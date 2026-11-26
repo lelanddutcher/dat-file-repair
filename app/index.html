@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <!-- The real name is set at start-up from productName in src-tauri/tauri.conf.json. -->
+    <title>DATfix</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script type="module" src="/src/main.ts"></script>
+  </head>
+  <body>
+    <main id="app" aria-live="off"></main>
+    <!-- Screen readers announce short status changes from here. -->
+    <div id="announcer" class="visually-hidden" role="status" aria-live="polite"></div>
+  </body>
+</html>

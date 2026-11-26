@@ -1,0 +1,455 @@
+/* DATfix window styles. Colors are tokens on :root; dark mode swaps the tokens. */
+
+:root {
+  --bg: #f6f5f2;
+  --surface: #ffffff;
+  --text: #1d1d1f;
+  --muted: #5f6368;
+  --border: #dcdad5;
+  --accent: #3b4fd8;
+  --accent-text: #ffffff;
+  --accent-soft: #eceefc;
+  --ok: #17703a;
+  --ok-soft: #e6f4ea;
+  --bad: #b3261e;
+  --bad-soft: #fbeaea;
+  --focus: #3b4fd8;
+  --radius: 12px;
+  color-scheme: light;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-size: 15px;
+  line-height: 1.45;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161618;
+    --surface: #222225;
+    --text: #f2f2f4;
+    --muted: #a5a7ad;
+    --border: #3a3a3f;
+    --accent: #8a98ff;
+    --accent-text: #10122a;
+    --accent-soft: #2a2d4a;
+    --ok: #6fd58f;
+    --ok-soft: #1d3324;
+    --bad: #ff8a80;
+    --bad-soft: #3a2020;
+    --focus: #8a98ff;
+    color-scheme: dark;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+}
+
+main {
+  max-width: 680px;
+  margin: 0 auto;
+  padding: 28px 20px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+h1 {
+  font-size: 26px;
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+
+h2 {
+  font-size: 16px;
+  margin: 0 0 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+p {
+  margin: 0 0 8px;
+}
+
+.lede {
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+}
+
+.step {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 700;
+  flex: none;
+}
+
+/* Buttons */
+
+button {
+  font: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 14px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+button:focus-visible,
+.result:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+button.danger {
+  color: var(--bad);
+  border-color: var(--bad);
+}
+
+button.link {
+  border: none;
+  background: none;
+  color: var(--accent);
+  padding: 2px 0;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+button.big-btn {
+  width: 100%;
+  padding: 13px;
+  font-size: 17px;
+}
+
+.icon-btn {
+  border: none;
+  background: none;
+  color: var(--muted);
+  padding: 2px 6px;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin: 8px 0;
+}
+
+/* Drop zone */
+
+.dropzone {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 40px 20px;
+  border: 2px dashed var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  text-align: center;
+}
+
+.dropzone.compact {
+  padding: 12px;
+  flex-direction: row;
+  justify-content: center;
+  gap: 10px;
+}
+
+.dropzone.dragging,
+.dropzone:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.drop-icon {
+  font-size: 30px;
+  color: var(--accent);
+}
+
+.drop-title {
+  font-size: 19px;
+  font-weight: 600;
+}
+
+.drop-title.small {
+  font-size: 15px;
+}
+
+.drop-sub {
+  color: var(--muted);
+}
+
+.hint {
+  margin: 12px 0 0;
+  color: var(--muted);
+}
+
+/* File list */
+
+.items {
+  list-style: none;
+  padding: 0;
+  margin: 14px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.item {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+
+.item-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.file-name {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.big {
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 14px;
+  margin: 8px 0 4px;
+}
+
+.facts dt {
+  color: var(--muted);
+}
+
+.facts dd {
+  margin: 0;
+}
+
+.explain {
+  margin-bottom: 4px;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.small {
+  font-size: 13px;
+}
+
+.path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+/* Status lines */
+
+.status {
+  margin: 10px 0 0;
+  padding: 8px 12px;
+  border-radius: 8px;
+}
+
+.status.ok {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.status.bad {
+  background: var(--bad-soft);
+}
+
+.status ul,
+.error ul {
+  margin: 4px 0 8px;
+  padding-left: 20px;
+}
+
+.error {
+  margin-top: 10px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: var(--bad-soft);
+  border-left: 4px solid var(--bad);
+}
+
+.error-title {
+  font-weight: 700;
+  color: var(--bad);
+}
+
+.next {
+  margin-top: 6px;
+}
+
+/* Progress */
+
+.run {
+  margin-top: 12px;
+}
+
+.stage {
+  font-weight: 600;
+}
+
+.bar {
+  height: 10px;
+  border-radius: 5px;
+  background: var(--accent-soft);
+  overflow: hidden;
+  margin: 6px 0;
+}
+
+.bar-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s linear;
+}
+
+.spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-right: 8px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  vertical-align: -1px;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation: none;
+  }
+  .bar-fill {
+    transition: none;
+  }
+}
+
+/* The Repair / Cancel button stays visible at the bottom of the window while scrolling. */
+.action {
+  position: sticky;
+  bottom: 12px;
+  z-index: 1;
+  box-shadow: 0 -6px 24px rgb(0 0 0 / 0.12);
+}
+
+.row.spread {
+  justify-content: space-between;
+  margin: 0;
+}
+
+.done-msg {
+  margin: 0;
+  font-weight: 600;
+}
+
+/* Result */
+
+.result {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: var(--ok-soft);
+}
+
+.recovered {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--ok);
+  margin-bottom: 2px;
+}
+
+details {
+  margin-top: 6px;
+}
+
+summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.foot {
+  text-align: center;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 8px 0 4px;
+}
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 20px;
+  transform: translateX(-50%);
+  max-width: min(560px, calc(100vw - 32px));
+  background: var(--text);
+  color: var(--bg);
+  padding: 10px 16px;
+  border-radius: 8px;
+  box-shadow: 0 4px 18px rgb(0 0 0 / 0.25);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}

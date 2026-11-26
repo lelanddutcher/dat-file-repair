@@ -1,8 +1,11 @@
 # Cargo workspace: one library crate (the repair engine) and one binary crate (the CLI).
-# A future Tauri app will be a third member that depends on `datfix-core`.
+# The Tauri desktop app (`app/src-tauri`) is a third member that depends on `datfix-core`.
 [workspace]
 resolver = "3"
-members = ["crates/datfix-core", "crates/datfix"]
+members = ["crates/datfix-core", "crates/datfix", "app/src-tauri"]
+# Plain `cargo build/test/clippy` at the root skips the app: it needs the built web page
+# (`app/dist`) and, on Linux, WebKitGTK. Build it with `cargo tauri build` or `-p datfix-app`.
+default-members = ["crates/datfix-core", "crates/datfix"]
 
 [workspace.package]
 version = "0.1.0"
