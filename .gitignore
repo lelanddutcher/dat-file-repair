@@ -1,0 +1,12 @@
+*.DAT
+*.dat
+*.MP4
+*.mp4
+*.CRM
+*.hevc
+*.h264
+/out/
+/samples/
+target/
+node_modules/
+.DS_Store
