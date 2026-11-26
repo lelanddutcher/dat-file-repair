@@ -19,3 +19,11 @@ Queued while `feat/hardening` and `feat/card-carve` own `crates/`.
 1. **"Recover from card" flow** for `datfix scan` (see the UI suggestions in `docs/format/card-carving.md`
    and the card-carve agent's report): offer it on the `EmptyDat` error and as its own action; image the
    card first; live progress and results; "Repair all" using the card's own clips as references.
+
+# Release backlog
+
+1. Release workflow must also build the CLI archives named in the README
+   (`datfix-cli-<v>-{aarch64,x86_64}-apple-darwin.tar.gz`, `datfix-cli-<v>-x86_64-pc-windows-msvc.zip`)
+   and `SHA256SUMS.txt`, and attach everything to a GitHub Release on tag.
+2. After engine v3 and the app card-recovery flow merge: update README privacy note and the guide's
+   "card recovery is CLI-only" line.
