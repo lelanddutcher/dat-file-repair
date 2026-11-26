@@ -5,14 +5,15 @@
 //
 // Flow for the person using it:
 //   1. Add one or more .DAT files (drop, or click).  -> each is read and summarized.
-//   2. A reference clip is found automatically on the same card, or chosen by hand.
+//   2. Settings: a clip found automatically on the same card, else DATfix's built-in settings
+//      for that camera. A clip the person chooses always wins.
 //   3. Output goes next to the .DAT unless they choose a folder.
 //   4. Repair -> progress -> result (Show in Finder / Play), or a friendly error.
 
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
-import { api, asAppError, type AppError, type AppInfo, type DatSummary, type Progress, type ReferenceMatch, type RepairOutcome, type Stage } from "./api";
+import { api, asAppError, type AppError, type AppInfo, type DatSummary, type PartialView, type Progress, type ReferenceMatch, type RepairOutcome, type Stage } from "./api";
 import * as fmt from "./format";
 import { h, type Child } from "./dom";
 
@@ -22,10 +23,10 @@ import { h, type Child } from "./dom";
 
 /** Where reference clips come from, for every file in the list. */
 type RefChoice =
-  | { kind: "auto" } // search the .DAT's folder or card
+  | { kind: "auto" } // search the .DAT's folder or card, then the built-in settings
   | { kind: "file"; path: string }
   | { kind: "folder"; path: string }
-  | { kind: "builtin" }; // engine profile bank (when the engine supports it)
+  | { kind: "builtin" }; // the engine's built-in camera settings
 
 interface RefState {
   status: "waiting" | "searching" | "ok" | "mismatch" | "error";
@@ -65,7 +66,7 @@ interface Item {
 }
 
 const state = {
-  info: { name: "DATfix", version: "", os: "macos", capabilities: { referenceFree: false } } as AppInfo,
+  info: { name: "DATfix", version: "", os: "macos", capabilities: { referenceFree: false }, theme: null } as AppInfo,
   items: [] as Item[],
   refChoice: { kind: "auto" } as RefChoice,
   /** null = save next to each .DAT. */
@@ -74,6 +75,9 @@ const state = {
   stopRequested: false,
   currentJob: null as string | null,
   dragging: false,
+  /** Unfinished files from a repair that was killed, found next to the outputs. */
+  partials: [] as PartialView[],
+  partialsNote: null as string | null,
 };
 
 let nextId = 1;
@@ -170,7 +174,7 @@ async function resolveReference(item: Item) {
       else if (choice.kind === "file") m = await api.checkReference(job, item.dat, choice.path);
       else if (choice.kind === "folder") m = await api.findReference(job, item.dat, choice.path);
       else if (choice.kind === "auto") m = await api.findReference(job, item.dat, null);
-      else throw notAvailableYet();
+      else m = await api.checkBuiltin(job, item.dat);
       // The choice may have changed while this ran; the newer run wins.
       if (choice !== state.refChoice && !item.ref.override) return;
       item.ref = { status: m.ok ? "ok" : "mismatch", match: m, override: item.ref.override };
@@ -180,17 +184,6 @@ async function resolveReference(item: Item) {
     }
     render();
   });
-}
-
-function notAvailableYet(): AppError {
-  return {
-    kind: "not_available",
-    title: "Not available yet",
-    message: "This version of DATfix needs a healthy clip from the same camera.",
-    nextStep: "Choose a clip, or search a folder of clips from the same camera.",
-    reasons: [],
-    details: "reference-free repair is not supported by this engine build",
-  };
 }
 
 async function setRefChoice(choice: RefChoice) {
@@ -241,7 +234,17 @@ async function repairAll() {
   if (queue.length === 0 || state.repairing) return;
   state.repairing = true;
   state.stopRequested = false;
+  state.partialsNote = null;
   for (const item of queue) item.run = { status: "idle" };
+  render();
+  // A repair that was killed (force quit, power loss) leaves a hidden temporary file next to
+  // its output. Offer to delete those; the repair goes on either way.
+  try {
+    const dirs = [...new Set(queue.map((i) => fmt.dirName(i.output!)))];
+    state.partials = await api.findPartials(dirs);
+  } catch {
+    state.partials = [];
+  }
   render();
   for (const item of queue) {
     if (state.stopRequested) break;
@@ -263,7 +266,9 @@ async function repairOne(item: Item) {
   try {
     // Re-pick a suggested name right before writing: a file with that name may exist by now.
     if (!item.outputChosen) await refreshOutput(item);
-    const outcome = await api.repairDat(job, item.dat, item.ref.match!.path, item.output!, (p) => onProgress(item, p));
+    const m = item.ref.match!;
+    const reference = m.source === "builtin" ? null : m.path;
+    const outcome = await api.repairDat(job, item.dat, reference, item.output!, (p) => onProgress(item, p));
     item.run = { status: "done", outcome };
   } catch (e) {
     const err = asAppError(e);
@@ -294,6 +299,19 @@ function onProgress(item: Item, p: Progress) {
     }
   }
   scheduleRender();
+}
+
+async function removePartials() {
+  const files = state.partials;
+  state.partials = [];
+  try {
+    const freed = await api.removePartials(files.map((p) => p.path));
+    state.partialsNote = `Deleted ${files.length} unfinished file${files.length === 1 ? "" : "s"} (${fmt.bytes(freed)} freed).`;
+  } catch (e) {
+    state.partialsNote = `Could not delete them: ${asAppError(e).message}`;
+  }
+  announce(state.partialsNote);
+  render();
 }
 
 async function cancelRepair() {
@@ -449,7 +467,7 @@ function renderItem(item: Item): HTMLElement {
     rows.push(
       h("p", { class: "big" }, length),
       h("dl", { class: "facts" }, [
-        fact("Camera", s.camera),
+        fact("Camera", s.frameRate ? `${s.camera}, ${s.frameRate} frames per second` : s.camera),
         fact("Contains", s.contents || "unknown"),
         fact("Size", fmt.bytes(s.sizeBytes)),
         fact(
@@ -485,71 +503,123 @@ function renderReference(): HTMLElement {
   const c = state.refChoice;
   const choiceText =
     c.kind === "auto"
-      ? "Looking on the same card or folder automatically."
+      ? "DATfix looks for a matching clip on the same card or in the same folder. If there is none, it uses its built-in settings for your camera."
       : c.kind === "file"
-        ? `Using ${fmt.baseName(c.path)}.`
+        ? `Using the clip you chose: ${fmt.baseName(c.path)}.`
         : c.kind === "folder"
-          ? `Searching ${c.path} and its subfolders.`
-          : "Using DATfix's built-in camera settings.";
+          ? `Searching ${c.path} and its subfolders. If no clip matches, DATfix uses its built-in settings.`
+          : "Using DATfix's built-in settings for your camera. No clip needed.";
   const canBuiltin = state.info.capabilities.referenceFree;
   return h("section", { class: "card", "aria-labelledby": "ref-h" }, [
-    h("h2", { id: "ref-h" }, [h("span", { class: "step" }, "2"), "A healthy clip from the same camera"]),
+    h("h2", { id: "ref-h" }, [h("span", { class: "step" }, "2"), "Video settings"]),
     h(
       "p",
       { class: "explain" },
-      "A .DAT file is missing the settings a video player needs. DATfix copies them from any clip that plays normally and was shot on the same camera with the same resolution, frame rate and sound settings.",
+      "A .DAT file is missing the settings a video player needs. DATfix can copy them from a clip that plays normally and was shot on the same camera with the same settings, or use the settings it already knows for many Canon cameras.",
     ),
     h("p", { class: "muted" }, choiceText),
     h("div", { class: "row" }, [
       h("button", { id: "choose-clip", type: "button", disabled: state.repairing, onclick: () => void chooseClip() }, "Choose a clip…"),
       h("button", { id: "search-folder", type: "button", disabled: state.repairing, onclick: () => void chooseRefFolder() }, "Search a folder…"),
-      h(
-        "button",
-        {
-          id: "try-builtin",
-          type: "button",
-          disabled: state.repairing || !canBuiltin,
-          title: canBuiltin ? "" : "Coming in a later version",
-          onclick: () => void setRefChoice({ kind: "builtin" }),
-        },
-        canBuiltin ? "Try without a reference" : "Try without a reference (coming soon)",
-      ),
+      canBuiltin && c.kind !== "builtin"
+        ? h("button", { id: "try-builtin", type: "button", disabled: state.repairing, onclick: () => void setRefChoice({ kind: "builtin" }) }, "Try without a reference")
+        : null,
       c.kind !== "auto"
-        ? h("button", { id: "ref-auto", class: "link", type: "button", disabled: state.repairing, onclick: () => void setRefChoice({ kind: "auto" }) }, "Find automatically")
+        ? h("button", { id: "ref-auto", class: "link", type: "button", disabled: state.repairing, onclick: () => void setRefChoice({ kind: "auto" }) }, "Choose automatically")
         : null,
     ]),
     single?.summary ? renderItemReference(single) : null,
   ]);
 }
 
-/** Match status for one item, in plain words. */
+/** Settings status for one item, in plain words. */
 function renderItemReference(item: Item): HTMLElement {
   const r = item.ref;
-  const label = state.items.length > 1 ? "Reference: " : "";
+  const many = state.items.length > 1;
   const pickOwn =
-    state.items.length > 1 && (r.status === "mismatch" || r.status === "error") && !state.repairing
+    many && (r.status === "mismatch" || r.status === "error") && !state.repairing
       ? h("button", { id: `clip-${item.id}`, class: "link", type: "button", onclick: () => void chooseClip(item) }, "Choose a clip for this file")
+      : null;
+  const useBuiltin =
+    (r.status === "mismatch" || r.status === "error") && state.info.capabilities.referenceFree && !state.repairing && state.refChoice.kind !== "builtin"
+      ? h(
+          "button",
+          {
+            id: `builtin-${item.id}`,
+            class: "link",
+            type: "button",
+            onclick: () => {
+              if (many) {
+                item.ref.override = undefined;
+                void resolveBuiltin(item);
+              } else void setRefChoice({ kind: "builtin" });
+            },
+          },
+          "Use built-in settings instead",
+        )
       : null;
   switch (r.status) {
     case "waiting":
-      return h("p", { class: "status muted" }, `${label}waiting…`);
+      return h("p", { class: "status muted" }, "Waiting…");
     case "searching":
-      return h("p", { class: "status muted" }, [spinner(), `${label}looking for a matching clip…`]);
-    case "ok":
-      return h("p", { class: "status ok" }, [
-        h("span", { "aria-hidden": "true" }, "✓ "),
-        `${label}${fmt.baseName(r.match!.path)} matches this file.`,
+      return h("p", { class: "status muted" }, [spinner(), "Looking for matching settings…"]);
+    case "ok": {
+      const m = r.match!;
+      return h("div", { class: "status ok-box" }, [
+        h("p", { class: "ok" }, [h("span", { "aria-hidden": "true" }, "✓ "), m.summary]),
+        m.searchNote ? h("p", { class: "muted small" }, m.searchNote) : null,
+        m.rebuilt.length ? h("ul", { class: "small rebuilt" }, m.rebuilt.map((x) => h("li", {}, x))) : null,
+        renderCandidates(m),
       ]);
-    case "mismatch":
+    }
+    case "mismatch": {
+      const m = r.match!;
       return h("div", { class: "status bad" }, [
-        h("p", {}, [h("span", { "aria-hidden": "true" }, "✗ "), `${label}${fmt.baseName(r.match!.path)} does not match:`]),
-        h("ul", {}, r.match!.reasons.map((x) => h("li", {}, x))),
-        h("p", {}, "Pick a clip recorded on the same camera with the same settings."),
-        pickOwn,
+        h("p", {}, [h("span", { "aria-hidden": "true" }, "✗ "), m.summary]),
+        h("ul", {}, m.reasons.map((x) => h("li", {}, x))),
+        h("p", {}, "Choose a clip recorded on the same camera with the same settings."),
+        h("div", { class: "row" }, [pickOwn, useBuiltin]),
+        m.details ? detailsBox(m.details) : null,
       ]);
+    }
     case "error":
-      return h("div", {}, [errorBox(r.error!, item), pickOwn]);
+      return h("div", {}, [errorBox(r.error!, item), h("div", { class: "row" }, [pickOwn, useBuiltin])]);
   }
+}
+
+/** The clips a search looked at, behind a disclosure. */
+function renderCandidates(m: ReferenceMatch): HTMLElement | null {
+  if (m.candidates.length === 0) return null;
+  const n = m.candidates.length;
+  return h("details", { class: "small" }, [
+    h("summary", {}, `${n} clip${n === 1 ? "" : "s"} checked`),
+    h(
+      "ul",
+      { class: "candidates" },
+      m.candidates.map((c) =>
+        h("li", { title: c.detail ?? "" }, [
+          h("span", { class: "file-name" }, c.fileName),
+          ": ",
+          c.verdict === "fits" ? "matches" : c.verdict === "videoOnly" ? "video matches; sound or data tracks would be rebuilt" : (c.reason ?? "skipped"),
+        ]),
+      ),
+    ),
+  ]);
+}
+
+/** Built-in settings for one file of a batch. */
+async function resolveBuiltin(item: Item) {
+  item.ref = { status: "searching" };
+  render();
+  await enqueue(async () => {
+    try {
+      const m = await api.checkBuiltin(newId("ref"), item.dat);
+      item.ref = { status: "ok", match: m, override: undefined };
+    } catch (e) {
+      item.ref = { status: "error", error: asAppError(e) };
+    }
+    render();
+  });
 }
 
 function renderOutput(): HTMLElement {
@@ -600,6 +670,7 @@ function renderAction(): HTMLElement {
   const waiting = state.items.some((i) => i.reading || i.ref.status === "searching");
   return h("section", { class: "card action", "aria-labelledby": "act-h" }, [
     h("h2", { id: "act-h", class: "visually-hidden" }, "Repair"),
+    renderPartials(),
     state.repairing
       ? h("button", { id: "cancel", class: "danger big-btn", type: "button", disabled: state.stopRequested, onclick: () => void cancelRepair() }, state.stopRequested ? "Stopping…" : "Cancel")
       : h("button", { id: "repair", class: "primary big-btn", type: "button", disabled: ready === 0, onclick: () => void repairAll() }, label),
@@ -609,12 +680,34 @@ function renderAction(): HTMLElement {
   ]);
 }
 
+/** Offer to delete unfinished files left by a repair that was killed. */
+function renderPartials(): HTMLElement | null {
+  if (state.partialsNote) return h("p", { class: "muted small" }, state.partialsNote);
+  const files = state.partials;
+  if (files.length === 0) return null;
+  const total = files.reduce((a, p) => a + p.bytes, 0);
+  const n = files.length;
+  return h("div", { class: "notice", role: "status" }, [
+    h(
+      "p",
+      {},
+      `Found ${n} unfinished file${n === 1 ? "" : "s"} (${fmt.bytes(total)}) from an earlier repair that was stopped before it finished. ${n === 1 ? "It is" : "They are"} hidden and can't be played.`,
+    ),
+    h("div", { class: "row" }, [
+      h("button", { id: "partials-delete", type: "button", onclick: () => void removePartials() }, n === 1 ? "Delete it" : "Delete them"),
+      h("button", { id: "partials-keep", class: "link", type: "button", onclick: () => { state.partials = []; render(); } }, "Keep"),
+    ]),
+  ]);
+}
+
 /** Progress, result or error of a repair, inside the item card. */
 function renderRun(item: Item): Child {
   const r = item.run;
   if (r.status === "running") {
     const frac = r.total ? (r.done ?? 0) / r.total : 0;
-    const stepNo = { indexing: 1, checkingReference: 2, analyzingVideo: 3, writing: 4 }[r.stage ?? "indexing"];
+    // The index was read when the file was added, so a repair has three steps. If the file
+    // changed since, it is read again first ("Getting ready").
+    const stepNo = { indexing: 0, checkingReference: 1, analyzingVideo: 2, writing: 3 }[r.stage ?? "checkingReference"];
     const amount =
       r.total && r.unit === "bytes"
         ? `${fmt.bytes(r.done ?? 0)} of ${fmt.bytes(r.total)}`
@@ -624,7 +717,7 @@ function renderRun(item: Item): Child {
     const speed = r.rate && r.unit === "bytes" ? `${fmt.bytes(r.rate)}/s` : r.rate ? `${Math.round(r.rate)} frames/s` : "";
     const left = r.rate && r.total ? fmt.eta((r.total - (r.done ?? 0)) / r.rate) : "";
     return h("div", { class: "run" }, [
-      h("p", { class: "stage" }, `Step ${stepNo} of 4: ${r.stageLabel ?? "Starting"}`),
+      h("p", { class: "stage" }, stepNo ? `Step ${stepNo} of 3: ${r.stageLabel ?? "Starting"}` : `Getting ready: ${r.stageLabel ?? "Starting"}`),
       progressBar(frac, r.stageLabel ?? "Repair progress"),
       h("p", { class: "muted small" }, [amount, speed, left].filter(Boolean).join(" · ") || " "),
     ]);
@@ -639,6 +732,8 @@ function renderRun(item: Item): Child {
         { class: "muted small" },
         `${o.videoFrames.toLocaleString()} frames · ${o.audioTracks} audio track${o.audioTracks === 1 ? "" : "s"} · ${fmt.bytes(o.bytesWritten)} · saved as ${fmt.baseName(o.output)}`,
       ),
+      h("p", { class: "small" }, o.settings),
+      o.rebuilt.length ? h("ul", { class: "small rebuilt" }, o.rebuilt.map((x) => h("li", {}, x))) : null,
       h("div", { class: "row" }, [
         h("button", { id: `reveal-${item.id}`, class: "primary", type: "button", onclick: () => void revealItemInDir(o.output).catch(openFailed) }, reveal),
         h("button", { id: `play-${item.id}`, type: "button", onclick: () => void openPath(o.output).catch(openFailed) }, "Play"),
@@ -663,8 +758,14 @@ function errorBox(err: AppError, item?: Item): HTMLElement {
     h("p", {}, err.message),
     err.reasons.length ? h("ul", {}, err.reasons.map((x) => h("li", {}, x))) : null,
     h("p", { class: "next" }, [h("strong", {}, "What to do: "), err.nextStep]),
+    err.details ? detailsBox(err.details) : null,
     h("button", { id: copyId, class: "link", type: "button", onclick: (ev: Event) => void copyDetails(err, item, ev.currentTarget as HTMLButtonElement) }, "Copy details"),
   ]);
+}
+
+/** Technical text, hidden until asked for. */
+function detailsBox(text: string): HTMLElement {
+  return h("details", { class: "tech" }, [h("summary", {}, "Details"), h("pre", {}, text)]);
 }
 
 function progressBar(fraction: number, label: string): HTMLElement {
@@ -687,7 +788,7 @@ async function copyDetails(err: AppError, item: Item | undefined, button: HTMLBu
     `${state.info.name} ${state.info.version} on ${state.info.os} (${navigator.userAgent})`,
     item ? `File: ${item.dat}` : "",
     s ? `Size: ${s.sizeBytes} bytes; camera: ${s.camera}; contents: ${s.contents}; frames: ${s.videoFrames}; cut off: ${s.cutOff}` : "",
-    item?.ref.match ? `Reference: ${item.ref.match.path} (ok: ${item.ref.match.ok})` : "",
+    item?.ref.match ? `Settings: ${item.ref.match.source} ${item.ref.match.path ?? ""} (ok: ${item.ref.match.ok}) ${item.ref.match.summary}` : "",
     item?.output ? `Output: ${item.output}` : "",
     `Error: ${err.kind}: ${err.title}`,
     err.details,
@@ -735,6 +836,8 @@ async function start() {
   try {
     state.info = await api.appInfo();
     document.title = state.info.name;
+    // DATFIX_DEV_THEME forces a theme for screenshots; otherwise the system setting applies.
+    if (state.info.theme) document.documentElement.dataset.theme = state.info.theme;
   } catch {
     // Running in a plain browser (vite dev without Tauri): keep the defaults.
   }
@@ -775,7 +878,8 @@ async function devAutorun() {
   }
   if (!cfg) return;
   if (cfg.outDir) state.outDir = cfg.outDir;
-  if (cfg.reference) {
+  if (cfg.reference === "builtin") state.refChoice = { kind: "builtin" };
+  else if (cfg.reference) {
     const isClip = /\.mp4$/i.test(cfg.reference);
     state.refChoice = isClip ? { kind: "file", path: cfg.reference } : { kind: "folder", path: cfg.reference };
   }
@@ -787,7 +891,24 @@ async function devAutorun() {
   const report = () =>
     api.devReport(
       JSON.stringify(
-        state.items.map((i) => ({ dat: i.dat, ref: i.ref.status, refPath: i.ref.match?.path, readError: i.readError?.kind, run: i.run.status, outcome: i.run.outcome, error: i.run.error?.kind })),
+        state.items.map((i) => ({
+          dat: i.dat,
+          camera: i.summary?.camera,
+          estimatedSeconds: i.summary?.estimatedSeconds,
+          ref: i.ref.status,
+          refSource: i.ref.match?.source,
+          refPath: i.ref.match?.path,
+          refSummary: i.ref.match?.summary,
+          searchNote: i.ref.match?.searchNote,
+          rebuilt: i.ref.match?.rebuilt,
+          checked: i.ref.match?.checked,
+          readError: i.readError?.kind,
+          readErrorTitle: i.readError?.title,
+          run: i.run.status,
+          outcome: i.run.outcome,
+          error: i.run.error?.kind,
+          partialsNote: state.partialsNote,
+        })),
       ),
     );
   if (cfg.scrollY) window.scrollTo(0, cfg.scrollY);
@@ -796,7 +917,13 @@ async function devAutorun() {
     return;
   }
   if (cfg.cancelAfterMs) setTimeout(() => void cancelRepair(), cfg.cancelAfterMs);
-  await repairAll();
+  const done = repairAll();
+  if (cfg.cleanPartials) {
+    // Wait for the offer to appear, then accept it.
+    for (let i = 0; i < 50 && state.partials.length === 0 && !state.partialsNote; i++) await new Promise((r) => setTimeout(r, 100));
+    if (state.partials.length) await removePartials();
+  }
+  await done;
   await report();
 }
 

@@ -12,6 +12,8 @@ export interface AppInfo {
   version: string;
   os: "macos" | "windows" | "linux" | string;
   capabilities: Capabilities;
+  /** Forced theme for screenshots (DATFIX_DEV_THEME), else null. */
+  theme: "light" | "dark" | null;
 }
 
 export interface DatSummary {
@@ -19,22 +21,50 @@ export interface DatSummary {
   fileName: string;
   sizeBytes: number;
   camera: string;
+  /** True when `camera` is the exact model read from the file. */
+  cameraKnown: boolean;
   contents: string;
   estimatedSeconds: number | null;
+  frameRate: string | null;
   videoFrames: number;
   cutOff: boolean;
 }
 
-export interface ReferenceMatch {
+export type SettingsSource = "clip" | "clipVideoOnly" | "builtin";
+
+export interface CandidateView {
   path: string;
+  fileName: string;
+  verdict: "fits" | "videoOnly" | "skipped";
+  reason: string | null;
+  detail: string | null;
+}
+
+export interface ReferenceMatch {
   ok: boolean;
+  source: SettingsSource;
+  path: string | null;
+  /** One plain sentence, e.g. "Using built-in settings for Canon EOS R5 Mark II, 4K 119.88p." */
+  summary: string;
+  /** Why no clip was used, when the built-in settings were picked automatically. */
+  searchNote: string | null;
+  rebuilt: string[];
   reasons: string[];
+  details: string;
   checked: number;
+  candidates: CandidateView[];
+}
+
+export interface PartialView {
+  path: string;
+  bytes: number;
 }
 
 export interface RepairOutcome {
   output: string;
-  reference: string;
+  settings: string;
+  rebuilt: string[];
+  camera: string | null;
   durationSeconds: number;
   videoFrames: number;
   audioTracks: number;
@@ -86,10 +116,14 @@ export const api = {
     invoke<ReferenceMatch>("check_reference", { job, dat, clip }),
   findReference: (job: string, dat: string, dir: string | null, onProgress?: (p: Progress) => void) =>
     invoke<ReferenceMatch>("find_reference", { job, dat, dir, progress: channel(onProgress) }),
+  checkBuiltin: (job: string, dat: string) => invoke<ReferenceMatch>("check_builtin", { job, dat }),
   suggestOutput: (dat: string, dir: string | null, taken: string[]) =>
     invoke<string>("suggest_output", { dat, dir, taken }),
-  repairDat: (job: string, dat: string, reference: string, output: string, onProgress: (p: Progress) => void) =>
+  /** `reference` null = built-in settings. */
+  repairDat: (job: string, dat: string, reference: string | null, output: string, onProgress: (p: Progress) => void) =>
     invoke<RepairOutcome>("repair_dat", { job, dat, reference, output, progress: channel(onProgress) }),
+  findPartials: (dirs: string[]) => invoke<PartialView[]>("find_partials", { dirs }),
+  removePartials: (paths: string[]) => invoke<number>("remove_partials", { paths }),
   cancelJob: (job: string) => invoke<void>("cancel_job", { job }),
   devAutorun: () => invoke<DevAutorun | null>("dev_autorun"),
   devReport: (line: string) => invoke<void>("dev_report", { line }),
@@ -98,8 +132,10 @@ export const api = {
 /** Test hook settings (see `dev_autorun` in commands.rs). */
 export interface DevAutorun {
   dats: string[];
-  /** A clip, or a folder to search. */
+  /** A clip, a folder to search, or "builtin". */
   reference?: string;
+  /** Press "Delete them" when unfinished files from a killed repair are found. */
+  cleanPartials?: boolean;
   outDir?: string;
   /** Press Repair automatically (default true). */
   repair?: boolean;
