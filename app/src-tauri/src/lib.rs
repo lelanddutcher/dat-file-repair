@@ -3,7 +3,8 @@
 //! How the pieces fit:
 //!
 //! - `engine.rs` calls the repair engine (`datfix-core`) and turns its results into plain-words
-//!   types for the page. It is the only file that uses `datfix-core`.
+//!   types for the page. It and its child module `engine/card.rs` (card recovery) are the only
+//!   files that use `datfix-core`.
 //! - `commands.rs` holds the functions the web page calls. Slow work runs on a background
 //!   thread; progress goes back to the page through a Tauri `Channel`.
 //! - `run()` below builds the window and wires everything together.
@@ -76,6 +77,11 @@ pub fn run() {
             commands::find_partials,
             commands::remove_partials,
             commands::cancel_job,
+            commands::list_cards,
+            commands::image_card,
+            commands::scan_card,
+            commands::card_prepare_repair,
+            commands::card_save,
             commands::dev_autorun,
             commands::dev_report,
         ])

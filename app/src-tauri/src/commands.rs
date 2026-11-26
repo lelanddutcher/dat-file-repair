@@ -13,6 +13,9 @@ use serde::Serialize;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
 
+use crate::engine::card::{
+    self, CardDevice, CardProgress, CardScanView, CardSession, PreparedCard,
+};
 use crate::engine::{
     self, AppError, AppResult, Capabilities, DatIndex, DatSummary, PartialView, Progress,
     ReferenceMatch, RepairOutcome,
@@ -28,6 +31,8 @@ pub struct AppState {
     indexes: Mutex<HashMap<PathBuf, Arc<DatIndex>>>,
     /// Jobs still running. Closing the window waits for this to reach zero.
     running: Arc<AtomicUsize>,
+    /// The last card scan, kept for "Repair all" and "Save".
+    card: Mutex<Option<Arc<CardSession>>>,
 }
 
 impl AppState {
@@ -278,6 +283,103 @@ pub fn cancel_job(state: State<'_, AppState>, job: String) {
     if let Some(flag) = state.jobs.lock().unwrap().get(&job) {
         flag.store(true, Ordering::SeqCst);
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Recover from a memory card
+// ---------------------------------------------------------------------------------------------
+
+/// Memory cards the computer can see now (macOS; empty elsewhere).
+#[tauri::command]
+pub async fn list_cards() -> AppResult<Vec<CardDevice>> {
+    background(|| Ok(card::list_cards())).await
+}
+
+/// Makes a raw image of a whole card in `out_dir`. Returns the image file.
+#[tauri::command]
+pub async fn image_card(
+    state: State<'_, AppState>,
+    job: String,
+    device: String,
+    out_dir: PathBuf,
+    progress: Channel<CardProgress>,
+) -> AppResult<PathBuf> {
+    let (cancel, _guard) = state.start_job(&job);
+    background(move || {
+        card::image_card(&device, &out_dir, cancel, &mut |p| {
+            let _ = progress.send(p);
+        })
+    })
+    .await
+}
+
+/// Scans a card image or raw device for recordings. Keeps the findings for later calls.
+#[tauri::command]
+pub async fn scan_card(
+    state: State<'_, AppState>,
+    job: String,
+    image: PathBuf,
+    progress: Channel<CardProgress>,
+) -> AppResult<CardScanView> {
+    let (cancel, _guard) = state.start_job(&job);
+    let (view, session) = background(move || {
+        card::scan(&image, cancel, &mut |p| {
+            let _ = progress.send(p);
+        })
+    })
+    .await?;
+    *state.card.lock().unwrap() = Some(session);
+    Ok(view)
+}
+
+fn card_session(state: &AppState) -> AppResult<Arc<CardSession>> {
+    state.card.lock().unwrap().clone().ok_or_else(|| {
+        AppError::new(
+            "scan_gone",
+            "Scan the card again",
+            "The results of the last scan are no longer available.".into(),
+            "Scan the card again.",
+        )
+    })
+}
+
+/// Copies the chosen recordings (by card offset) and their reference clips into `out_dir`.
+#[tauri::command]
+pub async fn card_prepare_repair(
+    state: State<'_, AppState>,
+    job: String,
+    offsets: Vec<u64>,
+    out_dir: PathBuf,
+    progress: Channel<CardProgress>,
+) -> AppResult<PreparedCard> {
+    let session = card_session(&state)?;
+    let (cancel, _guard) = state.start_job(&job);
+    background(move || {
+        card::prepare_repair(&session, &offsets, &out_dir, cancel, &mut |p| {
+            let _ = progress.send(p);
+        })
+    })
+    .await
+}
+
+/// Saves one fragment or finished clip from the last scan into `out_dir`.
+#[tauri::command]
+pub async fn card_save(
+    state: State<'_, AppState>,
+    job: String,
+    kind: String,
+    offset: u64,
+    out_dir: PathBuf,
+    progress: Channel<CardProgress>,
+) -> AppResult<PathBuf> {
+    let session = card_session(&state)?;
+    let (cancel, _guard) = state.start_job(&job);
+    background(move || {
+        card::save_item(&session, &kind, offset, &out_dir, cancel, &mut |p| {
+            let _ = progress.send(p);
+        })
+    })
+    .await
 }
 
 /// Test hook: when the environment variable `DATFIX_DEV_AUTORUN` holds JSON such as

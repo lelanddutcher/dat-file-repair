@@ -24,6 +24,9 @@ use datfix_core::repair::{
 pub use datfix_core::repi::DatIndex;
 use serde::Serialize;
 
+/// Card recovery: scan a card image, copy recordings off it, image a card.
+pub mod card;
+
 /// How many candidate clips a folder search checks before it gives up.
 const MAX_CANDIDATES: usize = 60;
 /// How deep a folder search goes below the folder the user picked.
