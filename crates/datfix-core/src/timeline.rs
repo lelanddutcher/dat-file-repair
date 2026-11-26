@@ -92,8 +92,10 @@ pub fn build<R: ReadAt + ?Sized>(src: &R, index: &DatIndex, layout: &DatLayout) 
                 .rejected_headers
                 .iter()
                 .any(|&r| r > prev.header_offset && r < g.header_offset);
-            if g.header_offset != expected || rejected {
-                g.header_offset.saturating_sub(prev.declared_end())
+            // A group cut short in the middle of the file (unreadable samples) is damage too.
+            let cut = prev.complete < prev.declared;
+            if g.header_offset != expected || rejected || cut {
+                g.header_offset.saturating_sub(prev.complete_end()).max(1)
             } else {
                 0
             }

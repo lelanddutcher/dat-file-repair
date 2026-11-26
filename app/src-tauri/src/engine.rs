@@ -448,6 +448,8 @@ pub fn repair(
         overwrite: false,
         cancel: Some(cancel),
         index,
+        // Skip unreadable parts of a failing card (the engine default).
+        ..Default::default()
     };
     let source = match reference {
         Some(r) => ReferenceSource::File(r.to_path_buf()),

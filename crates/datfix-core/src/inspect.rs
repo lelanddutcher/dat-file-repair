@@ -8,8 +8,8 @@ use serde::Serialize;
 use crate::error::{Error, Result};
 use crate::fourcc::FourCC;
 use crate::layout::{self, DatLayout};
-use crate::read_at::FileSource;
-use crate::repair::{Event, RepairOptions, classify_input, index_dat};
+use crate::read_at::{FileSource, Tolerant};
+use crate::repair::{Event, RepairOptions, classify_input, index_dat, not_a_dat};
 use crate::repi::{DatIndex, Truncation};
 
 /// Canon cameras record audio at 48 kHz. Used only for the duration estimate.
@@ -146,7 +146,7 @@ pub fn summarize(path: &Path, index: &DatIndex) -> InspectReport {
         gap_count: index.gaps.len() as u64,
         gap_bytes: index.gaps.iter().map(|g| g.len).sum(),
         common_gaps,
-        rejected_headers: index.rejected_headers.len() as u64,
+        rejected_headers: index.rejected_count,
         trailing_bytes: index.trailing_bytes,
         truncation: index.truncation.clone(),
         estimated_seconds,
@@ -194,10 +194,11 @@ pub fn inspect_with(
     opts: &RepairOptions,
     on_event: &mut dyn FnMut(&Event),
 ) -> Result<(InspectReport, DatIndex)> {
-    let src = FileSource::open(path)
+    let file = FileSource::open(path)
         .map_err(|e| Error::io(format!("cannot open {}", path.display()), e))?;
+    let src = Tolerant::new(file, !opts.stop_on_read_error);
     classify_input(path, &src)?;
-    let index = index_dat(&src, opts, on_event)?;
+    let index = index_dat(&src, opts, on_event).map_err(|e| not_a_dat(path, &src, e))?;
     if index.groups.is_empty() {
         return Err(Error::NotADat(format!(
             "{} has no Canon recovery index (repi)",
