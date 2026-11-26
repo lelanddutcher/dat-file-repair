@@ -70,7 +70,9 @@ impl<'a> BitReader<'a> {
         let mut zeros = 0;
         while !self.flag()? {
             zeros += 1;
-            if zeros > 31 {
+            // 31 or more leading zeros would code values of 2^31 and up, which no header field
+            // this crate reads can hold. Rejecting them keeps all later arithmetic in range.
+            if zeros > 30 {
                 return Err("bad Exp-Golomb code".into());
             }
         }

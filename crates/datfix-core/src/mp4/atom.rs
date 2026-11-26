@@ -205,7 +205,7 @@ pub fn scan_top_level<R: ReadAt + ?Sized>(src: &R) -> std::io::Result<Vec<TopBox
     let len = src.size();
     let mut out = Vec::new();
     let mut pos = 0u64;
-    while pos + 8 <= len {
+    while len.saturating_sub(pos) >= 8 {
         let mut h = [0u8; 16];
         let avail = (len - pos).min(16) as usize;
         src.read_exact_at(&mut h[..avail], pos)?;
