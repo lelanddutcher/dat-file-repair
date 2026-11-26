@@ -139,6 +139,9 @@ pub fn build<R: ReadAt + ?Sized>(src: &R, index: &DatIndex, layout: &DatLayout) 
     let mut start = vec![0i64; intervals.len()];
     let mut gaps = Vec::new();
     let mut last_tmcd: Option<(i64, u32)> = None;
+    // A gap measured only by its byte count, waiting for the next timecode to correct it:
+    // (gap index, first interval after the gap, largest believable correction).
+    let mut pending: Option<(usize, usize, i64)> = None;
     for i in 0..intervals.len() {
         let iv = &intervals[i];
         if i > 0 {
@@ -173,15 +176,32 @@ pub fn build<R: ReadAt + ?Sized>(src: &R, index: &DatIndex, layout: &DatLayout) 
                     }
                 }
                 start[i] = expected + lost.max(0);
+                pending = (method == "byte estimate").then_some((gaps.len(), i, bound));
                 gaps.push(TimelineGap {
                     resumes_at_frame: start[i],
-                    lost_frames: lost.max(0) + if prev.frames > 0 { 0 } else { f },
+                    lost_frames: start[i] - start[i - 1] - prev.frames,
                     damaged_bytes: iv.damage_before,
                     method,
                 });
             }
         }
         if let Some(c) = iv.tmcd {
+            // The damage cut an interval in the middle (its timecode was lost with it), so the
+            // gap could only be estimated. The first timecode after it says where this interval
+            // really starts; move everything since the gap by the difference.
+            if let (Some((gi, k, bound)), Some((p0, c0))) = (pending.take(), last_tmcd) {
+                let delta = p0 + (c as i64 - c0 as i64) - start[i];
+                let floor = start[k - 1] + intervals[k - 1].frames;
+                if delta != 0 && delta.abs() <= bound && start[k] + delta >= floor {
+                    for s in &mut start[k..=i] {
+                        *s += delta;
+                    }
+                    let g = &mut gaps[gi];
+                    g.resumes_at_frame = start[k];
+                    g.lost_frames = start[k] - floor;
+                    g.method = "timecode after the gap";
+                }
+            }
             last_tmcd = Some((start[i], c));
         }
     }

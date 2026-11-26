@@ -827,7 +827,23 @@ pub fn repair(
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64);
-    let src = Tolerant::new(file, !opts.stop_on_read_error);
+    repair_from(dat, file, mtime, reference, output, opts, on_event)
+}
+
+/// [`repair`] reading the `.DAT` bytes from `source` instead of opening `dat`. `dat` still
+/// names the recording (messages, creation time, the folder searched for clips). Tests use
+/// it to simulate a failing card.
+pub fn repair_from<R: ReadAt>(
+    dat: &Path,
+    source: R,
+    mtime: Option<i64>,
+    reference: &ReferenceSource,
+    output: &Path,
+    opts: &RepairOptions,
+    on_event: &mut dyn FnMut(&Event),
+) -> Result<RepairReport> {
+    check_output(dat, output, opts)?;
+    let src = Tolerant::new(source, !opts.stop_on_read_error);
     classify_input(dat, &src).map_err(|e| unreadable_error(&src, e))?;
     let out_dir = volume::parent_dir(output);
     // Fail before a long index walk: a folder that can't be written, or a drive that can't

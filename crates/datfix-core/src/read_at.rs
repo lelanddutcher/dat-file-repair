@@ -161,8 +161,9 @@ struct BadState {
 /// sector. Known bad regions are never read again. The caller asks for
 /// [`Tolerant::bad_regions`] afterwards and treats them as damage.
 ///
-/// When more than `limit` bytes are unreadable (the card was probably removed), reads fail
-/// with the last error and [`Tolerant::exceeded`] turns true.
+/// When more than a quarter of the file (at least 1 MiB) is unreadable, the card was
+/// probably removed or is dead: reads fail with the last error and [`Tolerant::exceeded`]
+/// turns true.
 pub struct Tolerant<R> {
     inner: R,
     skip: bool,
@@ -177,7 +178,7 @@ impl<R: ReadAt> Tolerant<R> {
         Tolerant {
             inner,
             skip,
-            limit: (size / 4).max(64 * 1024 * 1024),
+            limit: (size / 4).max(1024 * 1024),
             state: Mutex::new(BadState::default()),
         }
     }
@@ -470,7 +471,8 @@ mod tests {
     #[test]
     fn tolerant_skips_growing_steps_over_a_dead_region() {
         let data = pattern(64 << 20);
-        let src = Tolerant::new(FaultySource::new(data, vec![(1 << 20, 41 << 20)]), true);
+        let src = Tolerant::new(FaultySource::new(data, vec![(1 << 20, 41 << 20)]), true)
+            .with_limit(u64::MAX);
         src.read_vec(0, 64 << 20).unwrap();
         let fails = src
             .inner()
