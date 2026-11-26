@@ -181,7 +181,7 @@ fn real_damage_keeps_sync() {
     let len = env_u64("DATFIX_DAMAGE_LEN", 1024 * 1024);
     let source = match std::env::var_os("DATFIX_DAMAGE_REF") {
         Some(r) => ReferenceSource::File(PathBuf::from(r)),
-        None => ReferenceSource::Auto,
+        None => ReferenceSource::Builtin,
     };
     let stem = dat.file_stem().unwrap().to_string_lossy().to_string();
     let damaged = out_dir.join(format!("{stem}_zeroed_{at}_{len}.DAT"));

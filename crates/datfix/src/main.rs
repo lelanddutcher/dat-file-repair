@@ -7,6 +7,7 @@
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use datfix_core::inspect::{self, InspectReport};
@@ -37,26 +38,37 @@ enum Command {
         /// The .DAT file.
         dat: PathBuf,
     },
-    /// Rebuild a playable MP4 from a .DAT. Without --reference, the decoder settings come
-    /// from a built-in profile chosen by inspecting the .DAT.
+    /// Rebuild a playable MP4 from a .DAT. Without --reference or --reference-dir, the
+    /// clips in the .DAT's own folder are tried first, then the built-in profiles.
     Repair {
         /// The .DAT file. It is only read, never changed.
         dat: PathBuf,
         /// A healthy MP4 recorded on the same camera. Always wins over the built-in profiles.
         /// If only its video matches, its video track is used and the other tracks are
         /// synthesized.
-        #[arg(long, conflicts_with = "reference_dir")]
+        #[arg(long, conflicts_with_all = ["reference_dir", "builtin"])]
         reference: Option<PathBuf>,
         /// A folder searched (3 levels deep) for a compatible camera-original MP4. Re-encodes
         /// are skipped. Falls back to the built-in profiles when nothing fits.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "builtin")]
         reference_dir: Option<PathBuf>,
+        /// Use the built-in profiles only; do not look for clips next to the .DAT.
+        #[arg(long)]
+        builtin: bool,
         /// Output file. Default: <DAT name>_repaired.MP4 in the current folder.
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Replace the output if it already exists.
         #[arg(long)]
         force: bool,
+    },
+    /// Find hidden temporary files left by repairs that were killed, and delete them with --yes.
+    Clean {
+        /// The folder the repaired files were saved in. Default: the current folder.
+        dir: Option<PathBuf>,
+        /// Delete the files found (otherwise only list them).
+        #[arg(long)]
+        yes: bool,
     },
     /// List the built-in decoder profiles, or rebuild them from camera originals.
     Profiles {
@@ -90,16 +102,21 @@ fn main() -> ExitCode {
             ProfilesAction::List => run_profiles_list(json),
             ProfilesAction::Harvest { paths, out } => run_harvest(&paths, &out, json),
         },
+        Command::Clean { dir, yes } => {
+            run_clean(&dir.unwrap_or_else(|| PathBuf::from(".")), yes, json)
+        }
         Command::Repair {
             dat,
             reference,
             reference_dir,
+            builtin,
             output,
             force,
         } => {
             let source = match (reference, reference_dir) {
                 (Some(r), _) => ReferenceSource::File(r),
                 (None, Some(d)) => ReferenceSource::Dir(d),
+                (None, None) if builtin => ReferenceSource::Builtin,
                 (None, None) => ReferenceSource::Auto,
             };
             let output = output.unwrap_or_else(|| default_output(&dat));
@@ -109,11 +126,28 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
+            let m = e.user_message();
             if json {
-                emit_json(&serde_json::json!({ "event": "error", "message": e.to_string() }));
+                emit_json(&serde_json::json!({
+                    "event": "error", "kind": m.kind, "title": m.title, "message": m.message,
+                    "next_step": m.next_step, "reasons": m.reasons, "detail": e.to_string(),
+                }));
             } else {
                 clear_progress_line();
-                eprintln!("error: {e}");
+                eprintln!("error: {}", m.title);
+                eprintln!("  {}", m.message);
+                for r in &m.reasons {
+                    eprintln!("  - {r}");
+                }
+                eprintln!("  What to do: {}", m.next_step);
+                let detail = e.to_string();
+                if detail.trim() != m.message.trim() {
+                    eprintln!();
+                    eprintln!("details:");
+                    for line in detail.lines() {
+                        eprintln!("  {line}");
+                    }
+                }
             }
             ExitCode::FAILURE
         }
@@ -226,9 +260,11 @@ fn event_printer(json: bool) -> impl FnMut(&Event) {
                 let _ = std::io::stderr().flush();
             }
             Event::Progress { .. } => {}
-            Event::ReferenceRejected { path, reason } => {
+            Event::ReferenceRejected {
+                path, user_reason, ..
+            } => {
                 clear_progress_line();
-                eprintln!("  skipped {}: {reason}", path.display());
+                eprintln!("  skipped {}: {user_reason}", path.display());
             }
             Event::ReferenceChosen { path } => {
                 clear_progress_line();
@@ -271,11 +307,17 @@ fn print_inspect(r: &InspectReport) {
             "no"
         }
     );
+    if let Some(c) = &r.camera {
+        println!("  camera: {c}");
+    }
+    if let Some(b) = &r.brand {
+        println!("  brand: {b}");
+    }
     if let Some(l) = &r.layout {
         println!("  recording: {}", l.describe());
-        if let Some(code) = l.body_code {
-            println!("  body code: {:02x}{:02x}{:02x}", code[0], code[1], code[2]);
-        }
+    }
+    if let Some(code) = &r.body_code {
+        println!("  body code: {code}");
     }
     println!("  repi groups: {}", r.groups);
     let pattern: Vec<String> = r.pattern.iter().map(|k| k.to_string()).collect();
@@ -306,9 +348,16 @@ fn print_inspect(r: &InspectReport) {
         println!("  damaged headers skipped: {}", r.rejected_headers);
     }
     match (r.estimated_seconds, r.estimated_fps) {
-        (Some(s), Some(f)) => println!("  estimated duration: {} ({f:.3} fps)", hms(s)),
+        (Some(s), Some(f)) => println!(
+            "  estimated duration: {} ({} frames at {f:.3} fps)",
+            hms(s),
+            r.video_frames
+        ),
         (Some(s), None) => println!("  estimated duration: {}", hms(s)),
-        _ => println!("  estimated duration: unknown (no indexed PCM audio; repair to find out)"),
+        _ => println!(
+            "  estimated duration: unknown ({} frames, frame rate unknown)",
+            r.video_frames
+        ),
     }
     match &r.truncation {
         Some(t) => println!(
@@ -331,8 +380,24 @@ fn run_repair(
 ) -> datfix_core::Result<()> {
     let opts = RepairOptions {
         overwrite: force,
-        cancel: None,
+        ..Default::default()
     };
+    let out_dir = match output.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let stale = repair::find_stale_partials(&out_dir, Duration::from_secs(60));
+    if !stale.is_empty() && !json {
+        let bytes: u64 = stale.iter().map(|p| p.bytes).sum();
+        eprintln!(
+            "note: {} unfinished file(s) from an earlier repair that was stopped ({:.2} GB) are in \
+             {}. Delete them with: datfix clean \"{}\" --yes",
+            stale.len(),
+            bytes as f64 / 1e9,
+            out_dir.display(),
+            out_dir.display()
+        );
+    }
     let report = repair::repair(dat, source, output, &opts, &mut event_printer(json))?;
     if json {
         emit_json(&serde_json::json!({ "event": "result", "repair": report }));
@@ -343,8 +408,57 @@ fn run_repair(
     Ok(())
 }
 
+fn run_clean(dir: &Path, yes: bool, json: bool) -> datfix_core::Result<()> {
+    let found = repair::find_stale_partials(dir, Duration::from_secs(60));
+    let bytes: u64 = found.iter().map(|p| p.bytes).sum();
+    let freed = if yes {
+        let paths: Vec<PathBuf> = found.iter().map(|p| p.path.clone()).collect();
+        Some(repair::remove_partials(&paths)?)
+    } else {
+        None
+    };
+    if json {
+        emit_json(&serde_json::json!({
+            "event": "result", "partials": found, "bytes": bytes, "freed": freed,
+        }));
+        return Ok(());
+    }
+    if found.is_empty() {
+        println!("No unfinished repair files in {}.", dir.display());
+        return Ok(());
+    }
+    for p in &found {
+        println!(
+            "  {}  {:.2} GB, untouched for {} min",
+            p.path.display(),
+            p.bytes as f64 / 1e9,
+            p.idle_seconds / 60
+        );
+    }
+    match freed {
+        Some(n) => println!(
+            "Deleted {} file(s), freed {:.2} GB.",
+            found.len(),
+            n as f64 / 1e9
+        ),
+        None => println!(
+            "{} unfinished file(s), {:.2} GB. Run again with --yes to delete them.",
+            found.len(),
+            bytes as f64 / 1e9
+        ),
+    }
+    Ok(())
+}
+
 fn print_repair(r: &RepairReport) {
     println!("Repaired: {}", r.output.display());
+    println!("  {}", r.settings);
+    for line in &r.rebuilt {
+        println!("  {line}");
+    }
+    if let Some(c) = &r.camera {
+        println!("  camera: {c}");
+    }
     println!("  recording: {}", r.recording);
     let kind = match r.reference_kind {
         RefKind::User => "reference clip",

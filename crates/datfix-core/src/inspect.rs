@@ -46,9 +46,18 @@ pub struct InspectReport {
     pub rejected_headers: u64,
     pub trailing_bytes: u64,
     pub truncation: Option<Truncation>,
-    /// Estimated duration from 48 kHz PCM audio, when the `.DAT` has indexed PCM. Assumes
-    /// 16-bit stereo when the sample layout does not say otherwise.
+    /// Estimated duration: complete video frames divided by the frame rate. Before the layout
+    /// is known ([`summarize`] alone), estimated from 48 kHz PCM audio instead.
     pub estimated_seconds: Option<f64>,
+    /// Complete video frames in the index.
+    pub video_frames: u64,
+    /// The `ftyp` brand of this recording family (`XFVC` or `CAEP`), when known.
+    pub brand: Option<String>,
+    /// The camera as people know it (`Canon EOS R5 Mark II`), from the body code in the
+    /// per-frame records.
+    pub camera: Option<String>,
+    /// The body code as hex (`006049`), when the records carry one.
+    pub body_code: Option<String>,
     /// Estimated video frame rate from the same data.
     pub estimated_fps: Option<f64>,
     /// Body, codec, frame rate and family as read from the `.DAT`.
@@ -125,6 +134,7 @@ pub fn summarize(path: &Path, index: &DatIndex) -> InspectReport {
         }
         _ => None,
     };
+    let video_frames = video.map_or(0, |v| v.samples);
 
     InspectReport {
         path: path.to_path_buf(),
@@ -140,23 +150,65 @@ pub fn summarize(path: &Path, index: &DatIndex) -> InspectReport {
         trailing_bytes: index.trailing_bytes,
         truncation: index.truncation.clone(),
         estimated_seconds,
+        video_frames,
+        brand: None,
+        camera: None,
+        body_code: None,
         estimated_fps,
         layout: None,
     }
 }
 
-/// Walks a `.DAT` and summarizes it.
-pub fn inspect(path: &Path, on_event: &mut dyn FnMut(&Event)) -> Result<InspectReport> {
+/// Adds what the layout knows: camera, brand, frame rate, and the duration from the video
+/// frame count.
+pub fn apply_layout(report: &mut InspectReport, lay: DatLayout) {
+    if let Some(r) = lay.frame_rate {
+        report.estimated_fps = Some(r.fps());
+        if report.video_frames > 0 {
+            report.estimated_seconds = Some(report.video_frames as f64 / r.fps());
+        }
+    }
+    report.brand = lay.brand().map(|b| b.to_string());
+    report.camera = lay.camera();
+    report.body_code = lay.body_code.map(|c| layout::hex(&c));
+    report.layout = Some(lay);
+}
+
+/// Summarizes an index that was already read from `src`.
+pub fn inspect_index<R: crate::read_at::ReadAt + ?Sized>(
+    path: &Path,
+    src: &R,
+    index: &DatIndex,
+) -> InspectReport {
+    let mut report = summarize(path, index);
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    apply_layout(&mut report, layout::analyze(src, index, name));
+    report
+}
+
+/// Walks a `.DAT` and summarizes it. Also returns the index, so a later
+/// [`crate::repair::repair`] can skip the walk ([`RepairOptions::index`]). `opts.cancel`
+/// stops the walk.
+pub fn inspect_with(
+    path: &Path,
+    opts: &RepairOptions,
+    on_event: &mut dyn FnMut(&Event),
+) -> Result<(InspectReport, DatIndex)> {
     let src = FileSource::open(path)
         .map_err(|e| Error::io(format!("cannot open {}", path.display()), e))?;
     classify_input(path, &src)?;
-    let index = index_dat(&src, &RepairOptions::default(), on_event)?;
-    let mut report = summarize(path, &index);
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let lay = layout::analyze(&src, &index, name);
-    if let Some(r) = lay.frame_rate {
-        report.estimated_fps = Some(r.fps());
+    let index = index_dat(&src, opts, on_event)?;
+    if index.groups.is_empty() {
+        return Err(Error::NotADat(format!(
+            "{} has no Canon recovery index (repi)",
+            path.display()
+        )));
     }
-    report.layout = Some(lay);
-    Ok(report)
+    let report = inspect_index(path, &src, &index);
+    Ok((report, index))
+}
+
+/// Walks a `.DAT` and summarizes it.
+pub fn inspect(path: &Path, on_event: &mut dyn FnMut(&Event)) -> Result<InspectReport> {
+    inspect_with(path, &RepairOptions::default(), on_event).map(|(r, _)| r)
 }

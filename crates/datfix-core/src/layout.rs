@@ -39,6 +39,41 @@ pub fn body_name(code: [u8; 3]) -> Option<&'static str> {
     BODIES.iter().find(|(c, _)| *c == code).map(|(_, n)| *n)
 }
 
+/// Turns Canon's model string into the name on the camera: `Canon EOS R5m2` becomes
+/// `Canon EOS R5 Mark II`.
+pub fn friendly_body(modl: &str) -> String {
+    let m = modl.trim();
+    for (suffix, mark) in [("m2", " Mark II"), ("m3", " Mark III")] {
+        if let Some(base) = m.strip_suffix(suffix) {
+            if base.ends_with(|c: char| c.is_ascii_alphanumeric()) {
+                return format!("{base}{mark}");
+            }
+        }
+    }
+    m.to_string()
+}
+
+/// A frame rate as people write it: `119.88`, `59.94`, `25`.
+pub fn fps_text(fps: f64) -> String {
+    if (fps - fps.round()).abs() < 0.005 {
+        format!("{}", fps.round() as u32)
+    } else {
+        let s = format!("{fps:.2}");
+        s.trim_end_matches('0').to_string()
+    }
+}
+
+/// A resolution as people say it: `4K`, `8K`, `Full HD`, else `W×H`.
+pub fn resolution_text(width: u32, height: u32) -> String {
+    match (width, height) {
+        (w, _) if w >= 7680 => "8K".into(),
+        (w, _) if (5700..=6100).contains(&w) => "6K".into(),
+        (w, _) if w >= 3840 => "4K".into(),
+        (1920, 1080) => "Full HD".into(),
+        (w, h) => format!("{w}x{h}"),
+    }
+}
+
 /// The recording layouts seen on Canon bodies (spec section 4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Family {
@@ -171,6 +206,30 @@ pub fn hex(b: &[u8]) -> String {
 impl DatLayout {
     pub fn shape(&self, kind: &[u8; 4]) -> Option<&StreamShape> {
         self.shapes.iter().find(|s| s.kind.0 == *kind)
+    }
+
+    /// The camera as people know it (`Canon EOS R5 Mark II`), when the body code is known.
+    pub fn camera(&self) -> Option<String> {
+        self.body.map(friendly_body)
+    }
+
+    /// The `ftyp` brand this recording would have had (`XFVC` or `CAEP`), when known.
+    pub fn brand(&self) -> Option<FourCC> {
+        (self.family != Family::Unknown).then(|| self.family.brand())
+    }
+
+    /// Plain summary such as `Canon EOS R5 Mark II, HEVC video at 119.88p`.
+    pub fn describe_plain(&self) -> String {
+        let body = self.camera().unwrap_or_else(|| "Canon camera".into());
+        let codec = match self.codec.map(|c| c.0) {
+            Some(c) if c == *b"hvc1" => "HEVC video",
+            Some(c) if c == *b"avc1" => "H.264 video",
+            _ => "video",
+        };
+        match self.frame_rate {
+            Some(r) => format!("{body}, {codec} at {}p", fps_text(r.fps())),
+            None => format!("{body}, {codec}"),
+        }
     }
 
     /// One-line summary such as `Canon EOS R5m2, HEVC 119.880p Long GOP, XFVC with 24-bit LPCM`.
@@ -393,6 +452,19 @@ mod tests {
         assert_eq!(t, 1_734_788_442);
         assert_eq!(time_from_name("LAD33743.DAT"), None);
         assert_eq!(days_from_civil(1970, 1, 1), 0);
+    }
+
+    #[test]
+    fn plain_names() {
+        assert_eq!(friendly_body("Canon EOS R5m2"), "Canon EOS R5 Mark II");
+        assert_eq!(friendly_body("Canon EOS R6m2"), "Canon EOS R6 Mark II");
+        assert_eq!(friendly_body("Canon EOS R3"), "Canon EOS R3");
+        assert_eq!(fps_text(120_000.0 / 1001.0), "119.88");
+        assert_eq!(fps_text(30_000.0 / 1001.0), "29.97");
+        assert_eq!(fps_text(24_000.0 / 1001.0), "23.98");
+        assert_eq!(fps_text(25.0), "25");
+        assert_eq!(resolution_text(4096, 2160), "4K");
+        assert_eq!(resolution_text(1920, 1080), "Full HD");
     }
 
     #[test]

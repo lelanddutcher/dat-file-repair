@@ -117,10 +117,12 @@ fn build_trak(
     tkhd.body = Body::Leaf(h.to_payload());
 
     // Edit list: one edit covering the whole track. Video with B-frames starts `shift` frames
-    // in, so the first displayed frame plays at time zero.
+    // in, so the first displayed frame plays at time zero. The shift always comes from the
+    // rebuilt video tables, never from the reference: a Long-GOP reference's one-frame shift on
+    // an All-Intra .DAT would hide the first frame and drop the last.
     let media_time = match t.video {
-        Some(v) if v.shift_frames > 0 => v.shift_frames as i64 * t.ref_track.sample_delta as i64,
-        _ => t.ref_track.edit_media_time.unwrap_or(0),
+        Some(v) => v.shift_frames as i64 * t.ref_track.sample_delta as i64,
+        None => t.ref_track.edit_media_time.unwrap_or(0),
     };
     let needs_edit = trak.child(b"edts").is_some() || media_time != 0;
     trak.children_mut().retain(|a| a.kind.0 != *b"edts");

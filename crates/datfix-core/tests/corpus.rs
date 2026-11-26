@@ -80,7 +80,7 @@ fn repairs_every_dat_in_corpus() {
         };
         let dir = dat.parent().unwrap().to_path_buf();
         let source = if auto {
-            ReferenceSource::Auto
+            ReferenceSource::Builtin
         } else {
             ReferenceSource::Dir(dir)
         };

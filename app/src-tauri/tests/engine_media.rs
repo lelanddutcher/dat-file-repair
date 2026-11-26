@@ -45,18 +45,33 @@ fn repairs_a_sample_through_the_app_layer() {
     )
     .unwrap();
     assert!(found.ok, "{found:?}");
+    eprintln!("found: {} ({} clips checked)", found.summary, found.checked);
+
+    // The built-in settings fit the same file.
+    let builtin = engine::check_builtin(&dat, &index).unwrap();
+    eprintln!("builtin: {}", builtin.summary);
+    assert!(builtin.ok);
 
     let output = engine::suggest_output(&dat, Some(&out), &[]);
     let mut stages = Vec::new();
-    let outcome = engine::repair(&dat, &found.path, &output, Arc::default(), &mut |p| {
-        if let Progress::Stage { stage, .. } = p {
-            stages.push(stage);
-        }
-    })
+    let outcome = engine::repair(
+        &dat,
+        found.path.as_deref(),
+        &output,
+        Some(index),
+        Arc::default(),
+        &mut |p| {
+            if let Progress::Stage { stage, .. } = p {
+                stages.push(stage);
+            }
+        },
+    )
     .unwrap();
     eprintln!("outcome: {outcome:?}");
     assert_eq!(outcome.video_frames, summary.video_frames);
-    assert_eq!(stages.len(), 4, "every stage reported: {stages:?}");
+    // The index read by `inspect` is reused: no second walk.
+    assert_eq!(stages.len(), 3, "stages reported: {stages:?}");
+    assert!(!stages.contains(&engine::Stage::Indexing));
     assert!(output.exists());
 }
 
@@ -86,16 +101,23 @@ fn cancel_stops_a_large_repair_and_cleans_up() {
     let mut writing_since: Option<Instant> = None;
     let flag = cancel.clone();
     let started = Instant::now();
-    let err = engine::repair(&dat, &found.path, &output, cancel, &mut |p| {
-        if let Progress::Step { stage, .. } = p
-            && stage == engine::Stage::Writing
-        {
-            let since = *writing_since.get_or_insert_with(Instant::now);
-            if since.elapsed() > Duration::from_secs(2) {
-                flag.store(true, Ordering::SeqCst);
+    let err = engine::repair(
+        &dat,
+        found.path.as_deref(),
+        &output,
+        Some(index),
+        cancel,
+        &mut |p| {
+            if let Progress::Step { stage, .. } = p
+                && stage == engine::Stage::Writing
+            {
+                let since = *writing_since.get_or_insert_with(Instant::now);
+                if since.elapsed() > Duration::from_secs(2) {
+                    flag.store(true, Ordering::SeqCst);
+                }
             }
-        }
-    })
+        },
+    )
     .unwrap_err();
     eprintln!("stopped after {:?}: {}", started.elapsed(), err.kind);
     assert!(err.is_cancelled());

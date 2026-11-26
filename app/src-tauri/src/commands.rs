@@ -14,8 +14,8 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
 
 use crate::engine::{
-    self, AppError, AppResult, Capabilities, DatIndex, DatSummary, Progress, ReferenceMatch,
-    RepairOutcome,
+    self, AppError, AppResult, Capabilities, DatIndex, DatSummary, PartialView, Progress,
+    ReferenceMatch, RepairOutcome,
 };
 
 /// Shared state, owned by Tauri and handed to every command.
@@ -110,6 +110,8 @@ pub struct AppInfo {
     /// "macos", "windows" or "linux".
     os: &'static str,
     capabilities: Capabilities,
+    /// "light" or "dark" when `DATFIX_DEV_THEME` forces a theme (screenshots), else null.
+    theme: Option<String>,
 }
 
 #[tauri::command]
@@ -120,6 +122,9 @@ pub fn app_info(app: AppHandle) -> AppInfo {
         version: info.version.to_string(),
         os: std::env::consts::OS,
         capabilities: engine::capabilities(),
+        theme: std::env::var("DATFIX_DEV_THEME")
+            .ok()
+            .filter(|t| t == "light" || t == "dark"),
     }
 }
 
@@ -184,8 +189,20 @@ pub async fn check_reference(
     background(move || engine::check_reference_file(&dat, &index, &clip)).await
 }
 
-/// Searches for a matching clip. With `dir`, searches that folder and its subfolders; without
-/// it, searches the `.DAT`'s own folder, or the whole card when the `.DAT` is on one.
+/// Picks DATfix's built-in settings for a `.DAT`.
+#[tauri::command]
+pub async fn check_builtin(
+    state: State<'_, AppState>,
+    job: String,
+    dat: PathBuf,
+) -> AppResult<ReferenceMatch> {
+    let index = index_for(&state, &dat, &job).await?;
+    background(move || engine::check_builtin(&dat, &index)).await
+}
+
+/// Searches for a matching clip, then falls back to the built-in settings. With `dir`,
+/// searches that folder and its subfolders; without it, searches the `.DAT`'s own folder, or
+/// the whole card when the `.DAT` is on one.
 #[tauri::command]
 pub async fn find_reference(
     state: State<'_, AppState>,
@@ -214,23 +231,45 @@ pub fn suggest_output(dat: PathBuf, dir: Option<PathBuf>, taken: Vec<PathBuf>) -
     engine::suggest_output(&dat, dir.as_deref(), &taken)
 }
 
-/// Repairs one `.DAT`. Progress streams through `progress`; the result is the return value.
+/// Repairs one `.DAT`. `reference` is a clip, or null for the built-in settings. Progress
+/// streams through `progress`; the result is the return value.
 #[tauri::command]
 pub async fn repair_dat(
     state: State<'_, AppState>,
     job: String,
     dat: PathBuf,
-    reference: PathBuf,
+    reference: Option<PathBuf>,
     output: PathBuf,
     progress: Channel<Progress>,
 ) -> AppResult<RepairOutcome> {
+    // The index read when the file was added; the engine checks it still fits the file.
+    let index = state.cached_index(&dat);
     let (cancel, _guard) = state.start_job(&job);
     background(move || {
-        engine::repair(&dat, &reference, &output, cancel, &mut |p| {
-            let _ = progress.send(p);
-        })
+        engine::repair(
+            &dat,
+            reference.as_deref(),
+            &output,
+            index,
+            cancel,
+            &mut |p| {
+                let _ = progress.send(p);
+            },
+        )
     })
     .await
+}
+
+/// Lists temporary files left by killed repairs in the given folders.
+#[tauri::command]
+pub async fn find_partials(dirs: Vec<PathBuf>) -> AppResult<Vec<PartialView>> {
+    background(move || Ok(engine::find_partials(&dirs))).await
+}
+
+/// Deletes temporary files found by `find_partials`. Returns the bytes freed.
+#[tauri::command]
+pub async fn remove_partials(paths: Vec<PathBuf>) -> AppResult<u64> {
+    background(move || engine::remove_partials(&paths)).await
 }
 
 /// Asks a running job to stop. Unknown ids are ignored (the job already finished).

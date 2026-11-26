@@ -8,14 +8,17 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use datfix_core::Error as CoreError;
-use datfix_core::inspect::{InspectReport, summarize};
+use datfix_core::inspect::{InspectReport, inspect_with};
+use datfix_core::layout::{self, DatLayout};
 use datfix_core::mp4::reference::Reference;
 use datfix_core::read_at::FileSource;
 use datfix_core::repair::{
-    self, Event, Phase, ReferenceSource, RepairOptions, check_reference, index_dat,
+    self, Checked, Event, Phase, RefKind, ReferenceSource, RepairOptions, SearchOptions, Verdict,
+    check_reference, choose_profile, search_references,
 };
 // Re-exported so `commands.rs` can cache indexes without importing the engine itself.
 pub use datfix_core::repi::DatIndex;
@@ -27,6 +30,8 @@ const MAX_CANDIDATES: usize = 60;
 const MAX_SEARCH_DEPTH: usize = 6;
 /// Folder names that mark the top of a camera card.
 const CARD_MARKERS: [&str; 4] = ["DCIM", "XFVC", "PRIVATE", "CONTENTS"];
+/// A temporary file nobody wrote to for this long belongs to a repair that was killed.
+const STALE_AFTER: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------------------------
 // Types sent to the web page. `rename_all = "camelCase"` matches JavaScript naming.
@@ -47,27 +52,69 @@ pub struct DatSummary {
     pub path: PathBuf,
     pub file_name: String,
     pub size_bytes: u64,
-    /// For example "Canon XF-HEVC S camera (EOS R5 Mark II or C80)".
+    /// For example "Canon EOS R5 Mark II", or a family guess when the model is unknown.
     pub camera: String,
+    /// True when `camera` is the exact model read from the file.
+    pub camera_known: bool,
     /// What the file holds, for example "video, 4 audio channels, timecode".
     pub contents: String,
-    /// Length that can be recovered, when the engine can estimate it before repair.
+    /// Complete video frames divided by the frame rate.
     pub estimated_seconds: Option<f64>,
+    /// Frame rate as people write it ("119.88"), when known.
+    pub frame_rate: Option<String>,
     pub video_frames: u64,
     /// True when the last group of samples was cut off mid-write.
     pub cut_off: bool,
 }
 
-/// Result of checking one reference clip against one `.DAT`.
+/// Where the decoder settings for one `.DAT` come from.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SettingsSource {
+    /// A healthy clip whose every track fits.
+    Clip,
+    /// A healthy clip's video; sound or data tracks are rebuilt.
+    ClipVideoOnly,
+    /// DATfix's built-in camera settings.
+    Builtin,
+}
+
+/// One clip a search looked at.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateView {
+    pub path: PathBuf,
+    pub file_name: String,
+    /// "fits", "videoOnly" or "skipped".
+    pub verdict: &'static str,
+    /// Why it was skipped, in plain words.
+    pub reason: Option<String>,
+    /// The technical reason.
+    pub detail: Option<String>,
+}
+
+/// The settings chosen for one `.DAT`, or why none fit.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReferenceMatch {
-    pub path: PathBuf,
     pub ok: bool,
+    pub source: SettingsSource,
+    /// The clip, for `Clip` and `ClipVideoOnly` (and the clip that did not fit, when `!ok`).
+    pub path: Option<PathBuf>,
+    /// One plain sentence, for example "Using built-in settings for Canon EOS R5 Mark II, 4K
+    /// 119.88p."
+    pub summary: String,
+    /// Why no clip was used, when the built-in settings were picked automatically.
+    pub search_note: Option<String>,
+    /// Tracks rebuilt instead of copied, one plain sentence each.
+    pub rebuilt: Vec<String>,
     /// Why the clip does not fit, in plain words. Empty when `ok`.
     pub reasons: Vec<String>,
-    /// How many clips were checked to find this one (1 for a single file).
+    /// Technical text for "Details".
+    pub details: String,
+    /// Clips checked by a search (0 for a single clip or the built-in settings).
     pub checked: usize,
+    pub candidates: Vec<CandidateView>,
 }
 
 /// What a finished repair produced.
@@ -75,12 +122,23 @@ pub struct ReferenceMatch {
 #[serde(rename_all = "camelCase")]
 pub struct RepairOutcome {
     pub output: PathBuf,
-    pub reference: PathBuf,
+    /// Where the settings came from, one plain sentence.
+    pub settings: String,
+    pub rebuilt: Vec<String>,
+    pub camera: Option<String>,
     pub duration_seconds: f64,
     pub video_frames: u64,
     pub audio_tracks: usize,
     pub bytes_written: u64,
     pub notes: Vec<String>,
+}
+
+/// A temporary file left by a repair that was killed.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartialView {
+    pub path: PathBuf,
+    pub bytes: u64,
 }
 
 /// A progress update, sent to the page while a long job runs.
@@ -98,7 +156,7 @@ pub enum Progress {
         total: u64,
         unit: &'static str,
     },
-    /// A clip was checked and does not fit (folder search).
+    /// A clip was checked and does not fit (folder search). `reason` is plain words.
     #[serde(rename_all = "camelCase")]
     Rejected { path: PathBuf, reason: String },
     /// A non-fatal observation.
@@ -132,7 +190,7 @@ pub struct AppError {
 }
 
 impl AppError {
-    fn new(kind: &'static str, title: &str, message: String, next_step: &str) -> Self {
+    pub fn new(kind: &'static str, title: &str, message: String, next_step: &str) -> Self {
         AppError {
             kind,
             title: title.into(),
@@ -166,15 +224,13 @@ pub type AppResult<T> = Result<T, AppError>;
 
 /// Features of the engine this build links against.
 pub fn capabilities() -> Capabilities {
-    // The current engine always needs a reference clip. When the engine gains a built-in
-    // profile bank, set this to true and fill in `ReferenceChoice::Builtin` in `repair`.
     Capabilities {
-        reference_free: false,
+        reference_free: true,
     }
 }
 
 /// Reads the `.DAT`'s recovery index and summarizes it. Also returns the index so later steps
-/// (reference checks) do not have to walk a 40 GB file again.
+/// (reference checks, the repair itself) do not have to walk a 40 GB file again.
 pub fn inspect(
     dat: &Path,
     cancel: Arc<AtomicBool>,
@@ -189,30 +245,54 @@ pub fn inspect(
             "Drop the .DAT file itself, or drop the whole card folder.",
         ));
     }
-    if meta.len() == 0 {
-        return Err(empty_dat(dat));
-    }
-    let src = open_dat(dat)?;
     let opts = RepairOptions {
-        overwrite: false,
         cancel: Some(cancel),
+        ..Default::default()
     };
-    let index = index_dat(&src, &opts, &mut |ev| forward(ev, on_progress)).map_err(map_error)?;
-    let report = summarize(dat, &index);
-    if index.groups.is_empty() {
-        return Err(not_a_dat(dat, "no Canon recovery index (repi) was found"));
-    }
+    let (report, index) =
+        inspect_with(dat, &opts, &mut |ev| forward(ev, on_progress)).map_err(map_error)?;
     Ok((describe(dat, &report), Arc::new(index)))
 }
 
-/// Checks one reference clip against an indexed `.DAT`.
+/// Checks one clip the person chose against an indexed `.DAT`. The clip always wins: when it
+/// does not fit, the result says why and nothing else is tried.
 pub fn check_reference_file(
     dat: &Path,
     index: &DatIndex,
     clip: &Path,
 ) -> AppResult<ReferenceMatch> {
-    let src = open_dat(dat)?;
-    Ok(check_one(&src, index, clip))
+    let (src, lay) = open_with_layout(dat, index)?;
+    let checked =
+        Reference::open(clip).and_then(|r| check_reference(&src, index, &lay, r, RefKind::User));
+    Ok(match checked {
+        Ok(c) => matched(c, None, 0, Vec::new()),
+        Err(e) => {
+            let m = e.user_message();
+            ReferenceMatch {
+                ok: false,
+                source: SettingsSource::Clip,
+                path: Some(clip.to_path_buf()),
+                summary: format!("{} doesn't match this file.", file_name(clip)),
+                search_note: None,
+                rebuilt: Vec::new(),
+                reasons: if m.reasons.is_empty() {
+                    vec![m.message]
+                } else {
+                    m.reasons
+                },
+                details: e.to_string(),
+                checked: 1,
+                candidates: Vec::new(),
+            }
+        }
+    })
+}
+
+/// Picks DATfix's built-in settings for the `.DAT`.
+pub fn check_builtin(dat: &Path, index: &DatIndex) -> AppResult<ReferenceMatch> {
+    let (src, lay) = open_with_layout(dat, index)?;
+    let c = choose_profile(&src, index, &lay, &mut |_| {}).map_err(map_error)?;
+    Ok(matched(c, None, 0, Vec::new()))
 }
 
 /// Folders to search automatically for a reference: the `.DAT`'s own folder, or the whole card
@@ -221,20 +301,18 @@ pub fn auto_search_dirs(dat: &Path) -> (Vec<PathBuf>, bool) {
     let Some(parent) = dat.parent() else {
         return (Vec::new(), false);
     };
+    // A camera card has a DCIM (or XFVC, PRIVATE, CONTENTS) folder at its top. A plain drive
+    // root does not count: searching a whole external disk would take far too long.
     for dir in parent.ancestors().take(4) {
-        // A mounted card: `/Volumes/<name>` on macOS, a drive root such as `E:\` on Windows.
-        let is_volume_root = dir.parent().is_some_and(|p| p == Path::new("/Volumes"))
-            || (cfg!(windows) && dir.parent().is_none());
-        let has_marker = CARD_MARKERS.iter().any(|m| dir.join(m).is_dir());
-        if has_marker || is_volume_root {
+        if CARD_MARKERS.iter().any(|m| dir.join(m).is_dir()) {
             return (vec![dir.to_path_buf()], true);
         }
     }
     (vec![parent.to_path_buf()], false)
 }
 
-/// Searches folders for a clip that fits the `.DAT`. Clips in the `.DAT`'s own folder are
-/// tried first, then the smallest clips first (they are quickest to read).
+/// Searches folders for a clip that fits the `.DAT`. When none fits, falls back to the
+/// built-in settings and says so.
 pub fn find_reference(
     dat: &Path,
     index: &DatIndex,
@@ -243,66 +321,87 @@ pub fn find_reference(
     cancel: &AtomicBool,
     on_progress: &mut dyn FnMut(Progress),
 ) -> AppResult<ReferenceMatch> {
-    let src = open_dat(dat)?;
-    let home = dat.parent().map(Path::to_path_buf);
-    let mut candidates = Vec::new();
-    for d in dirs {
-        collect_mp4s(
-            d,
-            if recursive { MAX_SEARCH_DEPTH } else { 0 },
-            &mut candidates,
-        );
+    let (src, lay) = open_with_layout(dat, index)?;
+    let opts = SearchOptions {
+        depth: if recursive {
+            MAX_SEARCH_DEPTH as u32
+        } else {
+            0
+        },
+        max_candidates: MAX_CANDIDATES,
+        cancel: Some(cancel),
+    };
+    let found = search_references(&src, index, &lay, dirs, &opts, &mut |ev| {
+        forward(ev, on_progress)
+    })
+    .map_err(map_error)?;
+    let candidates: Vec<CandidateView> = found.candidates.iter().map(candidate_view).collect();
+    let checked = found.checked();
+    if let Some(c) = found.chosen {
+        return Ok(matched(c, None, checked, candidates));
     }
-    candidates.sort_by_key(|(path, size)| (path.parent() != home.as_deref(), *size));
-    candidates.dedup();
 
+    // Folder names only; the full path is in the tooltip of the clip list.
     let where_ = dirs
         .iter()
-        .map(|d| d.display().to_string())
+        .map(|d| format!("the folder “{}”", file_name(d)))
         .collect::<Vec<_>>()
         .join(", ");
-    if candidates.is_empty() {
-        return Err(AppError::new(
-            "no_reference_found",
-            "No healthy clips found",
-            format!("There are no .MP4 clips in {where_}."),
-            "Choose a clip you recorded on the same camera, or search another folder.",
-        ));
-    }
-
-    let mut rejected = Vec::new();
-    for (i, (clip, _)) in candidates.iter().take(MAX_CANDIDATES).enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(AppError::cancelled());
-        }
-        let m = check_one(&src, index, clip);
-        if m.ok {
-            return Ok(ReferenceMatch {
-                checked: i + 1,
-                ..m
-            });
-        }
-        let reason = m.reasons.join("; ");
-        on_progress(Progress::Rejected {
-            path: clip.clone(),
-            reason: reason.clone(),
-        });
-        rejected.push(format!("{}: {reason}", file_name(clip)));
-    }
-
-    let mut err = AppError::new(
-        "no_reference_found",
-        "No matching clip found",
+    let note = if checked == 0 {
+        format!("No clips were found in {where_}.")
+    } else {
         format!(
-            "None of the {} clips checked in {where_} was recorded with the same settings as this .DAT.",
-            rejected.len()
-        ),
-        "Choose a clip recorded on the same camera with the same resolution, frame rate and audio settings.",
-    );
-    err.details = format!("{}\n{}", err.message, rejected.join("\n"));
-    rejected.truncate(8);
-    err.reasons = rejected;
-    Err(err)
+            "None of the {checked} clip{} in {where_} matches this file.",
+            if checked == 1 { "" } else { "s" }
+        )
+    };
+    match choose_profile(&src, index, &lay, &mut |_| {}) {
+        Ok(c) => Ok(matched(c, Some(note), checked, candidates)),
+        Err(e) => {
+            let mut err = map_error(e);
+            err.message = format!("{note} {}", err.message);
+            err.reasons = candidates
+                .iter()
+                .filter_map(|c| c.reason.as_ref().map(|r| format!("{}: {r}", c.file_name)))
+                .take(8)
+                .collect();
+            err.details = format!(
+                "{}\n{}",
+                err.details,
+                candidates
+                    .iter()
+                    .map(|c| format!(
+                        "{}: {}",
+                        c.path.display(),
+                        c.detail.as_deref().unwrap_or(c.verdict)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Temporary files of killed repairs in the given folders.
+pub fn find_partials(dirs: &[PathBuf]) -> Vec<PartialView> {
+    let mut out: Vec<PartialView> = Vec::new();
+    for d in dirs {
+        for p in repair::find_stale_partials(d, STALE_AFTER) {
+            if !out.iter().any(|o| o.path == p.path) {
+                out.push(PartialView {
+                    path: p.path,
+                    bytes: p.bytes,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Deletes temporary files found by [`find_partials`]. Returns the bytes freed.
+pub fn remove_partials(paths: &[PathBuf]) -> AppResult<u64> {
+    repair::remove_partials(paths).map_err(map_error)
 }
 
 /// Picks an output path that does not exist yet: `<dir>/<stem>_repaired.mp4`, then
@@ -332,12 +431,14 @@ pub fn suggest_output(dat: &Path, dir: Option<&Path>, taken: &[PathBuf]) -> Path
 
 /// Runs a full repair. Blocks until done; call it from a background thread.
 ///
-/// `cancel` stops the job within about one 8 MB block. The engine deletes its temporary file
-/// when it stops, so a cancelled repair leaves nothing behind.
+/// `reference` is the clip to use, or `None` for the built-in settings. `index` is the index
+/// read when the file was added, so a 40 GB file is not walked twice. `cancel` stops the job
+/// within about one 8 MB block; the engine deletes its temporary file when it stops.
 pub fn repair(
     dat: &Path,
-    reference: &Path,
+    reference: Option<&Path>,
     output: &Path,
+    index: Option<Arc<DatIndex>>,
     cancel: Arc<AtomicBool>,
     on_progress: &mut dyn FnMut(Progress),
 ) -> AppResult<RepairOutcome> {
@@ -346,8 +447,12 @@ pub fn repair(
         // Never replace an existing file. `suggest_output` picks a free name.
         overwrite: false,
         cancel: Some(cancel),
+        index,
     };
-    let source = ReferenceSource::File(reference.to_path_buf());
+    let source = match reference {
+        Some(r) => ReferenceSource::File(r.to_path_buf()),
+        None => ReferenceSource::Builtin,
+    };
     let report = repair::repair(dat, &source, output, &opts, &mut |ev| {
         forward(ev, on_progress)
     })
@@ -359,7 +464,9 @@ pub fn repair(
         .count();
     Ok(RepairOutcome {
         output: report.output,
-        reference: report.reference,
+        settings: report.settings,
+        rebuilt: report.rebuilt,
+        camera: report.camera,
         duration_seconds: report.duration_seconds,
         video_frames: report.video_frames,
         audio_tracks,
@@ -397,19 +504,56 @@ fn open_dat(dat: &Path) -> AppResult<FileSource> {
     FileSource::open(dat).map_err(|e| io_error(dat, "read", e))
 }
 
-fn check_one(src: &FileSource, index: &DatIndex, clip: &Path) -> ReferenceMatch {
-    let result = Reference::open(clip).and_then(|r| check_reference(src, index, r));
-    let reasons = match result {
-        Ok(_) => Vec::new(),
-        Err(CoreError::Incompatible { reasons, .. }) => reasons,
-        Err(CoreError::BadReference { reason, .. }) => vec![reason],
-        Err(e) => vec![e.to_string()],
+/// Opens the `.DAT` and works out its layout (camera, frame rate) from a cached index.
+fn open_with_layout(dat: &Path, index: &DatIndex) -> AppResult<(FileSource, DatLayout)> {
+    let src = open_dat(dat)?;
+    let name = dat.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let lay = layout::analyze(&src, index, name);
+    Ok((src, lay))
+}
+
+/// Turns a chosen reference into the page's shape.
+fn matched(
+    c: Checked,
+    search_note: Option<String>,
+    checked: usize,
+    candidates: Vec<CandidateView>,
+) -> ReferenceMatch {
+    let source = match c.kind {
+        RefKind::User => SettingsSource::Clip,
+        RefKind::Hybrid => SettingsSource::ClipVideoOnly,
+        RefKind::Profile => SettingsSource::Builtin,
     };
     ReferenceMatch {
-        path: clip.to_path_buf(),
-        ok: reasons.is_empty(),
-        reasons,
-        checked: 1,
+        ok: true,
+        source,
+        path: (source != SettingsSource::Builtin).then(|| c.reference.path.clone()),
+        summary: c.summary,
+        search_note,
+        rebuilt: c.rebuilt,
+        reasons: Vec::new(),
+        details: c.notes.join("\n"),
+        checked,
+        candidates,
+    }
+}
+
+fn candidate_view(c: &repair::Candidate) -> CandidateView {
+    let (verdict, reason, detail) = match &c.verdict {
+        Verdict::Fits => ("fits", None, None),
+        Verdict::VideoOnly { rebuilt } => ("videoOnly", None, Some(rebuilt.join(" "))),
+        Verdict::Skipped { reason } => (
+            "skipped",
+            Some(reason.user.clone()),
+            Some(reason.detail.clone()),
+        ),
+    };
+    CandidateView {
+        path: c.path.clone(),
+        file_name: file_name(&c.path),
+        verdict,
+        reason,
+        detail,
     }
 }
 
@@ -469,9 +613,11 @@ fn forward(ev: &Event, on_progress: &mut dyn FnMut(Progress)) {
                 "bytes"
             },
         },
-        Event::ReferenceRejected { path, reason } => Progress::Rejected {
+        Event::ReferenceRejected {
+            path, user_reason, ..
+        } => Progress::Rejected {
             path: path.clone(),
-            reason: reason.clone(),
+            reason: user_reason.clone(),
         },
         Event::ReferenceChosen { .. } => return,
         Event::Note { message } => Progress::Note {
@@ -499,13 +645,13 @@ fn stage_label(p: Phase) -> &'static str {
     }
 }
 
-/// Describes the camera family and contents from the group pattern (see
-/// `docs/format/canon-dat-format.md`, section 4).
+/// Describes the camera and contents in plain words (see `docs/format/canon-dat-format.md`,
+/// section 4, for the family guesses used when the model is unknown).
 fn describe(dat: &Path, r: &InspectReport) -> DatSummary {
     let count = |k: &[u8; 4]| r.pattern.iter().filter(|f| f.0 == *k).count();
     let has = |k: &[u8; 4]| r.types.iter().any(|t| t.kind.0 == *k);
     let lpcm = count(b"lpcm");
-    let camera = if has(b"tdmt") {
+    let guess = if has(b"tdmt") {
         "Canon XF-HEVC S camera (such as EOS R5 Mark II or C80)"
     } else if has(b"aac ") {
         "Canon EOS camera with AAC audio (such as EOS R5, R6 or C70)"
@@ -530,165 +676,44 @@ fn describe(dat: &Path, r: &InspectReport) -> DatSummary {
     if has(b"tmcd") {
         parts.push("timecode".into());
     }
-    let video_frames = r
-        .types
-        .iter()
-        .find(|t| t.kind.0 == *b"vide")
-        .map_or(0, |t| t.samples);
 
     DatSummary {
         path: dat.to_path_buf(),
         file_name: file_name(dat),
         size_bytes: r.file_size,
-        camera: camera.into(),
+        camera: r.camera.clone().unwrap_or_else(|| guess.into()),
+        camera_known: r.camera.is_some(),
         contents: parts.join(", "),
-        // Frames divided by frame rate is exact; the audio-based estimate runs a little long
-        // because audio is recorded slightly ahead of the last complete video frame.
-        estimated_seconds: match r.estimated_fps {
-            Some(fps) if fps > 0.0 && video_frames > 0 => Some(video_frames as f64 / fps),
-            _ => r.estimated_seconds,
-        },
-        video_frames,
+        estimated_seconds: r.estimated_seconds,
+        frame_rate: r.estimated_fps.map(layout::fps_text),
+        video_frames: r.video_frames,
         cut_off: r.truncation.is_some(),
     }
 }
 
-/// Maps an engine error to a friendly one.
-///
-/// Every engine variant is listed on purpose: when the engine adds one, this stops compiling
-/// and points here.
+/// Maps an engine error to a friendly one. The words come from the engine
+/// ([`CoreError::user_message`]), so the CLI and the app say the same thing; the technical
+/// text goes to `details`.
 pub fn map_error(e: CoreError) -> AppError {
-    let details = e.to_string();
-    let mut err = match e {
-        CoreError::Io { context, source } => return io_error_ctx(&context, source),
-        CoreError::NotADat(msg) => AppError::new(
-            "not_a_dat",
-            "This file cannot be repaired",
-            format!("This does not look like a Canon recording: {msg}."),
-            "Check that it is the .DAT file from a Canon camera card. Older Canon bodies (such as the EOS R or M50 Mark II) do not write the index DATfix needs.",
-        ),
-        CoreError::BadReference { path, reason } => AppError::new(
-            "bad_reference",
-            "The healthy clip cannot be read",
-            format!("{} cannot be used: {reason}.", file_name(&path)),
-            "Choose a clip that plays normally, recorded on the same camera.",
-        ),
-        CoreError::Incompatible { path, reasons } => {
-            let mut e = AppError::new(
-                "incompatible_reference",
-                "The healthy clip does not match",
-                format!(
-                    "{} was recorded with different settings than this .DAT.",
-                    file_name(&path)
-                ),
-                "Choose a clip recorded on the same camera with the same resolution, frame rate, codec and audio settings.",
-            );
-            e.reasons = reasons;
-            e
-        }
-        CoreError::NoReference { dir, tried } => {
-            let mut e = AppError::new(
-                "no_reference_found",
-                "No matching clip found",
-                format!(
-                    "No clip in {} was recorded with the same settings.",
-                    dir.display()
-                ),
-                "Choose a clip recorded on the same camera with the same settings.",
-            );
-            e.reasons = tried
-                .into_iter()
-                .take(8)
-                .map(|(p, r)| format!("{}: {r}", file_name(&p)))
-                .collect();
-            e
-        }
-        CoreError::OutputExists(path) => AppError::new(
-            "output_exists",
-            "A file with that name already exists",
-            format!(
-                "{} already exists. DATfix never replaces files.",
-                path.display()
-            ),
-            "Choose another name or folder for the repaired video.",
-        ),
-        CoreError::OutputIsInput => AppError::new(
-            "output_is_input",
-            "That would overwrite the original",
-            "The save location is the .DAT file itself. The original is never changed.".into(),
-            "Choose another name for the repaired video.",
-        ),
-        CoreError::Cancelled => AppError::cancelled(),
-    };
-    err.details = details;
-    err
+    if matches!(e, CoreError::Cancelled) {
+        return AppError::cancelled();
+    }
+    let m = e.user_message();
+    AppError {
+        kind: m.kind,
+        title: m.title,
+        message: m.message,
+        next_step: m.next_step,
+        reasons: m.reasons,
+        details: e.to_string(),
+    }
 }
 
 fn io_error(path: &Path, verb: &str, source: std::io::Error) -> AppError {
-    io_error_ctx(&format!("cannot {verb} {}", path.display()), source)
-}
-
-/// Explains common disk and card errors in plain words.
-fn io_error_ctx(context: &str, source: std::io::Error) -> AppError {
-    use std::io::ErrorKind as K;
-    let details = format!("{context}: {source}");
-    let (kind, title, message, next): (&'static str, &str, &str, &str) = match source.kind() {
-        K::NotFound => (
-            "not_found",
-            "File not found",
-            "A file is missing. The card or drive may have been removed.",
-            "Reconnect the card or drive, then add the file again.",
-        ),
-        K::PermissionDenied | K::ReadOnlyFilesystem => (
-            "permission_denied",
-            "No permission",
-            "DATfix is not allowed to read or write here. A locked card or a read-only folder causes this.",
-            "Choose another folder to save to. On a Mac, check System Settings > Privacy & Security > Files and Folders.",
-        ),
-        K::StorageFull => (
-            "disk_full",
-            "The disk is full",
-            "The drive ran out of space while writing. The partial file was removed.",
-            "Free up space, or choose another drive to save to.",
-        ),
-        K::UnexpectedEof => (
-            "read_error",
-            "The file ended early",
-            "The file is shorter than expected. It may still be copying.",
-            "Wait until the copy is finished, then try again.",
-        ),
-        _ if source.raw_os_error() == Some(5) => (
-            "read_error",
-            "The card or disk reported a read error",
-            "Part of the file could not be read from the card or disk.",
-            "Copy the .DAT to your computer's internal drive first (a card recovery tool can help), then repair the copy.",
-        ),
-        _ => (
-            "io",
-            "A disk error stopped the repair",
-            "The operating system reported an error while reading or writing.",
-            "Check the card or drive is still connected and has free space, then try again.",
-        ),
-    };
-    let mut e = AppError::new(kind, title, message.into(), next);
-    e.details = details;
-    e
-}
-
-fn empty_dat(dat: &Path) -> AppError {
-    AppError::new(
-        "empty_dat",
-        "This .DAT file is empty (0 bytes)",
-        format!(
-            "{} contains no data. The camera saved the file's name, but the video itself was never recorded into it, so there is nothing for DATfix to rebuild.",
-            file_name(dat)
-        ),
-        "The video may still be on the card. Stop using the card, make a full copy (an image) of it, and run a card recovery tool such as PhotoRec on the copy. Then repair the .DAT it finds.",
-    )
-}
-
-fn not_a_dat(dat: &Path, why: &str) -> AppError {
-    map_error(CoreError::NotADat(format!("{} has {why}", file_name(dat))))
+    map_error(CoreError::io(
+        format!("cannot {verb} {}", path.display()),
+        source,
+    ))
 }
 
 /// Adds `.dat` files and `.mp4` clips; skips hidden files and our own outputs.
@@ -702,17 +727,6 @@ fn sort_file(p: &Path, dats: &mut Vec<PathBuf>, mp4s: &mut Vec<PathBuf>) {
         "mp4" if !name.contains("_repaired") => mp4s.push(p.to_path_buf()),
         _ => {}
     }
-}
-
-/// Collects `(path, size)` of usable clips under `dir`.
-fn collect_mp4s(dir: &Path, depth: usize, out: &mut Vec<(PathBuf, u64)>) {
-    walk(dir, depth, &mut |f| {
-        let name = file_name(f);
-        if extension(f) == "mp4" && !name.starts_with('.') && !name.contains("_repaired") {
-            let size = std::fs::metadata(f).map_or(u64::MAX, |m| m.len());
-            out.push((f.to_path_buf(), size));
-        }
-    });
 }
 
 /// Calls `visit` for every file under `dir`, `depth` folders deep. Skips hidden folders.
@@ -775,6 +789,7 @@ mod tests {
         let err = inspect(&dat, Arc::default(), &mut |_| {}).unwrap_err();
         assert_eq!(err.kind, "empty_dat");
         assert!(err.next_step.contains("PhotoRec"));
+        assert!(!err.details.is_empty());
     }
 
     #[test]

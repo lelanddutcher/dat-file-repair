@@ -15,13 +15,14 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 
 use crate::codec::{FrameAnalyzer, VideoCodec, verify_frame};
-use crate::error::{Error, Result};
+use crate::error::{Error, Reason, Result};
 use crate::hybrid;
-use crate::layout::DatLayout;
+use crate::layout::{DatLayout, fps_text, friendly_body};
 use crate::mapping::{self, Mapping, TrackPlan};
 use crate::mp4::reference::{Reference, TrackKind};
 use crate::mp4::synth;
@@ -65,8 +66,15 @@ pub struct Checked {
     pub kind: RefKind,
     /// Human name: the clip path or `built-in profile <id>`.
     pub label: String,
-    /// Tracks that were synthesized instead of copied.
+    /// Tracks that were synthesized instead of copied (technical names).
     pub synthesized: Vec<String>,
+    /// What was rebuilt and why, in plain sentences.
+    pub rebuilt: Vec<String>,
+    /// Where the settings come from, as one plain sentence, for example
+    /// `Using built-in settings for Canon EOS R5 Mark II, 4K 119.88p.`
+    pub summary: String,
+    /// The built-in profile in plain words, when one was used.
+    pub profile: Option<String>,
     pub notes: Vec<String>,
 }
 
@@ -95,6 +103,10 @@ pub fn describe_codec(codec: &VideoCodec) -> String {
     }
 }
 
+const NOT_LIKE_FRAMES: &str =
+    "Its picture settings (resolution, colour or compression) don't fit the frames in this .DAT.";
+const ALL_I_VS_IPB: &str = "It was recorded with ALL-I compression; this .DAT uses IPB (Long GOP).";
+
 /// Checks that the candidate's video fits the `.DAT`. Returns the codec and notes, or the
 /// reasons it does not fit.
 pub fn video_gate<R: ReadAt + ?Sized>(
@@ -102,39 +114,53 @@ pub fn video_gate<R: ReadAt + ?Sized>(
     index: &DatIndex,
     layout: &DatLayout,
     reference: &Reference,
-) -> std::result::Result<(VideoCodec, Vec<String>), Vec<String>> {
+) -> std::result::Result<(VideoCodec, Vec<String>), Vec<Reason>> {
     let mut notes = Vec::new();
-    let vt = reference
-        .video_track()
-        .ok_or_else(|| vec!["it has no video track".to_string()])?;
-    let vf = vt
-        .video
-        .as_ref()
-        .ok_or_else(|| vec!["no video format".into()])?;
-    let codec =
-        VideoCodec::from_config(vt.codec, vf.config_kind, &vf.config).map_err(|e| vec![e])?;
+    let no_video = || {
+        vec![Reason::new(
+            "The clip has no video.",
+            "it has no video track",
+        )]
+    };
+    let vt = reference.video_track().ok_or_else(no_video)?;
+    let vf = vt.video.as_ref().ok_or_else(no_video)?;
+    let codec = VideoCodec::from_config(vt.codec, vf.config_kind, &vf.config)
+        .map_err(|e| vec![Reason::new("Its video settings can't be read.", e)])?;
     if let Some(c) = layout.codec {
         let same = (c.0 == *b"avc1") == matches!(codec, VideoCodec::Avc(_));
         if !same {
-            return Err(vec![format!(
-                "codec differs: the .DAT holds {} frames, the clip is {}",
-                if c.0 == *b"avc1" { "H.264" } else { "HEVC" },
-                codec.name()
+            let dat = if c.0 == *b"avc1" { "H.264" } else { "HEVC" };
+            return Err(vec![Reason::new(
+                format!(
+                    "It was recorded as {} video; this .DAT holds {dat} video.",
+                    codec.name()
+                ),
+                format!(
+                    "codec differs: the .DAT holds {dat} frames, the clip is {}",
+                    codec.name()
+                ),
             )]);
         }
     }
     let ref_fps = vt.timescale as f64 / vt.sample_delta as f64;
     if let Some(rate) = layout.frame_rate {
         if !rate.matches(ref_fps) {
-            return Err(vec![format!(
-                "frame rate differs: the .DAT was recorded at {rate} ({} frames per 0.5 s group{}), \
-                 the clip at {ref_fps:.3}p",
-                layout.frames_per_group,
-                if layout.frame_rate_from_audio {
-                    ", measured against its audio"
-                } else {
-                    ""
-                }
+            return Err(vec![Reason::new(
+                format!(
+                    "It was recorded at {} frames per second, but this .DAT was recorded at {}.",
+                    fps_text(ref_fps),
+                    fps_text(rate.fps())
+                ),
+                format!(
+                    "frame rate differs: the .DAT was recorded at {rate} ({} frames per 0.5 s \
+                     group{}), the clip at {ref_fps:.3}p",
+                    layout.frames_per_group,
+                    if layout.frame_rate_from_audio {
+                        ", measured against its audio"
+                    } else {
+                        ""
+                    }
+                ),
             )]);
         }
     }
@@ -144,37 +170,51 @@ pub fn video_gate<R: ReadAt + ?Sized>(
                 && layout.frames_per_group > 0
                 && v.typical_samples != layout.frames_per_group
             {
-                return Err(vec![format!(
-                    "recording mode differs: the clip stores {} video frames per index group, \
-                     the .DAT stores {}",
-                    v.typical_samples, layout.frames_per_group
+                return Err(vec![Reason::new(
+                    "It was recorded in a different recording mode on the camera.",
+                    format!(
+                        "recording mode differs: the clip stores {} video frames per index \
+                         group, the .DAT stores {}",
+                        v.typical_samples, layout.frames_per_group
+                    ),
                 )]);
             }
             if v.align != 0 {
                 let dat_align = layout.shape(b"vide").map_or(1, |s| s.align);
                 if dat_align != v.align {
-                    return Err(vec![format!(
-                        "frame padding differs ({} vs {} bytes): another camera family",
-                        v.align, dat_align
+                    return Err(vec![Reason::new(
+                        "It comes from a different camera model or recording format.",
+                        format!(
+                            "frame padding differs ({} vs {} bytes): another camera family",
+                            v.align, dat_align
+                        ),
                     )]);
                 }
             }
         }
     }
     let ref_long = vt.has_stss || vt.has_ctts;
+    let gop_reason = || {
+        vec![Reason::new(
+            ALL_I_VS_IPB,
+            "the .DAT is Long GOP (it has non-key frames) but the clip is All-Intra",
+        )]
+    };
     if layout.long_gop == Some(true) && !ref_long {
-        return Err(vec![
-            "the .DAT is Long GOP (it has non-key frames) but the clip is All-Intra".into(),
-        ]);
+        return Err(gop_reason());
     }
 
     // Every probed frame must pass the full header check.
     let frames = gate_frames(index);
     for &(off, size) in &frames {
         if let Err(e) = verify_frame(src, &codec, off, size) {
-            return Err(vec![format!(
-                "the video frames do not fit the clip's settings ({}): frame at byte {off}: {e}",
-                describe_codec(&codec)
+            return Err(vec![Reason::new(
+                NOT_LIKE_FRAMES,
+                format!(
+                    "the video frames do not fit the clip's settings ({}): frame at byte {off}: \
+                     {e}",
+                    describe_codec(&codec)
+                ),
             )]);
         }
     }
@@ -185,17 +225,18 @@ pub fn video_gate<R: ReadAt + ?Sized>(
         match analyzer.analyze(src, off, size) {
             Ok(f) => non_key |= !f.sync && !f.cra,
             Err(e) => {
-                return Err(vec![format!(
-                    "the video frames cannot be read with the clip's {} settings: {e}",
-                    codec.name()
+                return Err(vec![Reason::new(
+                    NOT_LIKE_FRAMES,
+                    format!(
+                        "the video frames cannot be read with the clip's {} settings: {e}",
+                        codec.name()
+                    ),
                 )]);
             }
         }
     }
     if non_key && !ref_long {
-        return Err(vec![
-            "the .DAT is Long GOP (it has non-key frames) but the clip is All-Intra".into(),
-        ]);
+        return Err(gop_reason());
     }
     if let (Some(body), Some(theirs)) = (
         layout.body,
@@ -203,8 +244,9 @@ pub fn video_gate<R: ReadAt + ?Sized>(
     ) {
         if body != theirs {
             notes.push(format!(
-                "the .DAT comes from a {body}, the reference from a {theirs}; their video \
-                 settings match"
+                "the .DAT comes from a {}, the reference from a {}; their video settings match",
+                friendly_body(body),
+                friendly_body(&theirs)
             ));
         }
     }
@@ -220,7 +262,16 @@ pub fn check_reference<R: ReadAt + ?Sized>(
     kind: RefKind,
 ) -> Result<Checked> {
     let label = reference.path.display().to_string();
-    let incompatible = |path: &Path, reasons: Vec<String>| Error::Incompatible {
+    let name = reference
+        .path
+        .file_name()
+        .map_or_else(|| label.clone(), |n| n.to_string_lossy().into_owned());
+    let subject = if kind == RefKind::Profile {
+        "the built-in settings for this camera"
+    } else {
+        "your reference clip"
+    };
+    let incompatible = |path: &Path, reasons: Vec<Reason>| Error::Incompatible {
         path: path.to_path_buf(),
         reasons,
     };
@@ -234,20 +285,30 @@ pub fn check_reference<R: ReadAt + ?Sized>(
             mapping,
             codec,
             kind,
+            summary: format!("Using the settings from your clip {name}."),
             label,
             synthesized: Vec::new(),
+            rebuilt: Vec::new(),
+            profile: None,
             notes,
         }),
         Err(exact) => {
             let path = reference.path.clone();
-            let h = hybrid::assemble(&reference, index, layout).map_err(|e| {
-                let mut r = exact.clone();
-                r.push(e);
-                incompatible(&path, r)
+            let layout_reason = |detail: Vec<String>| {
+                Reason::new(
+                    "Its sound and data tracks are laid out differently, and DATfix can't \
+                     rebuild them.",
+                    detail.join("; "),
+                )
+            };
+            let h = hybrid::assemble(&reference, index, layout, subject).map_err(|e| {
+                let mut detail = exact.clone();
+                detail.push(e.detail.clone());
+                incompatible(&path, vec![Reason::new(e.user, detail.join("; "))])
             })?;
             let mapping = mapping::map_tracks(index, &h.reference).map_err(|mut r| {
                 r.splice(0..0, exact.iter().cloned());
-                incompatible(&path, r)
+                incompatible(&path, vec![layout_reason(r)])
             })?;
             let mut why = exact.clone();
             why.dedup();
@@ -275,19 +336,31 @@ pub fn check_reference<R: ReadAt + ?Sized>(
                 } else {
                     RefKind::Hybrid
                 },
+                summary: format!("Using the video settings from your clip {name}."),
                 label,
                 synthesized: h.synthesized,
+                rebuilt: h.rebuilt,
+                profile: None,
                 notes,
             })
         }
     }
 }
 
+const NOT_ORIGINAL: &str =
+    "It's an edited or converted copy, not the original file from the camera.";
+
 /// Opens a candidate clip and rejects files that cannot be camera originals.
-pub fn open_candidate(path: &Path) -> std::result::Result<Reference, String> {
-    let r = Reference::open(path).map_err(|e| match e {
-        Error::BadReference { reason, .. } => reason,
-        other => other.to_string(),
+pub fn open_candidate(path: &Path) -> std::result::Result<Reference, Reason> {
+    let r = Reference::open(path).map_err(|e| {
+        let detail = match e {
+            Error::BadReference { reason, .. } => reason,
+            other => other.to_string(),
+        };
+        Reason::new(
+            "It can't be read as a video file (it may be damaged or not fully copied).",
+            detail,
+        )
     })?;
     let brands: Vec<String> = r
         .ftyp
@@ -299,18 +372,27 @@ pub fn open_candidate(path: &Path) -> std::result::Result<Reference, String> {
     let vt = r.video_track();
     if let Some(v) = vt {
         match &v.codec.0 {
-            b"av01" => return Err("AV1 re-encode (not a camera original)".into()),
+            b"av01" => {
+                return Err(Reason::new(
+                    NOT_ORIGINAL,
+                    "AV1 re-encode (not a camera original)",
+                ));
+            }
             b"hev1" => {
-                return Err(
-                    "hev1 HEVC (a remux or re-encode; Canon writes hvc1 with settings in the header)"
-                        .into(),
-                );
+                return Err(Reason::new(
+                    NOT_ORIGINAL,
+                    "hev1 HEVC (a remux or re-encode; Canon writes hvc1 with settings in the \
+                     header)",
+                ));
             }
             b"hvc1" | b"avc1" => {}
             other => {
-                return Err(format!(
-                    "video codec {} is not one Canon writes",
-                    String::from_utf8_lossy(other)
+                return Err(Reason::new(
+                    "Its video format isn't one that Canon cameras record.",
+                    format!(
+                        "video codec {} is not one Canon writes",
+                        String::from_utf8_lossy(other)
+                    ),
                 ));
             }
         }
@@ -321,19 +403,201 @@ pub fn open_candidate(path: &Path) -> std::result::Result<Reference, String> {
             a.kind.0 == *b"uuid" && a.payload().is_some_and(|p| p.starts_with(&CANON_UUID))
         });
     if !canon_brand && !canon_uuid {
-        return Err(format!(
-            "not a Canon camera original (file type {}, no Canon metadata box): probably exported \
-             or re-encoded",
-            brands.join("/")
+        return Err(Reason::new(
+            "It isn't an original file from a Canon camera (it looks exported or converted).",
+            format!(
+                "not a Canon camera original (file type {}, no Canon metadata box): probably \
+                 exported or re-encoded",
+                brands.join("/")
+            ),
         ));
     }
-    if vt.is_none() {
-        return Err("no video track".into());
-    }
-    if r.tracks.iter().all(|t| t.kind != TrackKind::Video) {
-        return Err("no video track".into());
+    if vt.is_none() || r.tracks.iter().all(|t| t.kind != TrackKind::Video) {
+        return Err(Reason::new("The clip has no video.", "no video track"));
     }
     Ok(r)
+}
+
+/// How a folder search runs.
+#[derive(Clone, Copy, Debug)]
+pub struct SearchOptions<'a> {
+    /// Folder levels searched below each folder (0 = only the folder itself).
+    pub depth: u32,
+    /// Clips checked at most.
+    pub max_candidates: usize,
+    /// Set from another thread to stop the search with [`Error::Cancelled`].
+    pub cancel: Option<&'a AtomicBool>,
+}
+
+impl Default for SearchOptions<'_> {
+    fn default() -> Self {
+        SearchOptions {
+            depth: SEARCH_DEPTH,
+            max_candidates: MAX_CANDIDATES,
+            cancel: None,
+        }
+    }
+}
+
+/// What a search decided about one clip.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "verdict", rename_all = "snake_case")]
+pub enum Verdict {
+    /// Every track fits.
+    Fits,
+    /// The video fits; the other tracks would be rebuilt (plain sentences).
+    VideoOnly { rebuilt: Vec<String> },
+    /// The clip cannot be used.
+    Skipped { reason: Reason },
+}
+
+/// One checked clip.
+#[derive(Clone, Debug, Serialize)]
+pub struct Candidate {
+    pub path: PathBuf,
+    pub verdict: Verdict,
+}
+
+/// Result of [`search_references`].
+pub struct ReferenceSearch {
+    /// `.MP4` files found in the folders (before the [`SearchOptions::max_candidates`] limit).
+    pub found: usize,
+    /// Every clip checked, in the order checked, with its verdict.
+    pub candidates: Vec<Candidate>,
+    /// The best clip: the first whose every track fits, else the first whose video fits.
+    pub chosen: Option<Checked>,
+}
+
+impl ReferenceSearch {
+    /// Clips checked.
+    pub fn checked(&self) -> usize {
+        self.candidates.len()
+    }
+
+    /// The skipped clips and why, for [`Error::NoReference`].
+    pub fn skipped(&self) -> Vec<(PathBuf, Reason)> {
+        self.candidates
+            .iter()
+            .filter_map(|c| match &c.verdict {
+                Verdict::Skipped { reason } => Some((c.path.clone(), reason.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// Searches folders for a clip that fits the `.DAT` and reports a verdict for every clip it
+/// checked. Shallow clips first, then small ones (cheap to open, same settings). The search
+/// stops at the first clip whose every track fits; a clip whose only video fits is kept as a
+/// fallback while the search goes on.
+pub fn search_references<R: ReadAt + ?Sized>(
+    src: &R,
+    index: &DatIndex,
+    layout: &DatLayout,
+    dirs: &[PathBuf],
+    opts: &SearchOptions,
+    on_event: &mut dyn FnMut(&Event),
+) -> Result<ReferenceSearch> {
+    let mut keyed: Vec<(usize, u64, PathBuf)> = Vec::new();
+    for dir in dirs {
+        let mut files = Vec::new();
+        profile::collect_mp4s(dir, opts.depth, &mut files)
+            .map_err(|e| Error::io(format!("cannot list {}", dir.display()), e))?;
+        for p in files {
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default();
+            // Our own outputs are never camera originals.
+            if name.contains("_repaired") {
+                continue;
+            }
+            let depth = p.strip_prefix(dir).map_or(0, |r| r.components().count());
+            let size = std::fs::metadata(&p).map_or(u64::MAX, |m| m.len());
+            keyed.push((depth, size, p));
+        }
+    }
+    keyed.sort();
+    keyed.dedup_by(|a, b| a.2 == b.2);
+    let found = keyed.len();
+    let mut candidates = Vec::new();
+    let mut hybrid: Option<Checked> = None;
+    let mut reject = |path: PathBuf, reason: Reason, candidates: &mut Vec<Candidate>| {
+        on_event(&Event::ReferenceRejected {
+            path: path.clone(),
+            reason: reason.detail.clone(),
+            user_reason: reason.user.clone(),
+        });
+        candidates.push(Candidate {
+            path,
+            verdict: Verdict::Skipped { reason },
+        });
+    };
+    for (_, _, path) in keyed.into_iter().take(opts.max_candidates) {
+        if opts.cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err(Error::Cancelled);
+        }
+        let reference = match open_candidate(&path) {
+            Ok(r) => r,
+            Err(reason) => {
+                reject(path, reason, &mut candidates);
+                continue;
+            }
+        };
+        match check_reference(src, index, layout, reference, RefKind::User) {
+            Ok(c) if c.kind == RefKind::User => {
+                candidates.push(Candidate {
+                    path: path.clone(),
+                    verdict: Verdict::Fits,
+                });
+                on_event(&Event::ReferenceChosen { path });
+                return Ok(ReferenceSearch {
+                    found,
+                    candidates,
+                    chosen: Some(c),
+                });
+            }
+            Ok(c) => {
+                candidates.push(Candidate {
+                    path,
+                    verdict: Verdict::VideoOnly {
+                        rebuilt: c.rebuilt.clone(),
+                    },
+                });
+                if hybrid.is_none() {
+                    hybrid = Some(c);
+                }
+            }
+            Err(e) => {
+                let reason = match e {
+                    Error::Incompatible { reasons, .. } => Reason::new(
+                        reasons
+                            .iter()
+                            .map(|r| r.user.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        reasons
+                            .iter()
+                            .map(|r| r.detail.as_str())
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    ),
+                    other => Reason::new(other.user_message().message, other.to_string()),
+                };
+                reject(path, reason, &mut candidates);
+            }
+        }
+    }
+    if let Some(c) = &hybrid {
+        on_event(&Event::ReferenceChosen {
+            path: c.reference.path.clone(),
+        });
+    }
+    Ok(ReferenceSearch {
+        found,
+        candidates,
+        chosen: hybrid,
+    })
 }
 
 /// Searches `dir` (recursively, [`SEARCH_DEPTH`] levels) for a fitting clip. A clip whose
@@ -345,63 +609,17 @@ pub fn choose_from_dir<R: ReadAt + ?Sized>(
     dir: &Path,
     on_event: &mut dyn FnMut(&Event),
 ) -> Result<Checked> {
-    let mut files = Vec::new();
-    profile::collect_mp4s(dir, SEARCH_DEPTH, &mut files)
-        .map_err(|e| Error::io(format!("cannot list {}", dir.display()), e))?;
-    // Shallow files first, then small ones (cheap to open, same settings).
-    let mut keyed: Vec<(usize, u64, PathBuf)> = files
-        .into_iter()
-        .map(|p| {
-            let depth = p.strip_prefix(dir).map_or(0, |r| r.components().count());
-            let size = std::fs::metadata(&p).map_or(u64::MAX, |m| m.len());
-            (depth, size, p)
-        })
-        .collect();
-    keyed.sort();
-    let mut tried = Vec::new();
-    let mut hybrid: Option<Checked> = None;
-    for (_, _, path) in keyed.into_iter().take(MAX_CANDIDATES) {
-        let reference = match open_candidate(&path) {
-            Ok(r) => r,
-            Err(reason) => {
-                on_event(&Event::ReferenceRejected {
-                    path: path.clone(),
-                    reason: reason.clone(),
-                });
-                tried.push((path, reason));
-                continue;
-            }
-        };
-        match check_reference(src, index, layout, reference, RefKind::User) {
-            Ok(c) if c.kind == RefKind::User => {
-                on_event(&Event::ReferenceChosen { path: path.clone() });
-                return Ok(c);
-            }
-            Ok(c) => {
-                if hybrid.is_none() {
-                    hybrid = Some(c);
-                }
-            }
-            Err(e) => {
-                let reason = match &e {
-                    Error::Incompatible { reasons, .. } => reasons.join("; "),
-                    other => other.to_string(),
-                };
-                on_event(&Event::ReferenceRejected {
-                    path: path.clone(),
-                    reason: reason.clone(),
-                });
-                tried.push((path, reason));
-            }
-        }
-    }
-    if let Some(c) = hybrid {
-        on_event(&Event::ReferenceChosen {
-            path: c.reference.path.clone(),
-        });
-        return Ok(c);
-    }
-    Err(Error::NoReference {
+    let dirs = [dir.to_path_buf()];
+    let search = search_references(
+        src,
+        index,
+        layout,
+        &dirs,
+        &SearchOptions::default(),
+        on_event,
+    )?;
+    let tried = search.skipped();
+    search.chosen.ok_or_else(|| Error::NoReference {
         dir: dir.to_path_buf(),
         tried,
     })
@@ -435,6 +653,7 @@ pub fn choose_profile_from<R: ReadAt + ?Sized>(
     on_event: &mut dyn FnMut(&Event),
 ) -> Result<Checked> {
     let summary = layout.describe();
+    let camera = layout.describe_plain();
     let mut tried: Vec<(String, String)> = Vec::new();
     let code = layout.body_code.map(|c| crate::layout::hex(&c));
     let mut candidates: Vec<&Profile> = Vec::new();
@@ -472,7 +691,11 @@ pub fn choose_profile_from<R: ReadAt + ?Sized>(
             }
             Err(e) => {
                 let reason = match &e {
-                    Error::Incompatible { reasons, .. } => reasons.join("; "),
+                    Error::Incompatible { reasons, .. } => reasons
+                        .iter()
+                        .map(|r| r.detail.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; "),
                     other => other.to_string(),
                 };
                 tried.push((p.id.clone(), reason));
@@ -482,7 +705,11 @@ pub fn choose_profile_from<R: ReadAt + ?Sized>(
     if passing.is_empty() {
         // Only list the near misses: profiles of this body (or all when the body is unknown).
         tried.sort();
-        return Err(Error::NoProfile { summary, tried });
+        return Err(Error::NoProfile {
+            summary,
+            camera,
+            tried,
+        });
     }
     // Group decode-equivalent settings.
     let mut keys: Vec<String> = Vec::new();
@@ -512,6 +739,7 @@ pub fn choose_profile_from<R: ReadAt + ?Sized>(
                 .collect();
             return Err(Error::AmbiguousProfile {
                 summary,
+                camera,
                 candidates,
             });
         }
@@ -541,6 +769,9 @@ pub fn choose_profile_from<R: ReadAt + ?Sized>(
         ));
     }
     let (p, mut chosen) = same.swap_remove(0);
+    let plain = p.plain();
+    chosen.summary = format!("Using built-in settings for {plain}.");
+    chosen.profile = Some(plain);
     chosen.notes.insert(
         0,
         format!(
