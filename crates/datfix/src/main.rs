@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+mod scan;
+
 use clap::{Parser, Subcommand};
 use datfix_core::inspect::{self, InspectReport};
 use datfix_core::profile;
@@ -62,6 +64,9 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Find recordings on a card image or device: 0-byte, deleted or missing .DAT files whose
+    /// data is still on the card. Reads only; image the card first (see `docs/format/card-carving.md`).
+    Scan(scan::ScanArgs),
     /// Find hidden temporary files left by repairs that were killed, and delete them with --yes.
     Clean {
         /// The folder the repaired files were saved in. Default: the current folder.
@@ -102,6 +107,7 @@ fn main() -> ExitCode {
             ProfilesAction::List => run_profiles_list(json),
             ProfilesAction::Harvest { paths, out } => run_harvest(&paths, &out, json),
         },
+        Command::Scan(args) => scan::run(&args, json),
         Command::Clean { dir, yes } => {
             run_clean(&dir.unwrap_or_else(|| PathBuf::from(".")), yes, json)
         }

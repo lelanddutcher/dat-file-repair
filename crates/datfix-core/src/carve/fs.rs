@@ -48,9 +48,11 @@ impl DirEntry {
         self.path.rsplit('/').next().unwrap_or(&self.path)
     }
 
-    /// True for `*.DAT` (any case).
+    /// True for `*.DAT` (any case). macOS `._` metadata files are not recordings.
     pub fn is_dat(&self) -> bool {
-        !self.is_dir && self.name().to_ascii_uppercase().ends_with(".DAT")
+        !self.is_dir
+            && !self.name().starts_with("._")
+            && self.name().to_ascii_uppercase().ends_with(".DAT")
     }
 }
 

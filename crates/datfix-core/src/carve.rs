@@ -71,6 +71,8 @@ const OVERLAP: usize = 32;
 const KINDS: [&[u8; 4]; 5] = [b"vide", b"tmcd", b"lpcm", b"aac ", b"tdmt"];
 /// Size of one per-frame record after a video group (spec section 6).
 const RECORD_SIZE: u64 = 128;
+/// Byte of the 7-bit frame counter in a per-frame record (spec section 6).
+const RECORD_COUNTER: usize = 0x54;
 /// How far past the expected position a resync may look for the next header.
 const RESYNC_WINDOW: u64 = 64 << 10;
 /// Cluster sizes tried for the break point when the file system is unknown.
@@ -89,7 +91,7 @@ const MIN_CLUSTER: u64 = 4 << 10;
 /// Groups followed from a candidate continuation to reach its first `tmcd` group.
 const LOOKAHEAD_GROUPS: usize = 16;
 /// Fragments shorter than this many groups are not reported.
-const MIN_FRAGMENT_GROUPS: usize = 4;
+const MIN_FRAGMENT_GROUPS: usize = 2;
 /// Stitches per recording at most.
 const MAX_STITCHES: usize = 64;
 
@@ -533,6 +535,8 @@ struct Walk {
     /// Timecode the next `tmcd` group must start with.
     tc_next: Option<u32>,
     tc_first: Option<u32>,
+    /// 7-bit per-frame record counter the next video group must start with.
+    rc_next: Option<u32>,
     resyncs: u64,
     stitched: bool,
     partial: Option<String>,
@@ -656,6 +660,7 @@ impl<'a, R: ReadAt + ?Sized> Follower<'a, R> {
             mode: VideoMode::default(),
             tc_next: None,
             tc_first: None,
+            rc_next: None,
             resyncs: 0,
             stitched: false,
             partial: None,
@@ -682,6 +687,12 @@ impl<'a, R: ReadAt + ?Sized> Follower<'a, R> {
             match next {
                 Some((j, exact)) => {
                     self.learn(i, j, &mut w.mode);
+                    // A video group with a successor is complete: its records are real.
+                    if h.kind.0 == *b"vide" && w.mode.records == Some(true) {
+                        w.rc_next = self
+                            .record_counter(i, w.mode.pad8.unwrap_or(false))
+                            .map(|c| (c + h.n) & 0x7f);
+                    }
                     if !exact {
                         w.resyncs += 1;
                     }
@@ -704,12 +715,56 @@ impl<'a, R: ReadAt + ?Sized> Follower<'a, R> {
                             }
                             Err(why) => w.partial = why,
                         }
+                    } else if w.tc_next.is_none() && w.partial.is_none() {
+                        w.partial = self.continuation_hint(&w, i);
                     }
                     break;
                 }
             }
         }
         w
+    }
+
+    /// 7-bit frame counter in the first per-frame record after video group `i`.
+    fn record_counter(&self, i: usize, pad8: bool) -> Option<u32> {
+        let h = &self.hits[i];
+        let g = geom(self.src, h.offset, h);
+        let at = if pad8 { g.padded } else { g.packed };
+        let r = self.src.read_vec(at, RECORD_SIZE as usize).ok()?;
+        (r[0] == 0x04).then_some(r[RECORD_COUNTER] as u32 & 0x7f)
+    }
+
+    /// For a recording without timecode: is there a piece elsewhere that continues the
+    /// per-frame record counter? It is reported, never joined: 7 bits are no proof.
+    fn continuation_hint(&self, w: &Walk, last: usize) -> Option<String> {
+        let h = self.hits[last];
+        if h.kind.0 != *b"vide" || !self.chain_could_continue(last) {
+            return None;
+        }
+        let want = w.rc_next.map(|c| (c + h.n) & 0x7f)?;
+        let pad8 = w.mode.pad8.unwrap_or(false);
+        let g = geom(self.src, h.offset, &h);
+        let expect = expected_end(&g, &h, pad8, true);
+        let step = self.cluster.unwrap_or(MIN_CLUSTER) as i128;
+        let found: Vec<u64> = (0..self.hits.len())
+            .filter(|&j| {
+                let x = &self.hits[j];
+                let delta = x.offset as i128 - expect as i128;
+                !self.claimed[j]
+                    && x.kind == h.kind
+                    && delta != 0
+                    && delta.rem_euclid(step) == 0
+                    && !self.in_clip(x.offset)
+                    && self.record_counter(j, pad8) == Some(want)
+            })
+            .map(|j| self.hits[j].offset)
+            .take(3)
+            .collect();
+        let first = found.first()?;
+        Some(format!(
+            "it may continue at byte {first} (the frame counter matches), but this recording \
+             has no timecode to prove it; that piece is listed as a fragment"
+        ))
     }
 
     /// True when the image does not end right after group `i`.
@@ -998,7 +1053,8 @@ fn moov_model(moov: &[u8]) -> Option<String> {
     let i = memchr::memmem::find(moov, b"modl")?;
     let start = i.checked_sub(4)?;
     let size = u32::from_be_bytes(moov.get(start..i)?.try_into().ok()?) as usize;
-    let s = moov.get(i + 8..start + size)?;
+    // `modl` is a full box (4 bytes version/flags) with a 2-byte language code.
+    let s = moov.get(i + 10..start + size)?;
     let s = s.split(|&c| c == 0).next()?;
     let s = String::from_utf8_lossy(s).trim().to_string();
     (!s.is_empty()).then(|| friendly_body(&s))
@@ -1312,7 +1368,7 @@ pub fn scan<R: ReadAt + Sync + ?Sized>(
         }
     }
     for h in &dat_entries {
-        if h.recording.is_none() {
+        if h.recording.is_none() && h.data_offset.is_some() {
             notes.push(format!(
                 "{}{} points at {}, but no recording starts there",
                 h.path,

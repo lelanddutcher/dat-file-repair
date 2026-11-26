@@ -54,7 +54,7 @@ fn canon_stream(min_len: usize, tc0: u32, timecode: bool, frame: u32) -> Vec<u8>
             let mut r = vec![0u8; 128];
             r[0] = 0x04;
             r[1..4].copy_from_slice(&[0x00, 0x00, 0x45]);
-            r[0x54] = (k * F + i) as u8 & 0x7f;
+            r[0x54] = (k + i) as u8 & 0x7f;
             g.extend(r);
         }
         d.extend(g);
@@ -148,6 +148,8 @@ fn does_not_stitch_without_timecode() {
     let r = run(&img);
     assert_eq!(r.recordings.len(), 1);
     assert!(!r.recordings[0].stitched);
+    let why = r.recordings[0].partial.as_deref().unwrap_or_default();
+    assert!(why.contains("may continue at byte"), "{why}");
     // Frames after the cut are dropped. A frame that starts before the cut can only be checked
     // by its NAL length prefixes, so at most one frame of foreign bytes may remain.
     let kept = bytes_of(&img, &r.recordings[0]);
@@ -190,8 +192,8 @@ fn finished_clip(payload: &[u8]) -> Vec<u8> {
     mvhd[16..20].copy_from_slice(&2500u32.to_be_bytes());
     let mut modl = Vec::new();
     let name = b"Canon EOS R5m2\0";
-    modl.extend(((8 + 4 + name.len()) as u32).to_be_bytes());
-    modl.extend(b"modl\0\0\x15\xc7");
+    modl.extend(((8 + 6 + name.len()) as u32).to_be_bytes());
+    modl.extend(b"modl\0\0\0\0\x15\xc7");
     modl.extend(name);
     let moov_len = 8 + 8 + mvhd.len() + modl.len();
     v.extend((moov_len as u32).to_be_bytes());
