@@ -8,15 +8,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::codec::{FrameAnalyzer, FrameInfo, VideoCodec};
 use crate::error::{Error, Result};
 use crate::layout::{self, DatLayout};
 use crate::mapping::TrackPlan;
+use crate::mp4::atom::Atom;
 use crate::mp4::reference::{Reference, TrackKind};
 use crate::mp4::tables::MP4_EPOCH_OFFSET;
-use crate::mp4::writer::{self, TrackOutput, rescale};
+pub use crate::mp4::writer::Rotation;
+use crate::mp4::writer::{self, MoovOptions, MoovSummary, TrackOutput, rescale};
 use crate::read_at::{FileSource, Overlay, ReadAt, Region, Tolerant};
 use crate::repi::{self, DatIndex, Truncation};
 use crate::timeline::{self, TimelineGap};
@@ -88,6 +90,54 @@ pub struct RepairOptions {
     /// Stop at the first read error. By default (`false`) unreadable parts of a failing card
     /// are skipped and treated as damage; the report lists them and the seconds lost.
     pub stop_on_read_error: bool,
+    /// Copy the reference clip's own metadata into the output: Canon's thumbnail and EXIF box
+    /// (camera and lens serial numbers, firmware, owner, the reference's capture dates),
+    /// location and other user data. Off by default, because those describe another clip.
+    pub keep_reference_metadata: bool,
+    /// Display rotation of the picture, clockwise. `None` keeps the reference clip's
+    /// orientation (upright for the built-in settings).
+    pub rotation: Option<Rotation>,
+    /// What is known about the recording from outside the `.DAT` bytes, for example the card's
+    /// directory entry of a carved recording: original name and timestamps.
+    pub hint: Option<RecordingHint>,
+}
+
+/// Facts about a recording that come from outside its bytes.
+///
+/// [`crate::carve::hint_for`] builds one from the card's directory entry. Every field is
+/// optional.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecordingHint {
+    /// The recording's original file name (`LAD12345.DAT`,
+    /// `A_0002D054H241221_134042C0_LAD04.DAT`). A Canon name with a date is the best source of
+    /// the recording time.
+    pub name: Option<String>,
+    /// When the camera created the file, which is when the recording started. Camera local
+    /// time, as seconds since 1970 counted as if local time were UTC.
+    pub created_local: Option<i64>,
+    /// When the camera last wrote the file (about when the recording stopped). Same clock.
+    pub modified_local: Option<i64>,
+    /// The time-zone offset stored with those times, seconds east of UTC (exFAT only).
+    pub utc_offset: Option<i32>,
+    /// The `.DAT` copy's own modification time says nothing about the recording (a stream
+    /// carved from a card image is written at scan time). Never use it.
+    pub ignore_file_time: bool,
+}
+
+/// Where the recording time written into the file came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DateSource {
+    /// A Canon file name with date and time (`…H241221_134042…`).
+    FileName,
+    /// The card's directory entry (creation time) of a carved recording.
+    CardEntry,
+    /// The `.DAT`'s timecode (time of day) with the date from the file's modification time.
+    Timecode,
+    /// The file's modification time minus the recording length.
+    FileTime,
+    /// Nothing usable: the file says 1904-01-01.
+    Unknown,
 }
 
 /// One output track in the report.
@@ -127,6 +177,12 @@ pub struct RepairReport {
     /// Recording start written into the file (UTC, seconds since 1970) and where it came from.
     pub creation_time: Option<i64>,
     pub creation_time_source: String,
+    pub date_source: DateSource,
+    /// Display rotation of the video track in the output, clockwise, when it is a quarter turn.
+    pub rotation: Option<Rotation>,
+    /// Metadata of the reference clip that was left out of the output (empty with
+    /// [`RepairOptions::keep_reference_metadata`]).
+    pub withheld_metadata: Vec<String>,
     /// Damaged regions and how many frames each removed.
     pub gaps: Vec<TimelineGap>,
     pub output: PathBuf,
@@ -403,38 +459,141 @@ pub fn playable_mp4<R: ReadAt + ?Sized>(src: &R) -> Option<String> {
     ))
 }
 
-/// Picks the creation time: the Canon file name (local time) adjusted to UTC with the
-/// offset implied by the file's modification time, else modification time minus duration.
-fn creation_time(layout: &DatLayout, mtime: Option<i64>, duration: f64) -> (Option<i64>, String) {
-    let end_estimate = mtime.map(|m| m - duration.round() as i64);
-    if let Some(local) = layout.start.name_local {
-        if let Some(utc) = end_estimate {
-            let offset = local - utc;
-            let rounded = (offset as f64 / 900.0).round() as i64 * 900;
-            if rounded.abs() <= 14 * 3600 && (offset - rounded).abs() <= 600 {
-                let sign = if rounded < 0 { '-' } else { '+' };
-                return (
-                    Some(local - rounded),
-                    format!(
-                        "file name (camera local time, UTC{sign}{:02}:{:02} inferred from the file \
-                         time)",
-                        rounded.abs() / 3600,
-                        rounded.abs() % 3600 / 60
-                    ),
-                );
-            }
+/// Largest gap between the timecode's time of day and the file time (after removing a
+/// whole time zone) for the timecode to count as the camera clock. A preset or "rec run"
+/// timecode lands anywhere; LAD18029 (preset) is 359 s off the nearest quarter hour.
+const TIMECODE_TOLERANCE: i64 = 180;
+
+/// Time-zone offsets that are not a multiple of 30 minutes (Nepal, Eucla, Chatham).
+const ODD_ZONES: [i64; 3] = [20_700, 31_500, 45_900];
+
+/// Rounds a measured local-minus-UTC difference to a real time-zone offset. Returns `None`
+/// when the difference is more than `tolerance` seconds away from every real zone.
+fn zone_offset(diff: i64, tolerance: i64) -> Option<i64> {
+    let candidates = (-24..=28)
+        .map(|h| h as i64 * 1800)
+        .chain(ODD_ZONES)
+        .filter(|z| (-12 * 3600..=14 * 3600).contains(z));
+    candidates
+        .min_by_key(|z| (diff - z).abs())
+        .filter(|z| (diff - z).abs() <= tolerance)
+}
+
+fn zone_text(offset: i64) -> String {
+    let sign = if offset < 0 { '-' } else { '+' };
+    format!(
+        "UTC{sign}{:02}:{:02}",
+        offset.abs() / 3600,
+        offset.abs() % 3600 / 60
+    )
+}
+
+/// Picks the recording start time, best source first:
+///
+/// 1. **Canon file name** (`…H241221_134042…`): date and second, camera local time. The zone
+///    comes from the card entry when it stores one, else from the file time when that agrees
+///    within 10 minutes; else the local time is written as UTC.
+/// 2. **Card directory entry** of a carved recording: creation time, 2-second steps, local
+///    time; exFAT may store the zone.
+/// 3. **Timecode** (inside the `.DAT`): time of day to the frame, but no date. Used with the
+///    date and zone from the file time, and only when the two agree within
+///    [`TIMECODE_TOLERANCE`] after removing a whole time zone (so the timecode follows the
+///    camera clock and is not a preset). The per-frame records and `tdmt` hold no date.
+/// 4. **File time** minus the recording length (the camera last writes the `.DAT` when the
+///    recording stops). Right only if copies kept the original modification time.
+fn creation_time(
+    layout: &DatLayout,
+    name_local: Option<i64>,
+    hint: Option<&RecordingHint>,
+    mtime: Option<i64>,
+    duration: f64,
+) -> (Option<i64>, DateSource, String) {
+    let mtime = mtime.filter(|_| !hint.is_some_and(|h| h.ignore_file_time));
+    let start_estimate = mtime.map(|m| m - duration.round() as i64);
+    let card_zone = hint.and_then(|h| h.utc_offset).map(i64::from);
+    if let Some(local) = name_local {
+        if let Some(z) = card_zone {
+            return (
+                Some(local - z),
+                DateSource::FileName,
+                format!(
+                    "file name (camera local time, {} from the card)",
+                    zone_text(z)
+                ),
+            );
+        }
+        if let Some(z) = start_estimate.and_then(|utc| zone_offset(local - utc, 600)) {
+            return (
+                Some(local - z),
+                DateSource::FileName,
+                format!(
+                    "file name (camera local time, {} inferred from the file time)",
+                    zone_text(z)
+                ),
+            );
         }
         return (
             Some(local),
+            DateSource::FileName,
             "file name (camera local time; time zone unknown, written as UTC)".into(),
         );
     }
-    match end_estimate {
+    if let Some(local) = hint.and_then(|h| h.created_local) {
+        return match card_zone {
+            Some(z) => (
+                Some(local - z),
+                DateSource::CardEntry,
+                format!(
+                    "the card's directory entry (creation time, {} stored on the card)",
+                    zone_text(z)
+                ),
+            ),
+            None => (
+                Some(local),
+                DateSource::CardEntry,
+                "the card's directory entry (creation time in camera local time; time zone \
+                 unknown, written as UTC)"
+                    .into(),
+            ),
+        };
+    }
+    if let (Some(tod), Some(utc)) = (layout.start.timecode_seconds, start_estimate) {
+        let tod = tod.round() as i64;
+        let diff = (tod - utc.rem_euclid(86_400) + 43_200).rem_euclid(86_400) - 43_200;
+        // Zones east of UTC+12 wrap; try both readings.
+        let zone = zone_offset(diff, TIMECODE_TOLERANCE)
+            .or_else(|| zone_offset(diff + 86_400, TIMECODE_TOLERANCE));
+        if let Some(z) = zone {
+            let local_estimate = utc + z;
+            let mut local = local_estimate.div_euclid(86_400) * 86_400 + tod;
+            if local - local_estimate > 43_200 {
+                local -= 86_400;
+            } else if local_estimate - local > 43_200 {
+                local += 86_400;
+            }
+            return (
+                Some(local - z),
+                DateSource::Timecode,
+                format!(
+                    "timecode time of day, with the date from the file time ({} inferred)",
+                    zone_text(z)
+                ),
+            );
+        }
+    }
+    match start_estimate {
         Some(t) => (
             Some(t),
-            "file modification time minus the recording length".into(),
+            DateSource::FileTime,
+            if layout.start.timecode_seconds.is_some() {
+                "file modification time minus the recording length (the timecode does not \
+                 follow the camera clock)"
+                    .into()
+            } else {
+                "file modification time minus the recording length".into()
+            },
         ),
-        None => (None, "unknown".into()),
+        None => (None, DateSource::Unknown, "unknown".into()),
     }
 }
 
@@ -456,6 +615,11 @@ pub struct RepairPlan {
     pub notes: Vec<String>,
     pub created: Option<i64>,
     pub created_source: String,
+    pub date_source: DateSource,
+    /// Rotation of the output's video track, when it is a quarter turn.
+    pub rotation: Option<Rotation>,
+    /// Reference metadata left out of the output.
+    pub withheld: Vec<String>,
     pub truncation: Option<Truncation>,
     /// `.DAT` bytes `[copy_start, copy_end)` become the `mdat` payload, then `silence` zeros.
     pub copy_start: u64,
@@ -529,7 +693,13 @@ pub fn plan_repair<R: ReadAt + ?Sized>(
     opts: &RepairOptions,
     on_event: &mut dyn FnMut(&Event),
 ) -> Result<RepairPlan> {
-    let name = dat.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let file_name = dat.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    // A Canon name from the card wins over the name of a carved copy (`recovered_….DAT`).
+    let hint_name = opts.hint.as_ref().and_then(|h| h.name.as_deref());
+    let name = match hint_name {
+        Some(n) if layout::time_from_name(n).is_some() => n,
+        _ => file_name,
+    };
     let lay = layout::analyze(src, index, name);
     if !index
         .groups
@@ -554,7 +724,7 @@ pub fn plan_repair<R: ReadAt + ?Sized>(
         (Some(r), _) => check_reference(src, index, &lay, r.clone(), RefKind::User)?,
         (None, ReferenceSource::Dir(d)) => match choose_from_dir(src, index, &lay, d, on_event) {
             Ok(c) => c,
-            Err(dir_err @ Error::NoReference { .. }) => {
+            Err(dir_err @ (Error::NoReference { .. } | Error::LayoutNotSupported { .. })) => {
                 match choose_profile(src, index, &lay, on_event) {
                     Ok(mut c) => {
                         c.notes.insert(
@@ -580,11 +750,17 @@ pub fn plan_repair<R: ReadAt + ?Sized>(
                 ..SearchOptions::default()
             };
             let found = search_references(src, index, &lay, &dirs, &opts, on_event)?;
+            let fault = crate::select::layout_fault(found.skipped().iter().map(|(_, r)| r));
             let (checked, chosen) = (found.checked(), found.chosen);
             match chosen {
                 Some(c) => c,
                 None => {
-                    let mut c = choose_profile(src, index, &lay, on_event)?;
+                    let mut c = match choose_profile(src, index, &lay, on_event) {
+                        Ok(c) => c,
+                        // A clip next to the .DAT fit but its layout could not be followed:
+                        // say that, not "no built-in settings".
+                        Err(e) => return Err(fault.unwrap_or(e)),
+                    };
                     if checked > 0 {
                         c.notes.insert(
                             0,
@@ -661,7 +837,13 @@ pub fn plan_repair<R: ReadAt + ?Sized>(
 
     let vt = &reference.tracks[vplan.ref_track];
     let duration = vplan.duration_units() as f64 * vt.sample_seconds();
-    let (created, created_source) = creation_time(&lay, mtime, duration);
+    let (created, date_source, created_source) = creation_time(
+        &lay,
+        lay.start.name_local,
+        opts.hint.as_ref(),
+        mtime,
+        duration,
+    );
     let time = created.map_or(0, |t| (t + MP4_EPOCH_OFFSET as i64).max(0) as u64);
 
     // The payload is copied from the first group to the end of the last sample used; inserted
@@ -699,15 +881,44 @@ pub fn plan_repair<R: ReadAt + ?Sized>(
         .collect();
 
     // Build the moov twice: once to learn its size, then with the real chunk offsets.
-    let bad_ref = |reason: String| Error::BadReference {
-        path: reference.path.clone(),
-        reason,
+    // The reference passed every check; a failure here is DATfix's.
+    let bad_ref = |reason: String| Error::LayoutNotSupported {
+        detail: format!(
+            "cannot build the index from {}: {reason}",
+            reference.path.display()
+        ),
     };
-    let (probe, _) = writer::build_moov(&reference, &outputs, 0, time).map_err(bad_ref)?;
+    let moov_opts = MoovOptions {
+        keep_reference_metadata: opts.keep_reference_metadata,
+        // The camera that made the .DAT, when its records say; else the reference's own.
+        model: lay.body.map(str::to_string),
+        rotation: opts.rotation,
+    };
+    let (probe, _) =
+        writer::build_moov_with(&reference, &outputs, 0, time, &moov_opts).map_err(bad_ref)?;
     let payload_start = reference.ftyp.len() as u64 + probe.encoded_len() + 16;
     let delta = payload_start as i64 - copy_start as i64;
-    let (moov, dropped) = writer::build_moov(&reference, &outputs, delta, time).map_err(bad_ref)?;
+    let (moov, summary) =
+        writer::build_moov_with(&reference, &outputs, delta, time, &moov_opts).map_err(bad_ref)?;
     debug_assert_eq!(moov.encoded_len(), probe.encoded_len());
+    let MoovSummary { dropped, withheld } = summary;
+    if !withheld.is_empty() {
+        notes.push(format!(
+            "left out the reference clip's own metadata: {}",
+            withheld.join(", ")
+        ));
+    }
+    let rotation = moov
+        .children()
+        .iter()
+        .filter(|a| a.kind.0 == *b"trak")
+        .find_map(|trak| {
+            let is_video = trak
+                .find(&[b"mdia", b"hdlr"])
+                .and_then(Atom::payload)
+                .is_some_and(|p| p.get(8..12) == Some(b"vide"));
+            is_video.then(|| writer::trak_rotation(trak)).flatten()
+        });
     if !dropped.is_empty() {
         notes.push(format!(
             "reference boxes not carried over: {}",
@@ -733,6 +944,9 @@ pub fn plan_repair<R: ReadAt + ?Sized>(
         notes,
         created,
         created_source,
+        date_source,
+        rotation,
+        withheld,
         truncation: index.truncation.clone(),
         copy_start,
         copy_end,
@@ -1013,6 +1227,9 @@ pub fn repair_from<R: ReadAt>(
         recording: plan.layout.describe(),
         creation_time: plan.created,
         creation_time_source: plan.created_source,
+        date_source: plan.date_source,
+        rotation: plan.rotation,
+        withheld_metadata: plan.withheld,
         gaps: plan.gaps,
         output: output.to_path_buf(),
         bytes_written: written,
@@ -1216,4 +1433,90 @@ pub fn compute_video_timing<R: ReadAt + ?Sized>(
         .map(|&(o, s)| analyzer.analyze(src, o, s))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(timing::video_timing(&frames))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::{Family, StartTime};
+
+    fn layout(timecode_seconds: Option<f64>) -> DatLayout {
+        DatLayout {
+            family: Family::B,
+            frames_per_group: 30,
+            frame_rate: None,
+            frame_rate_from_audio: false,
+            body_code: None,
+            body: None,
+            codec: None,
+            long_gop: None,
+            has_records: false,
+            pcm_streams: 0,
+            pcm_frame_bytes: 0,
+            shapes: Vec::new(),
+            start: StartTime {
+                name_local: None,
+                timecode_seconds,
+            },
+        }
+    }
+
+    #[test]
+    fn timecode_gives_the_time_and_the_file_time_the_date() {
+        // LAD10430: timecode 11:28:01.5 local, file written 2022-03-20 15:29:02 UTC, 9.6 s long.
+        let lay = layout(Some(41_281.5));
+        let (t, src, text) = creation_time(&lay, None, None, Some(1_647_790_142), 9.643);
+        assert_eq!(src, DateSource::Timecode);
+        // 2022-03-20 15:28:02 UTC (11:28:02 at UTC-04:00).
+        assert_eq!(t, Some(1_647_790_082));
+        assert!(text.contains("UTC-04:00"), "{text}");
+    }
+
+    #[test]
+    fn preset_timecode_falls_back_to_the_file_time() {
+        // LAD18029: the timecode is 6 h 51 min off the file time, no real zone.
+        let lay = layout(Some(3.0 * 3600.0 + 52.0 * 60.0 + 43.0));
+        let mtime = 1_641_675_704;
+        let (t, src, text) = creation_time(&lay, None, None, Some(mtime), 1.1);
+        assert_eq!(src, DateSource::FileTime);
+        assert_eq!(t, Some(mtime - 1));
+        assert!(text.contains("does not follow the camera clock"));
+    }
+
+    #[test]
+    fn timecode_crossing_midnight_keeps_the_right_day() {
+        // 23:59:50 local at UTC+02:00 = 21:59:50 UTC; file written 22:00:30 UTC.
+        let day = 19_000 * 86_400;
+        let lay = layout(Some(86_390.0));
+        let (t, src, _) = creation_time(&lay, None, None, Some(day + 79_230), 40.0);
+        assert_eq!(src, DateSource::Timecode);
+        assert_eq!(t, Some(day + 79_190));
+        // 00:00:10 local at UTC-05:00 = 05:00:10 UTC.
+        let lay = layout(Some(10.0));
+        let (t, _, _) = creation_time(&lay, None, None, Some(day + 18_040), 30.0);
+        assert_eq!(t, Some(day + 18_010));
+    }
+
+    #[test]
+    fn name_wins_and_card_zone_beats_inference() {
+        let lay = layout(Some(1.0));
+        let name = Some(1_734_788_442);
+        let hint = RecordingHint {
+            utc_offset: Some(3600),
+            ..Default::default()
+        };
+        let (t, src, _) = creation_time(&lay, name, Some(&hint), Some(1), 1.0);
+        assert_eq!((t, src), (Some(1_734_788_442 - 3600), DateSource::FileName));
+        let (t, _, text) = creation_time(&lay, name, None, Some(1_734_806_444), 1.1);
+        assert_eq!(t, Some(1_734_788_442 + 5 * 3600));
+        assert!(text.contains("UTC-05:00"));
+    }
+
+    #[test]
+    fn zones() {
+        assert_eq!(zone_offset(-14_461, 180), Some(-14_400));
+        assert_eq!(zone_offset(20_750, 180), Some(20_700)); // Nepal
+        assert_eq!(zone_offset(24_659, 180), None);
+        assert_eq!(zone_offset(16 * 3600, 600), None);
+    }
 }

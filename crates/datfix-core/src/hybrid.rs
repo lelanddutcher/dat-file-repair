@@ -11,6 +11,8 @@ use crate::layout::{DatLayout, Family, FrameRate};
 use crate::mp4::atom::Atom;
 use crate::mp4::reference::{RefTrack, Reference, TrackKind};
 use crate::mp4::synth::{self, PcmKind};
+use crate::profile;
+use crate::read_at::ReadAt;
 use crate::repi::DatIndex;
 
 /// A reference assembled from a clip's video track and synthesized tracks.
@@ -31,15 +33,105 @@ fn renumbered(base: &Reference, t: &RefTrack, id: u32) -> Result<Atom, String> {
 }
 
 fn internal(e: String) -> Reason {
-    Reason::new(
+    Reason::engine(
         "Its settings could not be combined with this .DAT's sound and data tracks.",
         e,
     )
 }
 
+/// Channels of a raw AAC frame (no ADTS header) from its first syntax element: a single
+/// channel element means mono, a channel pair element stereo.
+pub fn aac_channels(first_byte: u8) -> Option<u16> {
+    match first_byte >> 5 {
+        0 => Some(1),
+        1 => Some(2),
+        _ => None,
+    }
+}
+
+/// An AAC track for a `.DAT` whose clip has none: the built-in template of the same body
+/// when the bank has one, else one built from the first AAC frame (AAC-LC, 48 kHz, the
+/// channel count read from the frame).
+fn aac_template<R: ReadAt + ?Sized>(
+    src: &R,
+    index: &DatIndex,
+    layout: &DatLayout,
+    id: u32,
+) -> Result<(Atom, String), Reason> {
+    let code = layout.body_code.map(|c| crate::layout::hex(&c));
+    let from_bank = profile::bank()
+        .iter()
+        .filter(|p| code.is_some() && p.body_code == code)
+        .filter_map(|p| p.to_reference().ok().map(|r| (p, r)))
+        .find_map(|(p, r)| {
+            let t = r
+                .tracks
+                .iter()
+                .find(|t| t.kind == TrackKind::CompressedAudio && t.codec.0 == *b"mp4a")?;
+            let trak = renumbered(&r, t, id).ok()?;
+            Some((
+                trak,
+                format!("AAC audio (settings of built-in profile {})", p.id),
+            ))
+        });
+    if let Some(found) = from_bank {
+        return Ok(found);
+    }
+    let no_aac = |detail: String| {
+        Reason::new(
+            "This .DAT has compressed (AAC) sound, and the clip has no compressed sound to copy \
+             its settings from.",
+            format!(
+                "the .DAT has AAC audio but the clip has no AAC track, no built-in profile of \
+                 this body has one, and {detail}"
+            ),
+        )
+    };
+    let group = index
+        .groups
+        .iter()
+        .find(|g| g.kind.0 == *b"aac " && g.complete > 0)
+        .ok_or_else(|| no_aac("no complete AAC frame was found".into()))?;
+    let (off, size) = group.samples(1).next().expect("one complete sample");
+    let mut b = [0u8; 1];
+    if size == 0 || src.read_exact_at(&mut b, off).is_err() {
+        return Err(no_aac(format!(
+            "the first AAC frame (byte {off}) cannot be read"
+        )));
+    }
+    let channels = aac_channels(b[0]).ok_or_else(|| {
+        no_aac(format!(
+            "the first AAC frame (byte {off}) does not start with an audio channel element"
+        ))
+    })?;
+    // AAC frames hold 1024 samples. At 48 kHz an interval of F video frames holds
+    // F / fps * 48000 / 1024 of them (23-24 per 0.5005 s on Canon bodies).
+    let per_interval = layout.shape(b"aac ").map_or(0, |s| s.typical_samples);
+    if let (Some(rate), true) = (layout.frame_rate, per_interval > 0) {
+        let expected = layout.frames_per_group as f64 / rate.fps() * 48_000.0 / 1024.0;
+        if (per_interval as f64 - expected).abs() > 1.5 {
+            return Err(no_aac(format!(
+                "{per_interval} AAC frames per interval do not fit 48 kHz (expected about \
+                 {expected:.1})"
+            )));
+        }
+    }
+    let bitrate = 128_000 * channels as u32;
+    let trak = synth::aac_trak(id, channels, 48_000, bitrate)
+        .ok_or_else(|| no_aac("no AAC settings could be built".into()))?;
+    Ok((
+        trak,
+        format!(
+            "AAC-LC 48 kHz {} audio (read from the first frame)",
+            if channels == 1 { "mono" } else { "stereo" }
+        ),
+    ))
+}
+
 /// Builds a hybrid reference for `index` from `base`'s video track. `subject` names the
 /// source in the plain sentences, for example `your reference clip`.
-pub fn assemble(
+pub fn assemble<R: ReadAt + ?Sized>(
+    src: &R,
     base: &Reference,
     index: &DatIndex,
     layout: &DatLayout,
@@ -103,18 +195,21 @@ pub fn assemble(
         }
     }
     if has(b"aac ").is_some() {
-        let theirs = of_kind(TrackKind::CompressedAudio);
-        let t = theirs.first().ok_or_else(|| {
-            Reason::new(
-                "This .DAT has compressed (AAC) sound, and the clip has no compressed sound to \
-                 copy its settings from.",
-                "the .DAT has AAC audio but the clip has no AAC track, and AAC settings cannot \
-                 be synthesized",
-            )
-        })?;
-        traks.push(renumbered(base, t, next).map_err(internal)?);
+        match of_kind(TrackKind::CompressedAudio).first() {
+            Some(t) => {
+                traks.push(renumbered(base, t, next).map_err(internal)?);
+                reused.push("AAC audio track".into());
+            }
+            None => {
+                let (trak, what) = aac_template(src, index, layout, next)?;
+                traks.push(trak);
+                synthesized.push(what);
+                rebuilt.push(format!(
+                    "Sound settings were rebuilt because {subject} had no compressed (AAC) sound."
+                ));
+            }
+        }
         next += 1;
-        reused.push("AAC audio track".into());
     }
     if has(b"tmcd").is_some() {
         match of_kind(TrackKind::Timecode).first() {
@@ -190,4 +285,57 @@ pub fn assemble(
         reused,
         rebuilt,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::{Family, StartTime};
+    use crate::repi::DatIndex;
+
+    #[test]
+    fn aac_channels_from_the_first_element() {
+        assert_eq!(aac_channels(0x00), Some(1));
+        assert_eq!(aac_channels(0x21), Some(2));
+        assert_eq!(aac_channels(0xe0), None); // END
+        assert_eq!(aac_channels(0xc0), None); // FIL
+    }
+
+    #[test]
+    fn aac_template_comes_from_the_bank_for_a_known_body() {
+        let layout = DatLayout {
+            family: Family::BPrime,
+            frames_per_group: 30,
+            frame_rate: None,
+            frame_rate_from_audio: false,
+            body_code: Some([0x00, 0x10, 0x42]), // EOS R5
+            body: Some("Canon EOS R5"),
+            codec: None,
+            long_gop: None,
+            has_records: true,
+            pcm_streams: 0,
+            pcm_frame_bytes: 0,
+            shapes: Vec::new(),
+            start: StartTime::default(),
+        };
+        let index = DatIndex::default();
+        let (trak, what) = aac_template(&[][..], &index, &layout, 3).unwrap();
+        assert!(what.contains("built-in profile R5-"), "{what}");
+        let mut probe = trak.clone();
+        synth::set_track_id(&mut probe, 3).unwrap();
+        assert_eq!(probe, trak);
+        let bytes = trak.to_bytes();
+        assert!(bytes.windows(4).any(|w| w == b"mp4a"));
+        // An unknown body and no AAC frame: the clear error.
+        let unknown = DatLayout {
+            body_code: Some([9, 9, 9]),
+            ..layout
+        };
+        let err = aac_template(&[][..], &index, &unknown, 3).unwrap_err();
+        assert!(
+            err.detail.contains("no complete AAC frame"),
+            "{}",
+            err.detail
+        );
+    }
 }

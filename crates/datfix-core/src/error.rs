@@ -14,6 +14,16 @@ use serde::Serialize;
 /// Where people report cameras that do not work yet.
 pub const ISSUES_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/issues");
 
+/// The issue form for recordings DATfix cannot read yet, in the repository's
+/// `.github/ISSUE_TEMPLATE` folder.
+pub const LAYOUT_ISSUE_TEMPLATE: &str = ".github/ISSUE_TEMPLATE/unreadable-recording.yml";
+
+/// Opens a new issue with [`LAYOUT_ISSUE_TEMPLATE`] filled in.
+pub const LAYOUT_ISSUE_URL: &str = concat!(
+    env!("CARGO_PKG_REPOSITORY"),
+    "/issues/new?template=unreadable-recording.yml"
+);
+
 /// Why a candidate reference (a clip or a built-in profile) does not fit a `.DAT`.
 ///
 /// `user` is one plain sentence for the screen. `detail` is the technical reason.
@@ -21,6 +31,10 @@ pub const ISSUES_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/issues");
 pub struct Reason {
     pub user: String,
     pub detail: String,
+    /// True when the fault is DATfix's, not the candidate's: the candidate's settings fit, but
+    /// the engine could not follow this `.DAT`'s layout. Another clip would not help.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub engine: bool,
 }
 
 impl Reason {
@@ -28,6 +42,15 @@ impl Reason {
         Reason {
             user: user.into(),
             detail: detail.into(),
+            engine: false,
+        }
+    }
+
+    /// A reason that is DATfix's fault (see [`Reason::engine`]).
+    pub fn engine(user: impl Into<String>, detail: impl Into<String>) -> Self {
+        Reason {
+            engine: true,
+            ..Reason::new(user, detail)
         }
     }
 }
@@ -196,6 +219,15 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+
+    /// The settings fit, but DATfix cannot follow how this recording is laid out. Not the
+    /// reference's fault: choosing another clip does not help.
+    #[error(
+        "this .DAT's layout is not supported yet: {detail}. The decoder settings fit; the \
+         sample layout could not be followed. Please report it: {}",
+        LAYOUT_ISSUE_URL
+    )]
+    LayoutNotSupported { detail: String },
 
     /// The caller asked to stop.
     #[error("cancelled")]
@@ -431,6 +463,18 @@ impl Error {
                 "Reconnect the card and try again. If it still fails, make a full copy of the \
                  card with a recovery tool (such as ddrescue or PhotoRec), then repair the .DAT \
                  from that copy.",
+            ),
+            Error::LayoutNotSupported { .. } => msg(
+                "layout_not_supported",
+                "DATfix can't read this recording yet",
+                "The settings fit this .DAT, but the camera arranged the video inside it in a \
+                 way DATfix does not understand yet. This is a gap in DATfix, not a problem \
+                 with your clip: choosing another clip will not help."
+                    .into(),
+                &format!(
+                    "Keep the .DAT file unchanged. Please report it so a later version can \
+                     repair it: {LAYOUT_ISSUE_URL} (include the details below)."
+                ),
             ),
             Error::Cancelled => msg(
                 "cancelled",

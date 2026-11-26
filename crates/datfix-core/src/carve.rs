@@ -52,7 +52,7 @@ use crate::layout::{self, friendly_body};
 use crate::read_at::ReadAt;
 use crate::repi;
 
-pub use fs::{DirEntry, FsKind, Volume};
+pub use fs::{DirEntry, FsKind, FsTime, Volume};
 pub use source::{ImageSource, StreamView};
 
 /// The 16 bytes a Canon `.DAT` starts with.
@@ -218,6 +218,10 @@ pub struct FileRef {
     pub path: String,
     pub size: u64,
     pub deleted: bool,
+    /// Creation time of the entry (recording start), when the file system has one.
+    pub created: Option<FsTime>,
+    /// Last-write time of the entry (about the recording end).
+    pub modified: Option<FsTime>,
 }
 
 /// A finished Canon MP4 found on the card.
@@ -1264,6 +1268,8 @@ pub fn scan<R: ReadAt + Sync + ?Sized>(
                 path: e.path.clone(),
                 size: e.size,
                 deleted: e.deleted,
+                created: e.created,
+                modified: e.modified,
             })
     };
     for c in &mut clips {
@@ -1509,9 +1515,44 @@ pub fn reference_candidates<'a>(
     v
 }
 
-/// File name for a recovered stream: `recovered_<offset>.DAT`.
+/// File name for a recovered stream: the original `.DAT` name when a directory entry points
+/// at it (`LAD12345.DAT`), else `recovered_<offset>.DAT`. A deleted FAT32 short name has lost
+/// its first letter (`_AD12345.DAT`); it is kept as it is.
 pub fn recovered_name(rec: &Recovered) -> PathBuf {
-    PathBuf::from(format!("recovered_{}.DAT", rec.offset))
+    original_name(rec)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("recovered_{}.DAT", rec.offset)))
+}
+
+/// The recording's original file name from the card, when it is a usable `.DAT` name.
+fn original_name(rec: &Recovered) -> Option<String> {
+    let f = rec.file.as_ref()?;
+    let name = f.path.rsplit('/').next()?.trim();
+    let safe = !name.is_empty()
+        && name.len() <= 200
+        && name.to_ascii_uppercase().ends_with(".DAT")
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' '));
+    safe.then(|| name.to_string())
+}
+
+/// What the card says about a recovered recording, for [`crate::repair::RepairOptions::hint`]:
+/// its original name and the directory entry's times. The extracted copy's own file time is
+/// the scan time, so the hint always tells the repair to ignore it.
+pub fn hint_for(rec: &Recovered) -> crate::repair::RecordingHint {
+    let f = rec.file.as_ref();
+    let zone = f
+        .and_then(|f| f.created.or(f.modified))
+        .and_then(|t| t.utc_offset);
+    crate::repair::RecordingHint {
+        name: original_name(rec),
+        created_local: f.and_then(|f| f.created).map(|t| t.local),
+        modified_local: f.and_then(|f| f.modified).map(|t| t.local),
+        utc_offset: zone,
+        ignore_file_time: true,
+    }
 }
 
 /// Groups the findings by camera for a summary line.

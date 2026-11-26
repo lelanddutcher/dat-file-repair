@@ -40,6 +40,66 @@ pub struct DirEntry {
     pub is_dir: bool,
     /// Absolute image offset of the first cluster, when the cluster number is valid.
     pub data_offset: Option<u64>,
+    /// When the file was created (the camera creates a `.DAT` when recording starts).
+    pub created: Option<FsTime>,
+    /// When the file was last written (about when recording stopped).
+    pub modified: Option<FsTime>,
+}
+
+/// A FAT/exFAT timestamp: local time of the device that wrote it, and the time-zone offset
+/// when the file system stores one (exFAT only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct FsTime {
+    /// Seconds since 1970, counting the device's local time as if it were UTC.
+    pub local: i64,
+    /// Seconds east of UTC, when recorded.
+    pub utc_offset: Option<i32>,
+}
+
+impl FsTime {
+    /// UTC seconds since 1970, when the offset is known.
+    pub fn utc(&self) -> Option<i64> {
+        self.utc_offset.map(|o| self.local - o as i64)
+    }
+}
+
+/// Decodes a DOS date and time (FAT32 and exFAT share the bit layout) plus a count of 10 ms
+/// units (0–199) that adds up to two seconds. Returns `None` for zero or invalid dates.
+pub fn dos_time(date: u16, time: u16, centis: u8) -> Option<i64> {
+    let (y, m, d) = (
+        1980 + (date >> 9) as i64,
+        ((date >> 5) & 0xf) as i64,
+        (date & 0x1f) as i64,
+    );
+    let (h, mi, s2) = (
+        (time >> 11) as i64,
+        ((time >> 5) & 0x3f) as i64,
+        (time & 0x1f) as i64,
+    );
+    if date == 0 || !(1..=12).contains(&m) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s2 > 29
+    {
+        return None;
+    }
+    let extra = if centis < 200 { centis as i64 / 100 } else { 0 };
+    Some(crate::layout::days_from_civil(y, m, d) * 86_400 + h * 3600 + mi * 60 + s2 * 2 + extra)
+}
+
+/// exFAT time-zone byte: bit 7 says the offset is valid, bits 0–6 are a signed count of
+/// 15-minute steps.
+fn exfat_offset(b: u8) -> Option<i32> {
+    if b & 0x80 == 0 {
+        return None;
+    }
+    let steps = ((b << 1) as i8 >> 1) as i32;
+    Some(steps * 15 * 60)
+}
+
+fn exfat_time(stamp: &[u8], centis: u8, zone: u8) -> Option<FsTime> {
+    let v = u32::from_le_bytes(stamp.try_into().ok()?);
+    Some(FsTime {
+        local: dos_time((v >> 16) as u16, v as u16, centis)?,
+        utc_offset: exfat_offset(zone),
+    })
 }
 
 impl DirEntry {
@@ -346,6 +406,8 @@ pub fn parse_exfat_dir(data: &[u8]) -> Vec<(DirEntry, bool)> {
                 deleted,
                 is_dir: attrs & 0x10 != 0,
                 data_offset: None,
+                created: exfat_time(&e[8..12], e[20], e[22]),
+                modified: exfat_time(&e[12..16], e[21], e[23]),
             },
             no_fat_chain,
         ));
@@ -400,11 +462,23 @@ pub fn parse_fat32_dir(data: &[u8]) -> Vec<(DirEntry, bool)> {
                 deleted,
                 is_dir: attr & 0x10 != 0,
                 data_offset: None,
+                created: dos_time(le16(e, 16), le16(e, 14), e[13]).map(|local| FsTime {
+                    local,
+                    utc_offset: None,
+                }),
+                modified: dos_time(le16(e, 24), le16(e, 22), 0).map(|local| FsTime {
+                    local,
+                    utc_offset: None,
+                }),
             },
             false,
         ));
     }
     out
+}
+
+fn le16(e: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([e[at], e[at + 1]])
 }
 
 fn short_name(e: &[u8], deleted: bool) -> String {
@@ -424,6 +498,45 @@ fn short_name(e: &[u8], deleted: bool) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn dos_times() {
+        // 2024-12-21 13:40:42 plus 1.99 s of 10 ms units.
+        let date = (44 << 9) | (12 << 5) | 21;
+        let time = (13 << 11) | (40 << 5) | 21;
+        assert_eq!(dos_time(date, time, 0), Some(1_734_788_442));
+        assert_eq!(dos_time(date, time, 199), Some(1_734_788_443));
+        assert_eq!(dos_time(0, 0, 0), None);
+        assert_eq!(dos_time(date, 24 << 11, 0), None);
+        assert_eq!(exfat_offset(0x00), None);
+        assert_eq!(exfat_offset(0x80 | 20), Some(5 * 3600));
+        assert_eq!(exfat_offset(0x80 | 0x6c), Some(-5 * 3600)); // -20 steps
+    }
+
+    #[test]
+    fn fat32_entry_times() {
+        let mut e = [0u8; 32];
+        e[0..11].copy_from_slice(b"LAD12345DAT");
+        e[11] = 0x20;
+        let date: u16 = (42 << 9) | (4 << 5) | 24;
+        let time: u16 = (10 << 11) | (22 << 5) | 16;
+        e[13] = 100;
+        e[14..16].copy_from_slice(&time.to_le_bytes());
+        e[16..18].copy_from_slice(&date.to_le_bytes());
+        e[22..24].copy_from_slice(&(time + 4).to_le_bytes());
+        e[24..26].copy_from_slice(&date.to_le_bytes());
+        let (d, _) = &parse_fat32_dir(&e)[0];
+        let local = crate::layout::days_from_civil(2022, 4, 24) * 86_400 + 37_352;
+        assert_eq!(
+            d.created,
+            Some(FsTime {
+                local: local + 1,
+                utc_offset: None
+            })
+        );
+        assert_eq!(d.modified.unwrap().local, local + 8);
+        assert_eq!(d.created.unwrap().utc(), None);
+    }
 
     fn utf16(s: &str) -> Vec<u16> {
         s.encode_utf16().collect()

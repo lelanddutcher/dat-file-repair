@@ -15,6 +15,8 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{Error, Result};
 use crate::mapping::TrackPlan;
 use crate::read_at::ReadAt;
@@ -47,21 +49,213 @@ pub fn rescale(value: u64, from: u32, to: u32) -> u64 {
     ((value as u128 * to as u128 + from as u128 / 2) / from as u128) as u64
 }
 
-/// Builds the new `moov`.
-///
-/// `offset_delta` is added to every `.DAT` offset to get the output file offset.
-/// `time` (seconds since 1904) becomes the creation and modification time.
-/// Returns the tree and the names of reference boxes that were dropped.
+/// A display rotation for the video track, clockwise, as people say it ("turn the picture
+/// 90 degrees to the right").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "u32", try_from = "u32")]
+pub enum Rotation {
+    R0,
+    R90,
+    R180,
+    R270,
+}
+
+impl Rotation {
+    /// Degrees clockwise.
+    pub fn degrees(self) -> u32 {
+        match self {
+            Rotation::R0 => 0,
+            Rotation::R90 => 90,
+            Rotation::R180 => 180,
+            Rotation::R270 => 270,
+        }
+    }
+
+    /// Parses 0, 90, 180 or 270 (degrees clockwise). `-90` is accepted as 270.
+    pub fn from_degrees(degrees: i32) -> Option<Rotation> {
+        match degrees.rem_euclid(360) {
+            0 => Some(Rotation::R0),
+            90 => Some(Rotation::R90),
+            180 => Some(Rotation::R180),
+            270 => Some(Rotation::R270),
+            _ => None,
+        }
+    }
+
+    /// The `tkhd` display matrix (nine big-endian 32-bit values, 16.16 / 2.30 fixed point)
+    /// for a picture `width` x `height` pixels. Same values ffmpeg and iPhones write.
+    pub fn matrix(self, width: u32, height: u32) -> [u8; 36] {
+        const ONE: i32 = 0x10000;
+        let (w, h) = ((width as i32) << 16, (height as i32) << 16);
+        let (a, b, c, d, tx, ty) = match self {
+            Rotation::R0 => (ONE, 0, 0, ONE, 0, 0),
+            Rotation::R90 => (0, ONE, -ONE, 0, h, 0),
+            Rotation::R180 => (-ONE, 0, 0, -ONE, w, h),
+            Rotation::R270 => (0, -ONE, ONE, 0, 0, w),
+        };
+        let mut out = [0u8; 36];
+        for (i, v) in [a, b, 0, c, d, 0, tx, ty, 0x4000_0000].iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&v.to_be_bytes());
+        }
+        out
+    }
+
+    /// Reads the rotation back from a display matrix. `None` for anything that is not a plain
+    /// quarter turn (scaling, mirroring, shearing).
+    pub fn from_matrix(m: &[u8]) -> Option<Rotation> {
+        if m.len() < 36 {
+            return None;
+        }
+        let v = |i: usize| i32::from_be_bytes([m[i * 4], m[i * 4 + 1], m[i * 4 + 2], m[i * 4 + 3]]);
+        const ONE: i32 = 0x10000;
+        match (v(0), v(1), v(3), v(4)) {
+            (ONE, 0, 0, ONE) => Some(Rotation::R0),
+            (0, ONE, n, 0) if n == -ONE => Some(Rotation::R90),
+            (a, 0, 0, d) if a == -ONE && d == -ONE => Some(Rotation::R180),
+            (0, n, ONE, 0) if n == -ONE => Some(Rotation::R270),
+            _ => None,
+        }
+    }
+}
+
+impl From<Rotation> for u32 {
+    fn from(r: Rotation) -> u32 {
+        r.degrees()
+    }
+}
+
+impl TryFrom<u32> for Rotation {
+    type Error = String;
+    fn try_from(d: u32) -> Result<Self, String> {
+        i32::try_from(d)
+            .ok()
+            .and_then(Rotation::from_degrees)
+            .ok_or_else(|| format!("rotation must be 0, 90, 180 or 270 degrees, not {d}"))
+    }
+}
+
+impl std::fmt::Display for Rotation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}\u{b0}", self.degrees())
+    }
+}
+
+/// Offset of the display matrix inside a `tkhd` [`TimedHeader::tail`].
+const TKHD_MATRIX: std::ops::Range<usize> = 16..52;
+
+/// The rotation stored in a `trak`'s `tkhd`, if it is a plain quarter turn.
+pub fn trak_rotation(trak: &Atom) -> Option<Rotation> {
+    let h = TimedHeader::parse(trak.child(b"tkhd")?.payload()?, 8).ok()?;
+    Rotation::from_matrix(h.tail.get(TKHD_MATRIX)?)
+}
+
+/// How the output `moov` treats the reference's own metadata and orientation.
+#[derive(Clone, Debug, Default)]
+pub struct MoovOptions {
+    /// Copy the reference's Canon `uuid` box (thumbnail, EXIF with serial numbers, lens and
+    /// dates), `meta` and every `udta` child verbatim. Off by default: those describe the
+    /// reference clip, not this recording.
+    pub keep_reference_metadata: bool,
+    /// Model string written into the rebuilt `udta` (`Canon EOS R5`). `None` keeps the
+    /// reference's own `modl`, if it has one.
+    pub model: Option<String>,
+    /// Display rotation of the video track. `None` keeps the reference's matrix.
+    pub rotation: Option<Rotation>,
+}
+
+/// What [`build_moov_with`] left out.
+#[derive(Clone, Debug, Default)]
+pub struct MoovSummary {
+    /// Sample-table boxes of the reference that could not be rebuilt (`sdtp (track 1)`).
+    pub dropped: Vec<String>,
+    /// Reference metadata left out for privacy, in plain words.
+    pub withheld: Vec<String>,
+}
+
+/// Plain description of a metadata box left out of the output.
+fn describe_withheld(a: &Atom) -> String {
+    match &a.kind.0 {
+        b"uuid" => {
+            let canon = a
+                .payload()
+                .is_some_and(|p| p.starts_with(&crate::select::CANON_UUID));
+            if canon {
+                "Canon metadata box (thumbnail picture, camera and lens serial numbers, firmware, owner and capture dates)"
+                    .into()
+            } else {
+                "vendor metadata box (uuid)".into()
+            }
+        }
+        b"meta" => "metadata box (meta)".into(),
+        b"loci" | b"\xa9xyz" => "location (GPS)".into(),
+        other => format!("user data '{}'", String::from_utf8_lossy(other)),
+    }
+}
+
+/// Rebuilds a `udta` with the maker and model only. Every other child (location, rating,
+/// owner, free space) is listed in `withheld`.
+fn scrubbed_udta(
+    udta: Option<&Atom>,
+    model: Option<&str>,
+    withheld: &mut Vec<String>,
+) -> Option<Atom> {
+    if let Some(u) = udta {
+        let payload = match &u.body {
+            Body::Leaf(p) => p.clone(),
+            Body::Container(c) => {
+                let mut v = Vec::new();
+                c.iter().for_each(|a| a.write_to(&mut v));
+                v
+            }
+        };
+        for child in super::atom::parse_atoms(&payload).unwrap_or_default() {
+            if !matches!(
+                &child.kind.0,
+                b"manu" | b"modl" | b"free" | b"skip" | b"urat"
+            ) {
+                withheld.push(describe_withheld(&child));
+            }
+        }
+    }
+    let model = model
+        .map(str::to_string)
+        .or_else(|| udta.and_then(super::synth::model_of))?;
+    Some(super::synth::udta_model(&model))
+}
+
+/// Builds the new `moov`, copying the reference's metadata verbatim (the behaviour before
+/// metadata scrubbing). See [`build_moov_with`].
 pub fn build_moov(
     reference: &Reference,
     tracks: &[TrackOutput],
     offset_delta: i64,
     time: u64,
 ) -> Result<(Atom, Vec<String>), String> {
+    let opts = MoovOptions {
+        keep_reference_metadata: true,
+        ..MoovOptions::default()
+    };
+    build_moov_with(reference, tracks, offset_delta, time, &opts).map(|(a, s)| (a, s.dropped))
+}
+
+/// Builds the new `moov`.
+///
+/// `offset_delta` is added to every `.DAT` offset to get the output file offset.
+/// `time` (seconds since 1904) becomes the creation and modification time.
+/// Returns the tree and what was left out.
+pub fn build_moov_with(
+    reference: &Reference,
+    tracks: &[TrackOutput],
+    offset_delta: i64,
+    time: u64,
+    opts: &MoovOptions,
+) -> Result<(Atom, MoovSummary), String> {
     let movie_ts = reference.movie_timescale;
-    let mut dropped = Vec::new();
+    let mut summary = MoovSummary::default();
     let mut children = Vec::new();
     let mut movie_duration = 0u64;
+    let scrub = !opts.keep_reference_metadata;
+    let mut udta_done = false;
 
     for (i, child) in reference.moov.children().iter().enumerate() {
         match &child.kind.0 {
@@ -70,14 +264,30 @@ pub fn build_moov(
                     continue;
                 };
                 let (trak, track_duration) =
-                    build_trak(child, t, movie_ts, offset_delta, time, &mut dropped)?;
+                    build_trak(child, t, movie_ts, offset_delta, time, opts, &mut summary)?;
                 movie_duration = movie_duration.max(track_duration);
                 children.push(trak);
             }
             // Padding the camera reserved for its own header; not needed.
             b"free" | b"skip" => {}
+            b"udta" if scrub => {
+                udta_done = true;
+                children.extend(scrubbed_udta(
+                    Some(child),
+                    opts.model.as_deref(),
+                    &mut summary.withheld,
+                ));
+            }
+            b"uuid" | b"meta" if scrub => summary.withheld.push(describe_withheld(child)),
             _ => children.push(child.clone()),
         }
+    }
+    if scrub && !udta_done {
+        children.extend(scrubbed_udta(
+            None,
+            opts.model.as_deref(),
+            &mut summary.withheld,
+        ));
     }
 
     let mvhd = children
@@ -90,9 +300,10 @@ pub fn build_moov(
     h.modification_time = time;
     mvhd.body = Body::Leaf(h.to_payload());
 
-    dropped.sort();
-    dropped.dedup();
-    Ok((Atom::container(b"moov", children), dropped))
+    summary.dropped.sort();
+    summary.dropped.dedup();
+    summary.withheld.dedup();
+    Ok((Atom::container(b"moov", children), summary))
 }
 
 /// Rebuilds one `trak`. Returns it and its duration in the movie timescale.
@@ -102,9 +313,20 @@ fn build_trak(
     movie_ts: u32,
     offset_delta: i64,
     time: u64,
-    dropped: &mut Vec<String>,
+    opts: &MoovOptions,
+    summary: &mut MoovSummary,
 ) -> Result<(Atom, u64), String> {
     let mut trak = src.clone();
+    if !opts.keep_reference_metadata {
+        // Per-track user data and metadata (names, locations) belong to the reference.
+        trak.children_mut().retain(|a| {
+            let keep = !matches!(&a.kind.0, b"udta" | b"meta" | b"uuid");
+            if !keep {
+                summary.withheld.push(describe_withheld(a));
+            }
+            keep
+        });
+    }
     let media_duration = t.media_duration();
     let track_duration = rescale(media_duration, t.ref_track.timescale, movie_ts);
 
@@ -114,6 +336,13 @@ fn build_trak(
     h.duration = track_duration;
     h.creation_time = time;
     h.modification_time = time;
+    if let Some(r) = opts.rotation.filter(|_| t.video.is_some()) {
+        if h.tail.len() >= 60 {
+            let size = |at: usize| u32::from_be_bytes(h.tail[at..at + 4].try_into().unwrap()) >> 16;
+            let m = r.matrix(size(52), size(56));
+            h.tail[TKHD_MATRIX].copy_from_slice(&m);
+        }
+    }
     tkhd.body = Body::Leaf(h.to_payload());
 
     // Edit list: one edit covering the whole track. Video with B-frames starts `shift` frames
@@ -158,7 +387,9 @@ fn build_trak(
             &a.kind.0,
             b"stsd" | b"stts" | b"stss" | b"ctts" | b"stsc" | b"stsz" | b"stco" | b"co64"
         ) {
-            dropped.push(format!("{} (track {})", a.kind, t.ref_track.track_id));
+            summary
+                .dropped
+                .push(format!("{} (track {})", a.kind, t.ref_track.track_id));
         }
     }
     *stbl = Atom::container(b"stbl", build_stbl(stsd, t, offset_delta)?);
@@ -269,4 +500,33 @@ pub fn write_file<R: ReadAt + ?Sized>(
     }
     f.sync_all().map_err(|e| Error::io(ctx("flush"), e))?;
     Ok(header.len() as u64 + payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotation_matrices_round_trip() {
+        for d in [0, 90, 180, 270] {
+            let r = Rotation::from_degrees(d).unwrap();
+            assert_eq!(Rotation::from_matrix(&r.matrix(4096, 2160)), Some(r));
+            assert_eq!(r.degrees(), d as u32);
+        }
+        assert_eq!(Rotation::from_degrees(-90), Some(Rotation::R270));
+        assert_eq!(Rotation::from_degrees(45), None);
+        // Same bytes ffmpeg writes for a 90 degree clockwise display rotation of 4096x2160.
+        let m = Rotation::R90.matrix(4096, 2160);
+        assert_eq!(&m[0..8], &[0, 0, 0, 0, 0, 1, 0, 0]);
+        assert_eq!(&m[12..16], &(-0x10000i32).to_be_bytes());
+        assert_eq!(&m[24..28], &(2160i32 << 16).to_be_bytes());
+        assert_eq!(&m[32..36], &0x4000_0000u32.to_be_bytes());
+        // A zoomed matrix is not a rotation.
+        let mut z = Rotation::R0.matrix(1, 1);
+        z[0..4].copy_from_slice(&0x20000i32.to_be_bytes());
+        assert_eq!(Rotation::from_matrix(&z), None);
+        let json = serde_json::to_string(&Rotation::R180).unwrap();
+        assert_eq!(json, "180");
+        assert!(serde_json::from_str::<Rotation>("45").is_err());
+    }
 }
