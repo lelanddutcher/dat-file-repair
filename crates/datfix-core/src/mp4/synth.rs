@@ -220,6 +220,79 @@ pub fn pcm_trak(track_id: u32, kind: PcmKind) -> Atom {
     )
 }
 
+/// An MPEG-4 descriptor: tag, then the length in Canon's fixed 4-byte form.
+fn descriptor(tag: u8, body: &[u8]) -> Vec<u8> {
+    let n = body.len() as u32;
+    let mut d = vec![
+        tag,
+        0x80 | (n >> 21) as u8 & 0x7f,
+        0x80 | (n >> 14) as u8 & 0x7f,
+        0x80 | (n >> 7) as u8 & 0x7f,
+        n as u8 & 0x7f,
+    ];
+    d.extend_from_slice(body);
+    d
+}
+
+/// AAC-LC AudioSpecificConfig (ISO 14496-3 1.6.2.1): object type 2, the sampling-frequency
+/// index, the channel configuration, no extensions.
+pub fn aac_lc_config(sample_rate: u32, channels: u16) -> Option<[u8; 2]> {
+    const RATES: [u32; 13] = [
+        96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025,
+        8_000, 7_350,
+    ];
+    let index = RATES.iter().position(|&r| r == sample_rate)? as u16;
+    if !(1..=7).contains(&channels) {
+        return None;
+    }
+    let v = (2u16 << 11) | (index << 7) | (channels << 3);
+    Some(v.to_be_bytes())
+}
+
+/// The `mp4a` sample entry Canon writes: version 0 sound entry plus an `esds` with a
+/// 4096-byte buffer and the bitrate as both maximum and average.
+pub fn mp4a_entry(channels: u16, sample_rate: u32, bitrate: u32) -> Option<Vec<u8>> {
+    let asc = aac_lc_config(sample_rate, channels)?;
+    let mut dc = vec![0x40, 0x15, 0x00, 0x10, 0x00]; // MPEG-4 audio, audio stream, buffer 4096
+    dc.put_u32(bitrate);
+    dc.put_u32(bitrate);
+    dc.extend(descriptor(0x05, &asc));
+    let mut es = vec![0x00, 0x00, 0x00]; // ES_ID 0, no flags
+    es.extend(descriptor(0x04, &dc));
+    es.extend(descriptor(0x06, &[0x02]));
+    let mut esds = full(0, 0);
+    esds.extend(descriptor(0x03, &es));
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0; 8]); // version, revision, vendor
+    body.put_u16(channels);
+    body.put_u16(16);
+    body.put_u32(0); // compression id, packet size
+    body.put_u32(sample_rate << 16);
+    body.extend(Atom::leaf(b"esds", esds).to_bytes());
+    let mut e = entry_header(b"mp4a", body.len());
+    e.extend(body);
+    Some(e)
+}
+
+/// An AAC audio track (1024 samples per frame).
+pub fn aac_trak(track_id: u32, channels: u16, sample_rate: u32, bitrate: u32) -> Option<Atom> {
+    let minf = Atom::container(
+        b"minf",
+        vec![
+            Atom::leaf(b"smhd", vec![0; 8]),
+            dinf(),
+            stbl(mp4a_entry(channels, sample_rate, bitrate)?, 1024, 0, 1),
+        ],
+    );
+    Some(Atom::container(
+        b"trak",
+        vec![
+            tkhd(track_id, 1, 0x0100, (0, 0)),
+            Atom::container(b"mdia", vec![mdhd(sample_rate), hdlr(b"soun"), minf]),
+        ],
+    ))
+}
+
 /// The `tmcd` sample entry for a frame rate.
 pub fn tmcd_entry(rate: FrameRate) -> Vec<u8> {
     let ntsc = rate.frame_duration == 1001;
@@ -396,6 +469,31 @@ mod tests {
             ftyp(Family::A, FourCC::new(b"hvc1")),
             hex("0000001c667479706d703432000000016d7034326876633143414550")
         );
+    }
+
+    #[test]
+    fn mp4a_matches_camera_files() {
+        // R5, AAC-LC 48 kHz stereo 256 kb/s (profile R5-hevc-4096x2160-59.94p-…-mp4a).
+        let canon = hex(
+            "000000576d703461000000000000000100000000000000000002001000000000bb80000000000033\
+             65736473000000000380808022000000048080801440150010000003e8000003e80005808080\
+             021190068080800102",
+        );
+        assert_eq!(mp4a_entry(2, 48_000, 256_000).unwrap(), canon);
+        assert_eq!(aac_lc_config(48_000, 1), Some([0x11, 0x88]));
+        assert_eq!(aac_lc_config(47_000, 2), None);
+        let t = aac_trak(3, 2, 48_000, 256_000).unwrap();
+        let r = crate::mp4::reference::Reference::from_parts(
+            std::path::Path::new("x"),
+            0,
+            ftyp(Family::BPrime, FourCC::new(b"hvc1")),
+            Atom::container(b"moov", vec![mvhd(48_000, 4), t]),
+        )
+        .unwrap();
+        let a = &r.tracks[0];
+        assert_eq!(a.codec, FourCC::new(b"mp4a"));
+        assert_eq!((a.timescale, a.sample_delta), (48_000, 1024));
+        assert_eq!(a.audio.as_ref().unwrap().channels, 2);
     }
 
     #[test]

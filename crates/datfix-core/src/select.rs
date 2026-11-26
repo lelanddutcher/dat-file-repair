@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 
-use crate::codec::{FrameAnalyzer, VideoCodec, verify_frame};
+use crate::codec::{self, FrameAnalyzer, VideoCodec, verify_frame};
 use crate::error::{Error, Reason, Result};
 use crate::hybrid;
 use crate::layout::{DatLayout, fps_text, friendly_body};
@@ -102,6 +102,9 @@ pub fn describe_codec(codec: &VideoCodec) -> String {
         VideoCodec::Avc(c) => format!("H.264 {}x{}", c.sps[0].width, c.sps[0].height),
     }
 }
+
+const LAYOUT_NOT_FOLLOWED: &str =
+    "Its settings fit, but DATfix could not follow how this .DAT is laid out.";
 
 const NOT_LIKE_FRAMES: &str =
     "Its picture settings (resolution, colour or compression) don't fit the frames in this .DAT.";
@@ -206,8 +209,20 @@ pub fn video_gate<R: ReadAt + ?Sized>(
 
     // Every probed frame must pass the full header check.
     let frames = gate_frames(index);
-    for &(off, size) in &frames {
+    for (i, &(off, size)) in frames.iter().enumerate() {
         if let Err(e) = verify_frame(src, &codec, off, size) {
+            // The first frames read fine with these settings, and this one is not even cut
+            // into whole NAL units: the sample boundaries are wrong, not the settings.
+            if i > 0 && !codec::nal_chain_fits(src, codec.length_size(), off, size) {
+                return Err(vec![Reason::engine(
+                    LAYOUT_NOT_FOLLOWED,
+                    format!(
+                        "frame {} (byte {off}, {size} bytes) is not cut at a frame boundary, \
+                         while the {i} frame(s) before it read correctly with these settings: {e}",
+                        i + 1
+                    ),
+                )]);
+            }
             return Err(vec![Reason::new(
                 NOT_LIKE_FRAMES,
                 format!(
@@ -225,8 +240,10 @@ pub fn video_gate<R: ReadAt + ?Sized>(
         match analyzer.analyze(src, off, size) {
             Ok(f) => non_key |= !f.sync && !f.cra,
             Err(e) => {
-                return Err(vec![Reason::new(
-                    NOT_LIKE_FRAMES,
+                // Every one of these frames passed the full header check above, so the
+                // timing parser is at fault, not the settings.
+                return Err(vec![Reason::engine(
+                    LAYOUT_NOT_FOLLOWED,
                     format!(
                         "the video frames cannot be read with the clip's {} settings: {e}",
                         codec.name()
@@ -275,9 +292,15 @@ pub fn check_reference<R: ReadAt + ?Sized>(
         path: path.to_path_buf(),
         reasons,
     };
+    let rejected = |path: &Path, reasons: Vec<Reason>| match reasons.iter().find(|r| r.engine) {
+        Some(r) => Error::LayoutNotSupported {
+            detail: r.detail.clone(),
+        },
+        None => incompatible(path, reasons),
+    };
     let (codec, mut notes) = match video_gate(src, index, layout, &reference) {
         Ok(x) => x,
-        Err(reasons) => return Err(incompatible(&reference.path, reasons)),
+        Err(reasons) => return Err(rejected(&reference.path, reasons)),
     };
     match mapping::map_tracks(index, &reference) {
         Ok(mapping) => Ok(Checked {
@@ -294,21 +317,24 @@ pub fn check_reference<R: ReadAt + ?Sized>(
         }),
         Err(exact) => {
             let path = reference.path.clone();
-            let layout_reason = |detail: Vec<String>| {
-                Reason::new(
-                    "Its sound and data tracks are laid out differently, and DATfix can't \
-                     rebuild them.",
-                    detail.join("; "),
-                )
-            };
-            let h = hybrid::assemble(&reference, index, layout, subject).map_err(|e| {
+            let h = hybrid::assemble(src, &reference, index, layout, subject).map_err(|e| {
                 let mut detail = exact.clone();
                 detail.push(e.detail.clone());
-                incompatible(&path, vec![Reason::new(e.user, detail.join("; "))])
+                rejected(
+                    &path,
+                    vec![Reason {
+                        detail: detail.join("; "),
+                        ..e
+                    }],
+                )
             })?;
+            // The synthesized tracks follow the .DAT's own layout by construction; when they
+            // still do not map, the engine is at fault.
             let mapping = mapping::map_tracks(index, &h.reference).map_err(|mut r| {
                 r.splice(0..0, exact.iter().cloned());
-                incompatible(&path, vec![layout_reason(r)])
+                Error::LayoutNotSupported {
+                    detail: format!("the rebuilt tracks do not fit the index: {}", r.join("; ")),
+                }
             })?;
             let mut why = exact.clone();
             why.dedup();
@@ -588,6 +614,9 @@ pub fn search_references<R: ReadAt + ?Sized>(
                             .collect::<Vec<_>>()
                             .join("; "),
                     ),
+                    other @ Error::LayoutNotSupported { .. } => {
+                        Reason::engine(LAYOUT_NOT_FOLLOWED, other.to_string())
+                    }
                     other => Reason::new(other.user_message().message, other.to_string()),
                 };
                 reject(path, reason, &mut candidates);
@@ -625,10 +654,22 @@ pub fn choose_from_dir<R: ReadAt + ?Sized>(
         on_event,
     )?;
     let tried = search.skipped();
-    search.chosen.ok_or_else(|| Error::NoReference {
-        dir: dir.to_path_buf(),
-        tried,
+    search.chosen.ok_or_else(|| {
+        layout_fault(tried.iter().map(|(_, r)| r)).unwrap_or_else(|| Error::NoReference {
+            dir: dir.to_path_buf(),
+            tried,
+        })
     })
+}
+
+/// When any candidate failed through DATfix's own fault, the error that says so.
+pub fn layout_fault<'a>(reasons: impl IntoIterator<Item = &'a Reason>) -> Option<Error> {
+    reasons
+        .into_iter()
+        .find(|r| r.engine)
+        .map(|r| Error::LayoutNotSupported {
+            detail: r.detail.clone(),
+        })
 }
 
 /// Key that is equal for two configurations that decode the same way (colour tags and other
@@ -682,6 +723,7 @@ pub fn choose_profile_from<R: ReadAt + ?Sized>(
         }
     }
     let mut passing: Vec<(&Profile, Checked)> = Vec::new();
+    let mut engine_fault: Option<Error> = None;
     for p in candidates {
         let reference = match p.to_reference() {
             Ok(r) => r,
@@ -696,6 +738,11 @@ pub fn choose_profile_from<R: ReadAt + ?Sized>(
                 passing.push((p, c));
             }
             Err(e) => {
+                if matches!(e, Error::LayoutNotSupported { .. }) && engine_fault.is_none() {
+                    engine_fault = Some(Error::LayoutNotSupported {
+                        detail: format!("built-in profile {}: {e}", p.id),
+                    });
+                }
                 let reason = match &e {
                     Error::Incompatible { reasons, .. } => reasons
                         .iter()
@@ -709,6 +756,9 @@ pub fn choose_profile_from<R: ReadAt + ?Sized>(
         }
     }
     if passing.is_empty() {
+        if let Some(e) = engine_fault {
+            return Err(e);
+        }
         // Only list the near misses: profiles of this body (or all when the body is unknown).
         tried.sort();
         return Err(Error::NoProfile {

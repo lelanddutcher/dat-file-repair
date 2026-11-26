@@ -423,3 +423,55 @@ Notes from making the engine survive hostile input and hostile environments.
 - `cargo check --target x86_64-pc-windows-msvc` works from a Mac for pure-Rust crates after
   `rustup target add x86_64-pc-windows-msvc`. The Tauri app's build script also needs
   `llvm-rc` (a Windows resource compiler), so it does not check from a Mac without it.
+
+## Engine round 3 (metadata, dates, rotation)
+
+### Privacy of copied boxes
+
+- A Canon camera MP4 carries a `uuid` box (`85c0b687-820f-11e0-8111-f4ce462b6a48`) in its
+  `moov`. Inside: `CNCV` (compressor version), `CNDM`, `CNTH` (a JPEG thumbnail whose EXIF
+  holds the body model, firmware, battery, lens name and serial, body serial and the capture
+  dates with time zone) and `CNOP` (another copy of the body serial). Copying the reference's
+  `moov` "verbatim except the tables" therefore stamps another clip's identity onto every
+  repair. Treat any box you copy from a user's file as personal data until shown otherwise.
+- QuickTime/AVFoundation, ffmpeg and the built-in profiles (which never had the box) all play
+  files without it. Old exiftool (11.38) shows only `CompressorVersion` and `ThumbnailImage`
+  from it; `strings` on the first megabyte is a better leak check.
+- Removing children of `moov` shifts the index of every later child. Code that stores
+  "track = n-th child of moov" (`RefTrack::moov_index`) must skip boxes while it builds the
+  output, not edit the reference tree beforehand.
+- When rewriting a `udta`, keep only what you can vouch for (`manu`, `modl`), and write the
+  model from the `.DAT`'s own body code, not from the reference.
+
+### Time
+
+- FAT32 and exFAT timestamps share the DOS layout: date = `(year-1980)<<9 | month<<5 | day`,
+  time = `hour<<11 | minute<<5 | seconds/2`, plus a 10 ms byte (0–199). exFAT adds a
+  time-zone byte: bit 7 = valid, low 7 bits a signed count of 15-minute steps. FAT32 has no
+  zone, so its times are camera local time and stay that way.
+- A local time without a zone can still be tied to UTC when a second clock agrees: round the
+  difference to a real zone (multiples of 30 min plus +5:45, +8:45, +12:45) and accept only a
+  small remainder. Rounding to 15 minutes accepts everything (any value is within 7.5 min of
+  a quarter hour), so it is not a check at all.
+- Canon timecode in `tmcd` is usually the camera clock (frames / real fps = time of day), but
+  some clips use a preset timecode (LAD18029: 6 h 51 min off). The per-frame records and
+  `tdmt` hold no date.
+- Do not use a carved file's own modification time: it is the time it was extracted.
+
+### Display rotation
+
+- Orientation lives only in the `tkhd` matrix `{a b u; c d v; tx ty w}` (16.16 fixed point,
+  `w` 2.30). For a clockwise turn of a W×H picture: 90° = `0,1,-1,0, tx=H`; 180° =
+  `-1,0,0,-1, tx=W, ty=H`; 270° = `0,-1,1,0, ty=W`. Keep `tkhd` width and height unrotated.
+- ffprobe reports the display matrix as `rotation=-90` for a 90° clockwise turn (ffmpeg
+  counts counter-clockwise). AVFoundation's `preferredTransform` shows `[0 1 -1 0]`.
+
+### Small Rust notes
+
+- `#[serde(into = "u32", try_from = "u32")]` serializes an enum such as `Rotation` as a
+  plain number and rejects bad values on input, with no hand-written serde code.
+- A `\` at the end of a line inside a Python string written with a heredoc is a Python line
+  continuation, not a Rust one: generated Rust strings lost their newline and kept the
+  indentation. Check generated string literals for runs of spaces.
+- Adding a field to a public struct breaks callers that build it with a literal. Give new
+  option structs `Default` and tell callers to use `..Default::default()`.

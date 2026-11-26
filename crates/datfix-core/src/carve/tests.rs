@@ -340,3 +340,67 @@ fn two_equal_continuations_leave_the_recording_partial() {
     );
     assert!((half as u64..half as u64 + 32 * 1024).contains(&rec.length));
 }
+
+#[test]
+fn carved_recording_keeps_its_card_name_and_times() {
+    use super::fs::tests::{exfat_image, exfat_set};
+    let cluster = 40u32;
+    let mut set = exfat_set("LAD12345.DAT", cluster, 0, false, true);
+    // Created 2022-04-24 10:22:33.50 at UTC-04:00, modified 10:22:41 the same day.
+    let date = (42u32 << 9) | (4 << 5) | 24;
+    let created = (date << 16) | (10 << 11) | (22 << 5) | 16;
+    let modified = (date << 16) | (10 << 11) | (22 << 5) | 20;
+    set[8..12].copy_from_slice(&created.to_le_bytes());
+    set[12..16].copy_from_slice(&modified.to_le_bytes());
+    set[20] = 150; // +1.5 s
+    set[22] = 0x80 | (-16i8 as u8 & 0x7f); // -16 x 15 min
+    set[23] = set[22];
+    let dat = canon_stream(200_000, 42, true, 20_000);
+    let mut img = exfat_image(&[set], 0, 2 << 20);
+    let at = 32 * 512 + (cluster as usize - 2) * 4096;
+    img[at..at + dat.len()].copy_from_slice(&dat);
+    let r = run(&img);
+    let rec = &r.recordings[0];
+    let f = rec.file.as_ref().unwrap();
+    let local = crate::layout::days_from_civil(2022, 4, 24) * 86_400 + 10 * 3600 + 22 * 60 + 33;
+    assert_eq!(
+        f.created,
+        Some(FsTime {
+            local,
+            utc_offset: Some(-4 * 3600)
+        })
+    );
+    assert_eq!(f.created.unwrap().utc(), Some(local + 4 * 3600));
+    assert_eq!(f.modified.unwrap().local, local + 7);
+    assert_eq!(recovered_name(rec), PathBuf::from("LAD12345.DAT"));
+    let hint = hint_for(rec);
+    assert_eq!(hint.name.as_deref(), Some("LAD12345.DAT"));
+    assert_eq!(hint.created_local, Some(local));
+    assert_eq!(hint.utc_offset, Some(-4 * 3600));
+    assert!(hint.ignore_file_time);
+}
+
+#[test]
+fn recovered_name_without_a_usable_entry() {
+    let mut img = vec![0u8; 1 << 20];
+    let dat = canon_stream(200_000, 42, true, 20_000);
+    img[4096..4096 + dat.len()].copy_from_slice(&dat);
+    let r = run(&img);
+    let rec = &r.recordings[0];
+    assert_eq!(recovered_name(rec), PathBuf::from("recovered_4096.DAT"));
+    let mut odd = rec.clone();
+    odd.file = Some(FileRef {
+        path: "/DCIM/../../etc/x.DAT".into(),
+        size: 0,
+        deleted: true,
+        created: None,
+        modified: None,
+    });
+    // Only the last part of the path is used; unusual characters fall back to the offset.
+    assert_eq!(recovered_name(&odd), PathBuf::from("x.DAT"));
+    odd.file.as_mut().unwrap().path = "/DCIM/a:b.DAT".into();
+    assert_eq!(recovered_name(&odd), PathBuf::from("recovered_4096.DAT"));
+    let hint = hint_for(rec);
+    assert_eq!(hint.name, None);
+    assert!(hint.ignore_file_time);
+}

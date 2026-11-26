@@ -87,8 +87,14 @@ pub fn run(args: &ScanArgs, json: bool) -> datfix_core::Result<()> {
     std::fs::create_dir_all(dir)
         .map_err(|e| datfix_core::Error::io(format!("cannot create {}", dir.display()), e))?;
     let mut saved = Vec::new();
+    let mut names = std::collections::HashSet::new();
     for rec in &report.recordings {
-        let path = dir.join(carve::recovered_name(rec));
+        // The original name, unless two recordings would share it.
+        let mut name = carve::recovered_name(rec);
+        if !names.insert(name.clone()) {
+            name = PathBuf::from(format!("recovered_{}.DAT", rec.offset));
+        }
+        let path = dir.join(name);
         save(&src, rec, &path, &opts, json)?;
         saved.push((rec, path));
     }
@@ -211,7 +217,10 @@ fn repair_one(
         dat,
         &source,
         &output,
-        &RepairOptions::default(),
+        &RepairOptions {
+            hint: Some(carve::hint_for(rec)),
+            ..RepairOptions::default()
+        },
         &mut event_printer(json),
     )?;
     if json {

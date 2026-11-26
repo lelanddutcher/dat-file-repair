@@ -15,8 +15,18 @@ use clap::{Parser, Subcommand};
 use datfix_core::inspect::{self, InspectReport};
 use datfix_core::profile;
 use datfix_core::repair::{
-    self, Event, Phase, RefKind, ReferenceSource, RepairOptions, RepairReport,
+    self, Event, Phase, RefKind, ReferenceSource, RepairOptions, RepairReport, Rotation,
 };
+
+/// Parses `--rotate`: 0, 90, 180 or 270 (also -90).
+fn parse_rotation(s: &str) -> Result<Rotation, String> {
+    s.trim()
+        .trim_end_matches('\u{b0}')
+        .parse::<i32>()
+        .ok()
+        .and_then(Rotation::from_degrees)
+        .ok_or_else(|| format!("'{s}' is not 0, 90, 180 or 270"))
+}
 
 #[derive(Parser)]
 #[command(
@@ -67,6 +77,16 @@ enum Command {
         /// skipped and treated as damage, and the report says how many seconds were lost.
         #[arg(long)]
         stop_on_read_error: bool,
+        /// Copy the reference clip's own metadata into the output (its thumbnail, camera and
+        /// lens serial numbers, firmware, owner and dates). By default it is left out, because
+        /// it describes the reference clip, not this recording.
+        #[arg(long)]
+        keep_reference_metadata: bool,
+        /// Turn the picture clockwise for display: 0, 90, 180 or 270 degrees. Use it for
+        /// vertical recordings. Default: the reference clip's orientation (upright for the
+        /// built-in settings).
+        #[arg(long, value_name = "DEGREES", value_parser = parse_rotation)]
+        rotate: Option<Rotation>,
     },
     /// Find recordings on a card image or device: 0-byte, deleted or missing .DAT files whose
     /// data is still on the card. Reads only; image the card first (see `docs/format/card-carving.md`).
@@ -123,6 +143,8 @@ fn main() -> ExitCode {
             output,
             force,
             stop_on_read_error,
+            keep_reference_metadata,
+            rotate,
         } => {
             let source = match (reference, reference_dir) {
                 (Some(r), _) => ReferenceSource::File(r),
@@ -134,6 +156,8 @@ fn main() -> ExitCode {
             let opts = RepairOptions {
                 overwrite: force,
                 stop_on_read_error,
+                keep_reference_metadata,
+                rotation: rotate,
                 ..Default::default()
             };
             run_repair(&dat, &source, &output, &opts, json)
@@ -487,6 +511,9 @@ fn print_repair(r: &RepairReport) {
             utc(t),
             r.creation_time_source
         );
+    }
+    if let Some(r) = r.rotation.filter(|r| r.degrees() != 0) {
+        println!("  rotation: {r} clockwise");
     }
     println!(
         "  duration: {}  video frames: {}  keyframes: {}{}",

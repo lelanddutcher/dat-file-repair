@@ -166,6 +166,37 @@ pub fn verify_frame<R: ReadAt + ?Sized>(
 }
 
 /// Facts about one video frame.
+/// True when the bytes at `offset` split into length-prefixed NAL units that end exactly at
+/// `offset + size`, each with a valid header byte. This checks only the sample boundaries,
+/// not any codec setting: a frame that fails it was cut at the wrong place.
+pub fn nal_chain_fits<R: ReadAt + ?Sized>(
+    src: &R,
+    length_size: u8,
+    offset: u64,
+    size: u32,
+) -> bool {
+    let ls = length_size as u64;
+    let end = offset + size as u64;
+    let mut pos = offset;
+    let mut units = 0;
+    while pos < end {
+        let mut head = [0u8; 5];
+        let n = (ls as usize + 1).min(5);
+        if pos + n as u64 > end || src.read_exact_at(&mut head[..n], pos).is_err() {
+            return false;
+        }
+        let len = head[..ls as usize]
+            .iter()
+            .fold(0u64, |a, &b| (a << 8) | b as u64);
+        if len < 2 || head[ls as usize] & 0x80 != 0 || pos + ls + len > end {
+            return false;
+        }
+        pos += ls + len;
+        units += 1;
+    }
+    units > 0
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FrameInfo {
     /// Clean random access point: HEVC IDR/BLA, H.264 IDR.
