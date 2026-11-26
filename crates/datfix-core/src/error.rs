@@ -386,7 +386,11 @@ impl Error {
                      can't store files larger than {}.",
                     gb(*size),
                     dir.display(),
-                    gb(*limit)
+                    if *limit == crate::volume::FAT_MAX_FILE {
+                        "4 GB".to_string()
+                    } else {
+                        gb(*limit)
+                    }
                 ),
                 "Save to another drive (your computer's internal drive, or one formatted as \
                  exFAT, APFS or NTFS).",

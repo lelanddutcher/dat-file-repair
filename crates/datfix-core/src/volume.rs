@@ -289,6 +289,7 @@ mod tests {
         let m = err.user_message();
         assert_eq!(m.kind, "file_too_large_for_volume");
         assert!(m.message.contains("FAT32"), "{}", m.message);
+        assert!(m.message.contains("larger than 4 GB"), "{}", m.message);
         assert!(m.next_step.contains("exFAT"));
     }
 
