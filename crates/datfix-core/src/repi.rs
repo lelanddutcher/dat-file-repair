@@ -43,6 +43,17 @@ pub const HEADER_MIN: u64 = 20;
 pub const MAX_SAMPLES_PER_GROUP: u32 = 8_000_000;
 pub const MAX_SAMPLE_SIZE: u32 = 1 << 30;
 pub const MAX_GROUP_PAYLOAD: u64 = 8 << 30;
+/// Sample alignments tried for variable-size groups. 1 means "packed back to back".
+const ALIGNMENTS: [u32; 5] = [1, 4, 8, 16, 32];
+/// Samples checked per group when detecting alignment. Checking only a few is not enough: a
+/// wrong alignment can fit by chance when the padding happens to agree for the first frames.
+const ALIGN_CHECK_SAMPLES: u32 = 128;
+
+/// Rounds `offset` up to a multiple of `align`.
+fn align_up(offset: u64, align: u32) -> u64 {
+    let a = align.max(1) as u64;
+    offset.div_ceil(a) * a
+}
 
 /// One `repi` group: a header plus the samples it describes.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -62,6 +73,9 @@ pub struct Group {
     pub declared: u32,
     /// Number of samples whose bytes are entirely inside the file.
     pub complete: u32,
+    /// Each sample after the first starts at a multiple of this (file offset). 1 = packed.
+    /// R5 Mark II video is packed; R3 video is padded to 8-byte boundaries.
+    pub align: u32,
 }
 
 impl Group {
@@ -79,7 +93,7 @@ impl Group {
         }
     }
 
-    /// Bytes of the first `count` samples.
+    /// Bytes of the first `count` samples, padding excluded.
     pub fn len_of(&self, count: u32) -> u64 {
         if self.fixed_size > 0 {
             self.fixed_size as u64 * count as u64
@@ -88,14 +102,39 @@ impl Group {
         }
     }
 
+    /// `(offset, size)` of the first `count` samples.
+    pub fn samples(&self, count: u32) -> impl Iterator<Item = (u64, u32)> + '_ {
+        let mut off = self.data_offset();
+        (0..count as usize).map(move |i| {
+            if i > 0 {
+                off = align_up(off, self.align);
+            }
+            let size = self.sample_size(i);
+            let here = off;
+            off += size as u64;
+            (here, size)
+        })
+    }
+
+    /// File offset just after the `count`-th sample.
+    pub fn end_of(&self, count: u32) -> u64 {
+        if self.align <= 1 {
+            self.data_offset() + self.len_of(count)
+        } else {
+            self.samples(count)
+                .last()
+                .map_or(self.data_offset(), |(o, s)| o + s as u64)
+        }
+    }
+
     /// File offset just after the last declared sample.
     pub fn declared_end(&self) -> u64 {
-        self.data_offset() + self.len_of(self.declared)
+        self.end_of(self.declared)
     }
 
     /// File offset just after the last complete sample.
     pub fn complete_end(&self) -> u64 {
-        self.data_offset() + self.len_of(self.complete)
+        self.end_of(self.complete)
     }
 }
 
@@ -140,6 +179,51 @@ impl DatIndex {
     pub fn payload_start(&self) -> u64 {
         self.groups.first().map(|g| g.header_offset).unwrap_or(0)
     }
+
+    /// The typical shape of each stream, in order of first appearance.
+    pub fn shapes(&self) -> Vec<StreamShape> {
+        let mut out: Vec<StreamShape> = Vec::new();
+        let mut counts: Vec<std::collections::HashMap<u32, usize>> = Vec::new();
+        for g in &self.groups {
+            let i = match out.iter().position(|s| s.kind == g.kind) {
+                Some(i) => i,
+                None => {
+                    out.push(StreamShape {
+                        kind: g.kind,
+                        typical_samples: 0,
+                        fixed_size: g.fixed_size,
+                        align: g.align,
+                    });
+                    counts.push(Default::default());
+                    out.len() - 1
+                }
+            };
+            // Only complete groups say how many samples a group normally holds.
+            if g.complete == g.declared {
+                *counts[i].entry(g.declared).or_default() += 1;
+            }
+            out[i].align = out[i].align.max(g.align);
+        }
+        for (s, c) in out.iter_mut().zip(counts) {
+            s.typical_samples = c
+                .into_iter()
+                .max_by_key(|&(n, k)| (k, n))
+                .map_or(0, |(n, _)| n);
+        }
+        out
+    }
+}
+
+/// How one stream is laid out: a fingerprint of the camera's recording mode.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct StreamShape {
+    pub kind: FourCC,
+    /// Most common samples per group (0 when no group is complete).
+    pub typical_samples: u32,
+    /// Sample size, or 0 when sizes vary.
+    pub fixed_size: u32,
+    /// Sample alignment (1 = packed).
+    pub align: u32,
 }
 
 /// Why a candidate header was not accepted.
@@ -157,6 +241,18 @@ pub fn walk<R: ReadAt + ?Sized>(
     src: &R,
     progress: &mut dyn FnMut(u64) -> bool,
 ) -> Result<DatIndex> {
+    walk_from(src, 0, usize::MAX, progress)
+}
+
+/// Walks groups starting at `start`, stopping after `max_groups` groups.
+///
+/// Used with a limit to sample the `repi` layout inside a healthy clip's `mdat`.
+pub fn walk_from<R: ReadAt + ?Sized>(
+    src: &R,
+    start: u64,
+    max_groups: usize,
+    progress: &mut dyn FnMut(u64) -> bool,
+) -> Result<DatIndex> {
     let len = src.size();
     let io = |e| Error::io("cannot read the .DAT", e);
     let mut index = DatIndex {
@@ -170,15 +266,18 @@ pub fn walk<R: ReadAt + ?Sized>(
     }
 
     // `last_end` is where the previous group ended; the scan starts there.
-    let mut last_end = 0u64;
-    let mut scan_from = 0u64;
-    loop {
+    let mut last_end = start;
+    let mut scan_from = start;
+    while index.groups.len() < max_groups {
         let Some(at) = find_magic(src, scan_from).map_err(io)? else {
             index.trailing_bytes = len - last_end;
             break;
         };
         match read_header(src, at).map_err(io)? {
             HeaderResult::Valid(mut g) => {
+                if g.fixed_size == 0 && g.declared >= 2 {
+                    g.align = detect_alignment(src, &g).map_err(io)?;
+                }
                 // The first gap (before the first group) is the file header, not a gap.
                 if at > last_end && !index.groups.is_empty() {
                     index.gaps.push(Gap {
@@ -189,16 +288,10 @@ pub fn walk<R: ReadAt + ?Sized>(
                 let end = g.declared_end();
                 if end > len {
                     // Keep only samples whose last byte is inside the file.
-                    let mut off = g.data_offset();
-                    let mut complete = 0u32;
-                    while complete < g.declared {
-                        let next = off + g.sample_size(complete as usize) as u64;
-                        if next > len {
-                            break;
-                        }
-                        off = next;
-                        complete += 1;
-                    }
+                    let complete = g
+                        .samples(g.declared)
+                        .take_while(|&(o, s)| o + s as u64 <= len)
+                        .count() as u32;
                     g.complete = complete;
                     index.truncation = Some(Truncation {
                         offset: at,
@@ -296,11 +389,66 @@ fn read_header<R: ReadAt + ?Sized>(src: &R, at: u64) -> std::io::Result<HeaderRe
         sizes,
         declared: n,
         complete: n,
+        align: 1,
     };
     if g.len_of(n) > MAX_GROUP_PAYLOAD {
         return Ok(HeaderResult::Invalid);
     }
     Ok(HeaderResult::Valid(g))
+}
+
+/// Works out how the samples of a variable-size group are laid out.
+///
+/// Canon video samples are length-prefixed NAL units (4-byte big-endian lengths). For each
+/// candidate alignment, the first few samples are checked: their NAL lengths must add up to
+/// exactly the sample size. Sample 0 always starts right after the header, so at least two
+/// samples must be checked to tell alignments apart. Falls back to packed (1).
+fn detect_alignment<R: ReadAt + ?Sized>(src: &R, g: &Group) -> std::io::Result<u32> {
+    let len = src.size();
+    'candidates: for align in ALIGNMENTS {
+        let mut off = g.data_offset();
+        let mut checked = 0;
+        for i in 0..g.declared.min(ALIGN_CHECK_SAMPLES) as usize {
+            if i > 0 {
+                off = align_up(off, align);
+            }
+            let size = g.sizes[i];
+            if off + size as u64 > len {
+                break;
+            }
+            if !nal_chain_fits(src, off, size)? {
+                continue 'candidates;
+            }
+            checked += 1;
+            off += size as u64;
+        }
+        if checked >= 2 {
+            return Ok(align);
+        }
+    }
+    Ok(1)
+}
+
+/// True when the 4-byte NAL length prefixes starting at `off` add up to exactly `size`.
+fn nal_chain_fits<R: ReadAt + ?Sized>(src: &R, off: u64, size: u32) -> std::io::Result<bool> {
+    let end = off + size as u64;
+    let mut pos = off;
+    let mut b = [0u8; 4];
+    for _ in 0..4096 {
+        if pos == end {
+            return Ok(true);
+        }
+        if pos + 4 > end {
+            return Ok(false);
+        }
+        src.read_exact_at(&mut b, pos)?;
+        let nal = u32::from_be_bytes(b) as u64;
+        if nal == 0 {
+            return Ok(false);
+        }
+        pos += 4 + nal;
+    }
+    Ok(false)
 }
 
 /// Finds the next `repi` magic at or after `from`.
@@ -474,6 +622,49 @@ pub(crate) mod tests {
         let idx = walk(&d, &mut no_progress()).unwrap();
         assert_eq!(idx.groups[0].header_offset, 64 * 1024 + 1);
         assert!(!idx.has_canon_header);
+    }
+
+    /// A sample made of one NAL unit with a 4-byte length prefix.
+    fn nal_sample(size: u32) -> Vec<u8> {
+        let mut v = (size - 4).to_be_bytes().to_vec();
+        v.extend(std::iter::repeat_n(0x40u8, size as usize - 4));
+        v
+    }
+
+    #[test]
+    fn detects_packed_and_aligned_samples() {
+        let sizes = [29u32, 30, 45, 17];
+        // Packed: samples back to back.
+        let mut d = dat_header();
+        let mut g = group_bytes(b"vide", 0, &sizes);
+        g.truncate(20 + 16);
+        for &s in &sizes {
+            g.extend(nal_sample(s));
+        }
+        d.extend(&g);
+        let idx = walk(&d, &mut no_progress()).unwrap();
+        assert_eq!(idx.groups[0].align, 1);
+        assert_eq!(idx.groups[0].declared_end(), d.len() as u64);
+
+        // Aligned: each sample after the first starts on a 16-byte boundary.
+        let mut d = dat_header();
+        d.extend(&group_bytes(b"vide", 0, &sizes)[..36]);
+        for (i, &s) in sizes.iter().enumerate() {
+            if i > 0 {
+                while d.len() % 16 != 0 {
+                    d.push(0xee);
+                }
+            }
+            d.extend(nal_sample(s));
+        }
+        let idx = walk(&d, &mut no_progress()).unwrap();
+        let g = &idx.groups[0];
+        assert_eq!(g.align, 16);
+        let offs: Vec<u64> = g.samples(4).map(|(o, _)| o).collect();
+        assert_eq!(offs[0], 16 + 36);
+        assert!(offs[1..].iter().all(|o| o % 16 == 0));
+        assert_eq!(g.declared_end(), d.len() as u64);
+        assert!(idx.truncation.is_none());
     }
 
     #[test]

@@ -11,6 +11,7 @@ use serde::Serialize;
 use crate::error::{Error, Result};
 use crate::fourcc::FourCC;
 use crate::read_at::{FileSource, ReadAt};
+use crate::repi::{self, StreamShape};
 
 use super::atom::{self, Atom};
 use super::bytes::ByteReader;
@@ -103,6 +104,10 @@ pub struct Reference {
     pub moov: Atom,
     pub movie_timescale: u32,
     pub tracks: Vec<RefTrack>,
+    /// Layout of the `repi` groups inside the reference's own `mdat`, when it has them. Canon
+    /// cameras keep the index in finished files too, so this is a fingerprint of the
+    /// recording mode that can be compared with the `.DAT`.
+    pub repi_shapes: Option<Vec<StreamShape>>,
 }
 
 impl Reference {
@@ -135,7 +140,15 @@ impl Reference {
         let mut parsed =
             atom::parse_atoms(&moov_bytes).map_err(|e| bad(format!("broken moov: {e}")))?;
         let moov = parsed.pop().ok_or_else(|| bad("empty moov".into()))?;
-        Self::from_parts(path, src.size(), ftyp, moov).map_err(bad)
+        let mut reference = Self::from_parts(path, src.size(), ftyp, moov).map_err(bad)?;
+        if let Some(mdat) = find(b"mdat") {
+            // Sample the first groups only; that is enough to see every stream.
+            reference.repi_shapes =
+                repi::walk_from(&src, mdat.offset + mdat.header_len, 32, &mut |_| true)
+                    .ok()
+                    .map(|index| index.shapes());
+        }
+        Ok(reference)
     }
 
     /// Builds a reference from an already-parsed `ftyp` box and `moov` tree.
@@ -177,6 +190,7 @@ impl Reference {
             moov,
             movie_timescale,
             tracks,
+            repi_shapes: None,
         })
     }
 

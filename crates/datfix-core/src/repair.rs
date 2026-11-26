@@ -484,7 +484,7 @@ pub fn repair(
         )
     })?;
 
-    let tracks: Vec<TrackReport> = outputs
+    let mut tracks: Vec<TrackReport> = outputs
         .iter()
         .zip(&trimmed)
         .map(|(t, &trim)| TrackReport {
@@ -497,6 +497,7 @@ pub fn repair(
             trimmed_samples: trim,
         })
         .collect();
+    tracks.sort_by_key(|t| t.track_id);
     let duration_seconds = tracks
         .iter()
         .find(|t| t.source.0 == *b"vide")

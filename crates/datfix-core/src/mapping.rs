@@ -17,7 +17,7 @@ use serde::Serialize;
 
 use crate::fourcc::FourCC;
 use crate::mp4::reference::{RefTrack, Reference, TrackKind};
-use crate::repi::DatIndex;
+use crate::repi::{DatIndex, StreamShape};
 
 /// A run of samples that sit back to back in the `.DAT` (one `repi` group).
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -134,18 +134,6 @@ fn wanted_kind(t: FourCC) -> Option<TrackKind> {
         b"tdmt" => Some(TrackKind::Metadata),
         _ => None,
     }
-}
-
-/// Most common value (ties: the smallest). Used for "typical samples per group".
-fn mode(values: impl Iterator<Item = u32>) -> Option<u32> {
-    let mut counts: HashMap<u32, usize> = HashMap::new();
-    for v in values {
-        *counts.entry(v).or_default() += 1;
-    }
-    counts
-        .into_iter()
-        .max_by_key(|&(v, c)| (c, std::cmp::Reverse(v)))
-        .map(|(v, _)| v)
 }
 
 /// Maps the `.DAT` streams onto the reference tracks and checks they fit.
@@ -267,14 +255,40 @@ pub fn map_tracks(index: &DatIndex, reference: &Reference) -> Result<Mapping, Ve
             ));
             return Err(reasons);
         }
-        p.chunks.push(Chunk {
-            offset: g.data_offset(),
-            samples: g.complete,
-        });
+        if g.align <= 1 {
+            // Packed samples: the whole group is one chunk.
+            p.chunks.push(Chunk {
+                offset: g.data_offset(),
+                samples: g.complete,
+            });
+        } else {
+            // Padded samples are not contiguous, so each one is its own chunk (as Canon does).
+            p.chunks.extend(
+                g.samples(g.complete)
+                    .map(|(offset, _)| Chunk { offset, samples: 1 }),
+            );
+        }
         if g.fixed_size == 0 {
             p.sizes.extend_from_slice(&g.sizes[..g.complete as usize]);
         }
         p.sample_count += g.complete as u64;
+    }
+
+    // Some cameras store a whole PCM group as one big sample (for example 96096 bytes =
+    // 24024 stereo 16-bit frames). MP4 stores one sample per audio frame, so split it.
+    for p in &mut plans {
+        let rt = &reference.tracks[p.ref_track];
+        let frame = rt.fixed_sample_size;
+        if rt.kind == TrackKind::PcmAudio
+            && frame > 0
+            && p.fixed_size > frame
+            && p.fixed_size % frame == 0
+        {
+            let k = p.fixed_size / frame;
+            p.chunks.iter_mut().for_each(|c| c.samples *= k);
+            p.sample_count *= k as u64;
+            p.fixed_size = frame;
+        }
     }
 
     // Sample size must match the reference for fixed-size streams.
@@ -296,7 +310,9 @@ pub fn map_tracks(index: &DatIndex, reference: &Reference) -> Result<Mapping, Ve
         }
     }
 
-    check_group_durations(index, reference, &plans, &mut reasons, &mut notes);
+    let shapes = index.shapes();
+    check_group_durations(reference, &plans, &shapes, &mut reasons, &mut notes);
+    compare_shapes(reference, &shapes, &mut reasons, &mut notes);
 
     for (i, t) in reference.tracks.iter().enumerate() {
         if !plans.iter().any(|p| p.ref_track == i) {
@@ -314,29 +330,72 @@ pub fn map_tracks(index: &DatIndex, reference: &Reference) -> Result<Mapping, Ve
     }
 }
 
-/// Checks that one typical group of every stream covers the same time span as one typical
-/// video group. A mismatch means a different frame rate or audio rate than the reference.
-fn check_group_durations(
-    index: &DatIndex,
+/// Compares the `.DAT` stream layout with the `repi` layout inside the reference's `mdat`.
+/// A different number of samples per group, or a stream only one side has, means the clips
+/// were recorded in different modes.
+fn compare_shapes(
     reference: &Reference,
-    plans: &[TrackPlan],
+    dat: &[StreamShape],
     reasons: &mut Vec<String>,
     notes: &mut Vec<String>,
 ) {
-    let typical = |t: FourCC| {
-        mode(
-            index
-                .groups
-                .iter()
-                .filter(|g| g.kind == t && g.complete == g.declared)
-                .map(|g| g.declared),
-        )
+    let Some(theirs) = &reference.repi_shapes else {
+        notes.push(
+            "the reference has no Canon recovery index, so its recording mode could not be compared"
+                .into(),
+        );
+        return;
+    };
+    for d in dat {
+        let Some(r) = theirs.iter().find(|r| r.kind == d.kind) else {
+            continue; // handled by the track mapping
+        };
+        if d.typical_samples > 0 && r.typical_samples > 0 && d.typical_samples != r.typical_samples
+        {
+            reasons.push(format!(
+                "the reference stores {} '{}' samples per index group but the .DAT stores {}: \
+                 the clips use a different frame rate or recording mode",
+                r.typical_samples, r.kind, d.typical_samples
+            ));
+        }
+    }
+    let extra: Vec<String> = theirs
+        .iter()
+        .filter(|r| !dat.iter().any(|d| d.kind == r.kind))
+        .map(|r| format!("'{}'", r.kind))
+        .collect();
+    if !extra.is_empty() {
+        reasons.push(format!(
+            "the reference also records {} stream(s) that the .DAT does not have: it was recorded \
+             in a different mode (for example with audio or timecode on)",
+            extra.join(", ")
+        ));
+    }
+}
+
+/// Checks that one typical group of every stream covers the same time span as one typical
+/// video group. A mismatch means a different frame rate or audio rate than the reference.
+fn check_group_durations(
+    reference: &Reference,
+    plans: &[TrackPlan],
+    shapes: &[StreamShape],
+    reasons: &mut Vec<String>,
+    notes: &mut Vec<String>,
+) {
+    // Typical samples per group, in the reference's sample units (PCM groups may be split).
+    let typical = |p: &TrackPlan| {
+        let shape = shapes.iter().find(|s| s.kind == p.repi_type)?;
+        let split = match (shape.fixed_size, p.fixed_size) {
+            (a, b) if a > 0 && b > 0 => a / b,
+            _ => 1,
+        };
+        Some(shape.typical_samples * split).filter(|&n| n > 0)
     };
     let Some(video_plan) = plans.iter().find(|p| p.repi_type.0 == *b"vide") else {
         return;
     };
     let vt: &RefTrack = &reference.tracks[video_plan.ref_track];
-    let Some(vn) = typical(video_plan.repi_type) else {
+    let Some(vn) = typical(video_plan) else {
         return;
     };
     let video_span = vn as f64 * vt.sample_seconds();
@@ -346,7 +405,7 @@ fn check_group_durations(
     let mut compared = false;
     for p in plans.iter().filter(|p| p.repi_type.0 != *b"vide") {
         let rt = &reference.tracks[p.ref_track];
-        let Some(n) = typical(p.repi_type) else {
+        let Some(n) = typical(p) else {
             continue;
         };
         let span = n as f64 * rt.sample_seconds();
@@ -360,7 +419,13 @@ fn check_group_durations(
             ));
         }
     }
-    if !compared && vt.samples_per_chunk > 0 && vt.samples_per_chunk != vn {
+    // Without audio, only the reference's own repi layout (compare_shapes) or its chunking can
+    // hint at the frame rate.
+    if !compared
+        && reference.repi_shapes.is_none()
+        && vt.samples_per_chunk > 0
+        && vt.samples_per_chunk != vn
+    {
         notes.push(format!(
             "could not verify the frame rate: the .DAT has no indexed audio. Video groups hold {vn} \
              frames, the reference's chunks hold {}; check that both clips use the same frame rate",
@@ -402,11 +467,5 @@ mod tests {
         assert_eq!(p.chunks[1].samples, 1);
         assert_eq!(p.sizes, vec![10, 20, 30]);
         assert_eq!(p.end_offset(), 530);
-    }
-
-    #[test]
-    fn mode_prefers_most_common() {
-        assert_eq!(mode([60, 60, 15, 60, 15].into_iter()), Some(60));
-        assert_eq!(mode(std::iter::empty()), None);
     }
 }

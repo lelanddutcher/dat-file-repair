@@ -45,7 +45,8 @@ pub struct InspectReport {
     pub rejected_headers: u64,
     pub trailing_bytes: u64,
     pub truncation: Option<Truncation>,
-    /// Estimated duration from 48 kHz PCM audio, when the `.DAT` has indexed PCM.
+    /// Estimated duration from 48 kHz PCM audio, when the `.DAT` has indexed PCM. Assumes
+    /// 16-bit stereo when the sample layout does not say otherwise.
     pub estimated_seconds: Option<f64>,
     /// Estimated video frame rate from the same data.
     pub estimated_fps: Option<f64>,
@@ -102,14 +103,22 @@ pub fn summarize(path: &Path, index: &DatIndex) -> InspectReport {
     common_gaps.sort_by_key(|&(size, count)| (std::cmp::Reverse(count), size));
     common_gaps.truncate(5);
 
-    // Duration estimate: PCM samples of one channel at 48 kHz.
-    let lpcm_runs = pattern.iter().filter(|k| k.0 == *b"lpcm").count().max(1) as f64;
+    // Duration estimate from PCM bytes. 24-bit mono groups (R5 II) use 3-byte samples; groups
+    // stored as one big sample are assumed to be 16-bit stereo (4 bytes per audio frame).
     let pcm = types.iter().find(|t| t.kind.0 == *b"lpcm");
     let video = types.iter().find(|t| t.kind.0 == *b"vide");
-    let estimated_seconds = pcm.map(|p| p.samples as f64 / lpcm_runs / ASSUMED_AUDIO_RATE);
+    let lpcm_per_interval = pattern.iter().filter(|k| k.0 == *b"lpcm").count().max(1) as f64;
+    let frame_bytes = |p: &TypeSummary| match p.fixed_size {
+        Some(s) if s <= 8 => s as f64,
+        _ => 4.0,
+    };
+    let estimated_seconds =
+        pcm.map(|p| p.bytes as f64 / frame_bytes(p) / lpcm_per_interval / ASSUMED_AUDIO_RATE);
     let estimated_fps = match (pcm, video) {
         (Some(p), Some(v)) if p.typical_group > 0 => {
-            Some(v.typical_group as f64 / (p.typical_group as f64 / ASSUMED_AUDIO_RATE))
+            let group_bytes = p.typical_group as f64 * p.fixed_size.unwrap_or(0) as f64;
+            let span = group_bytes / frame_bytes(p) / ASSUMED_AUDIO_RATE;
+            (span > 0.0).then(|| v.typical_group as f64 / span)
         }
         _ => None,
     };
