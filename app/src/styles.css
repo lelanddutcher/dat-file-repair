@@ -748,3 +748,33 @@ details.group > summary {
 .card-note p {
   margin: 0 0 4px;
 }
+
+/* Advanced options per file */
+
+details.advanced {
+  margin: 8px 0 0;
+}
+
+.adv-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.adv-row select {
+  font: inherit;
+  padding: 3px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+}
+
+.adv-row input[type="checkbox"] {
+  margin: 0;
+}
+
+.adv-help {
+  margin: 2px 0 0;
+}

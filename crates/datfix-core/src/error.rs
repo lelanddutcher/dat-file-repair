@@ -118,8 +118,9 @@ pub enum Error {
     /// The `.DAT` is empty, or holds only zero bytes.
     #[error(
         "{} holds no recording data ({detail}): the data isn't in this file. The card's file \
-         table points at empty space. Recover the memory card with PhotoRec first (free, \
-         https://www.cgsecurity.org), without writing anything to the card, then run datfix \
+         table points at empty space. Search the card (or an image of it) for the recording \
+         with `datfix scan` (in the app: \"Recover from a memory card\"); it only reads the card. \
+         If that finds nothing, try PhotoRec (free, https://www.cgsecurity.org) and run datfix \
          on the .DAT or .MP4 pieces it finds.",
         .path.display()
     )]
@@ -318,8 +319,11 @@ impl Error {
                     file_name(path)
                 ),
                 "The video may still be on the card. Stop using the card and do not format \
-                 it. Recover the card with PhotoRec (free, https://www.cgsecurity.org) without \
-                 writing anything to it, then open the .DAT or .MP4 files it finds in DATfix.",
+                 it. Let DATfix search the card for the recording: in the DATfix app, choose \
+                 \"Recover from a memory card\"; on the command line, run `datfix scan` on the \
+                 card or an image of it. Both only read the card. If DATfix finds nothing, a \
+                 general recovery tool such as PhotoRec (free, https://www.cgsecurity.org) may \
+                 still help.",
             ),
             Error::NotCanon(what) => msg(
                 "not_canon",
@@ -402,8 +406,9 @@ impl Error {
                     file_name(path)
                 ),
                 "If you expected a longer clip, the rest may still be on the card. Stop using \
-                 the card and recover it with PhotoRec (free, https://www.cgsecurity.org), \
-                 without writing anything to it.",
+                 the card and let DATfix search it (\"Recover from a memory card\" in the app, \
+                 `datfix scan` on the command line). If that finds nothing, try PhotoRec (free, \
+                 https://www.cgsecurity.org).",
             ),
             Error::FileTooLargeForVolume {
                 dir,

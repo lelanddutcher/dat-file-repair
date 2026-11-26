@@ -19,10 +19,11 @@ use std::time::{Duration, Instant};
 
 use datfix_core::Error as CoreError;
 use datfix_core::carve::{
-    self, DatHint, FinishedClip, Found, FsKind, ImageSource, Recovered, ScanEvent, ScanOptions,
+    self, FileMatch, FinishedClip, Found, FsKind, ImageSource, Recovered, ScanEvent, ScanOptions,
     ScanPhase, ScanReport, StreamEnd,
 };
 use datfix_core::read_at::ReadAt;
+use datfix_core::repair::RecordingHint;
 use serde::Serialize;
 
 use super::{AppError, AppResult, file_name, gb, map_error};
@@ -130,6 +131,9 @@ pub struct PreparedRecording {
     pub offset: u64,
     /// The new `.DAT` file, when the copy worked.
     pub dat: Option<PathBuf>,
+    /// What the card says about the recording (original name, card times), from
+    /// [`carve::hint_for`]. The page passes it back to `repair_dat` with this `.DAT`.
+    pub hint: RecordingHint,
     pub error: Option<AppError>,
 }
 
@@ -393,7 +397,7 @@ fn describe(image: &Path, r: &ScanReport, src: &ImageSource) -> CardScanView {
 }
 
 fn recording_view(r: &ScanReport, rec: &Recovered) -> RecordingView {
-    let entry = card_entry(r, rec);
+    let entry = rec.file.as_ref();
     let badge = entry.as_ref().and_then(|f| {
         if f.deleted {
             Some("deleted")
@@ -403,7 +407,7 @@ fn recording_view(r: &ScanReport, rec: &Recovered) -> RecordingView {
             None
         }
     });
-    let card_path = entry.as_ref().map(|f| f.path.clone());
+    let card_path = entry.map(|f| f.path.clone());
     let end = match rec.end {
         StreamEnd::DatUnit => "ends at a 32 MiB unit, like the camera's .DAT",
         StreamEnd::LastGroup => "ends after the last complete group",
@@ -446,11 +450,11 @@ fn recording_view(r: &ScanReport, rec: &Recovered) -> RecordingView {
     if !rec.has_dat_header {
         details.push("headerless: no .DAT start leads here".into());
     }
-    if rec.file.is_none()
-        && let Some(e) = &entry
+    if rec.file_match == Some(FileMatch::StartTime)
+        && let Some(e) = entry
     {
         details.push(format!(
-            "named after the file entry {} ({} bytes): its name's time matches the recording's \
+            "named after the file entry {} ({} bytes): its start time matches the recording's \
              start timecode",
             e.path, e.size
         ));
@@ -564,6 +568,7 @@ pub fn prepare_repair(
             Ok(_) => out.push(PreparedRecording {
                 offset: rec.offset,
                 dat: Some(path),
+                hint: carve::hint_for(rec),
                 error: None,
             }),
             Err(e) => {
@@ -574,6 +579,7 @@ pub fn prepare_repair(
                 out.push(PreparedRecording {
                     offset: rec.offset,
                     dat: None,
+                    hint: carve::hint_for(rec),
                     error: Some(err),
                 });
             }
@@ -672,77 +678,19 @@ pub fn save_item(
     Ok(path)
 }
 
-/// The card's file entry for a recording: the one whose first cluster points at it, or else a
-/// `.DAT` entry the scan could not place (usually a 0-byte entry with no cluster) whose name
-/// holds the time the recording's timecode starts at.
-fn card_entry(r: &ScanReport, rec: &Recovered) -> Option<EntryRef> {
-    if let Some(f) = &rec.file {
-        return Some(EntryRef {
-            path: f.path.clone(),
-            size: f.size,
-            deleted: f.deleted,
-        });
-    }
-    let starts = |rec: &Recovered| -> Option<f64> {
-        Some(rec.start_timecode? as f64 / rec.frame_rate.filter(|f| *f > 0.0)?)
-    };
-    let matches = |h: &DatHint, rec: &Recovered| -> bool {
-        match (name_time(&h.path), starts(rec)) {
-            (Some(t), Some(s)) => {
-                let d = (s - t as f64).rem_euclid(86_400.0);
-                d.min(86_400.0 - d) <= 2.0
-            }
-            _ => false,
-        }
-    };
-    let mut hits = r
-        .dat_entries
-        .iter()
-        .filter(|h| h.recording.is_none() && matches(h, rec));
-    let hit = hits.next()?;
-    // Only a single, unambiguous match names the recording.
-    if hits.next().is_some()
-        || r.recordings
-            .iter()
-            .filter(|o| o.file.is_none() && matches(hit, o))
-            .count()
-            != 1
-    {
-        return None;
-    }
-    Some(EntryRef {
-        path: hit.path.clone(),
-        size: hit.size,
-        deleted: hit.deleted,
-    })
-}
-
-struct EntryRef {
-    path: String,
-    size: u64,
-    deleted: bool,
-}
-
-/// Seconds after midnight from a Canon file name with a date and time, such as
-/// `A_0001C809H241214_1422235Q_LAD04.DAT` (`H` + `YYMMDD_HHMMSS`).
-fn name_time(path: &str) -> Option<u32> {
-    let name = path.rsplit('/').next()?.as_bytes();
-    (0..name.len().saturating_sub(13)).find_map(|i| {
-        let w = &name[i..i + 14];
-        let digits = |r: std::ops::Range<usize>| w[r].iter().all(u8::is_ascii_digit);
-        if w[0] != b'H' || w[7] != b'_' || !digits(1..7) || !digits(8..14) {
-            return None;
-        }
-        let n = |a: usize| (w[a] - b'0') as u32 * 10 + (w[a + 1] - b'0') as u32;
-        let (h, m, s) = (n(8), n(10), n(12));
-        (h < 24 && m < 60 && s < 60).then_some(h * 3600 + m * 60 + s)
-    })
-}
-
-/// `<card name>.DAT` when the card's file list names it, else `recovered_<offset>.DAT`.
+/// The engine's name for a recording ([`carve::recovered_name`]: the card's name for it, else
+/// `recovered_<offset>.DAT`). As in `datfix scan`, when an earlier recording in the scan has
+/// the same name, this one is named by its offset. A file that exists gets " (2)" and so on.
 fn recording_path(dir: &Path, r: &ScanReport, rec: &Recovered) -> PathBuf {
-    let stem = card_entry(r, rec)
-        .and_then(|f| safe_stem(&f.path))
+    let name = carve::recovered_name(rec);
+    let taken = r
+        .recordings
+        .iter()
+        .take_while(|o| o.offset != rec.offset)
+        .any(|o| carve::recovered_name(o) == name);
+    let stem = (!taken)
+        .then(|| safe_stem(&name.to_string_lossy()))
+        .flatten()
         .unwrap_or_else(|| format!("recovered_{}", rec.offset));
     unique_path(dir, &stem, ".DAT")
 }
@@ -1293,14 +1241,66 @@ mod tests {
         );
     }
 
+    fn recovered(offset: u64, path: Option<&str>) -> Recovered {
+        Recovered {
+            offset,
+            length: 1,
+            pieces: Vec::new(),
+            has_dat_header: true,
+            groups: 1,
+            video_frames: 1,
+            duration_seconds: None,
+            frame_rate: None,
+            camera: None,
+            recording: None,
+            brand: None,
+            start_timecode: None,
+            end: StreamEnd::DatUnit,
+            stitched: false,
+            partial: None,
+            overlaps_clips: Vec::new(),
+            file: path.map(|p| carve::FileRef {
+                path: p.into(),
+                size: 0,
+                deleted: false,
+                created: None,
+                modified: None,
+            }),
+            file_match: path.map(|_| FileMatch::StartTime),
+            resyncs: 0,
+        }
+    }
+
     #[test]
-    fn times_in_canon_names() {
+    fn copies_keep_the_card_name_and_share_it_like_the_cli() {
+        let report = ScanReport {
+            size: 0,
+            is_device: false,
+            volumes: Vec::new(),
+            recordings: vec![
+                recovered(100, Some("/DCIM/A_0001C002H220424_102233C0.DAT")),
+                recovered(200, Some("/DCIM2/A_0001C002H220424_102233C0.DAT")),
+                recovered(300, None),
+            ],
+            clips: Vec::new(),
+            fragments: Vec::new(),
+            dat_entries: Vec::new(),
+            headers_seen: 0,
+            seconds: 0.0,
+            notes: Vec::new(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let p = |i: usize| recording_path(dir.path(), &report, &report.recordings[i]);
+        assert_eq!(p(0), dir.path().join("A_0001C002H220424_102233C0.DAT"));
+        assert_eq!(p(1), dir.path().join("recovered_200.DAT"));
+        assert_eq!(p(2), dir.path().join("recovered_300.DAT"));
+        // The hint keeps the original name, so the repair can read the time from it.
         assert_eq!(
-            name_time("/XFVC/CLIPS001/A_0001C809H241214_1422235Q_LAD04.DAT"),
-            Some(14 * 3600 + 22 * 60 + 23)
+            carve::hint_for(&report.recordings[0]).name.as_deref(),
+            Some("A_0001C002H220424_102233C0.DAT")
         );
-        assert_eq!(name_time("/DCIM/100EOSR5/LAD12345.DAT"), None);
-        assert_eq!(name_time("H241214_996060"), None);
+        std::fs::write(p(0), b"x").unwrap();
+        assert_eq!(p(0), dir.path().join("A_0001C002H220424_102233C0 (2).DAT"));
     }
 
     #[cfg(unix)]

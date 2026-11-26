@@ -71,8 +71,12 @@ sees these files and does not guess.
 ## Usage
 
 **App.** Open DATfix and drop your `.DAT` file (or the whole card folder) into the window. DATfix
-reads the file and picks the video settings. Choose where to save, then press **Repair**. The
+reads the file and picks the video settings. Choose where to save, then press **Repair**. Each file
+has an **Advanced** section: **Rotate** turns the picture for clips filmed on the side, and **Keep
+the reference clip's camera metadata** is off by default (see [Privacy](#privacy)). The
 [user guide](docs/user/guide.md) walks through every step.
+
+<img src="docs/user/img/05-done.png" width="480" alt="DATfix after a repair: Recovered 1.1 s, with Show in Finder and Play buttons">
 
 **Command line.**
 
@@ -80,6 +84,7 @@ reads the file and picks the video settings. Choose where to save, then press **
 datfix inspect A001.DAT                         # what is in the file, and how much can be recovered
 datfix repair A001.DAT                          # writes A001_repaired.MP4 in the current folder
 datfix repair A001.DAT --reference A002.MP4 -o fixed.MP4
+datfix repair A001.DAT --rotate 90              # play the picture turned 90 degrees clockwise
 datfix scan card.img -o recovered --repair      # find lost recordings on a card image
 ```
 
@@ -103,13 +108,19 @@ A 0-byte `.DAT` holds no video. The camera created the file entry but never upda
 cards the entry is missing completely. The recording is often still on the card, outside any file.
 
 1. Stop using the card. Do not record on it, format it or let the computer "repair" it.
-2. Make a raw image of the card (see the [user guide](docs/user/guide.md#recover-a-0-byte-or-missing-dat)
-   for macOS and Windows steps).
-3. Run `datfix scan card.img -o recovered --repair`. DATfix reads the whole image, finds the
-   recordings by their content, saves each one as a `.DAT`, and repairs it.
+2. In the app, click **Recover from a memory card…** (or **Scan the memory card for this
+   recording…** under the "This .DAT file is empty" message). DATfix can make an image of the
+   card for you, or scan an image you already have. It lists what it finds; **Repair all** copies
+   each recording off the card and repairs it.
+3. On the command line, make a raw image of the card (see the
+   [user guide](docs/user/guide.md#recover-a-0-byte-or-missing-dat) for macOS and Windows steps)
+   and run `datfix scan card.img -o recovered --repair`.
 
 The scan only reads. It also finds deleted clips and joins recordings that the card split into
-pieces when it can prove the order. [How card scanning works](docs/format/card-carving.md).
+pieces when it can prove the order. A recovered recording keeps its original file name when the
+card's file list still has it, also for a 0-byte entry (matched by its start time). The repaired
+file then gets the recording time from that name or from the card's file list, not the time of
+the scan. [How card scanning works](docs/format/card-carving.md).
 
 ## How DATfix compares
 
@@ -149,7 +160,9 @@ DATfix runs on your computer. It never uploads your files and works without an i
 A repaired file does not carry another clip's identity. DATfix copies only the settings a player
 needs from the reference clip. It leaves out that clip's thumbnail, lens, serial numbers, dates and
 location, and takes the camera model and recording date from your `.DAT`. To keep the reference
-clip's Canon metadata instead, use `--keep-reference-metadata`.
+clip's Canon metadata instead, turn on **Keep the reference clip's camera metadata** under
+**Advanced** in the app, or use `--keep-reference-metadata`. The result's **Details** list what was
+left out.
 
 ## FAQ
 

@@ -59,6 +59,8 @@ fn repairs_a_sample_through_the_app_layer() {
         found.path.as_deref(),
         &output,
         Some(index),
+        engine::RepairChoices::default(),
+        None,
         Arc::default(),
         &mut |p| {
             if let Progress::Stage { stage, .. } = p {
@@ -106,6 +108,8 @@ fn cancel_stops_a_large_repair_and_cleans_up() {
         found.path.as_deref(),
         &output,
         Some(index),
+        engine::RepairChoices::default(),
+        None,
         cancel,
         &mut |p| {
             if let Progress::Step { stage, .. } = p

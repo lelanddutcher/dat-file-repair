@@ -41,10 +41,12 @@ Scanning the device directly (`/dev/rdisk4`, `/dev/sdX`, `\\.\PhysicalDriveN`) a
 needs administrator rights. It is read-only, but an image protects against a card that dies
 during a second read.
 
+The desktop app runs the same scan ("Recover from a memory card"); see the user guide.
+
 ```text
 datfix scan card.img                       # report only
-datfix scan card.img -o recovered          # save recovered_<offset>.DAT files
-datfix scan card.img -o recovered --repair # also write recovered_<offset>.MP4
+datfix scan card.img -o recovered          # save each recording as <card name>.DAT or recovered_<offset>.DAT
+datfix scan card.img -o recovered --repair # also write the repaired .MP4 next to each .DAT
            [--clips] [--fragments] [--no-stitch] [--json]
 ```
 
@@ -82,7 +84,14 @@ If the image has a FAT-family file system (at offset 0, or in an MBR or GPT part
 scanner reads its boot sector, FAT and directories. It never needs them, but they add:
 
 - **Names**: a recording whose start is where a `.DAT` entry's first cluster points gets that
-  entry's name, live or deleted.
+  entry's name, live or deleted (`file_match: first_cluster`). A 0-byte entry has no first
+  cluster, so it is matched by time instead (`file_match: start_time`): the time in its Canon
+  name (`…H241221_134042…`), or else its creation time, must equal the time of day of the
+  recording's first timecode counter within 2 s. Only a match that is unique both ways counts;
+  two candidates on either side leave the recording unnamed.
+- **Times**: the entry's creation and modification times (exFAT adds a time zone).
+  `carve::hint_for` passes them, with the original name, to the repair
+  (`RepairOptions::hint`), so the repaired file is not dated by the scan.
 - **Hints**: every `.DAT` entry is listed with what was found at its first cluster. exFAT keeps
   the first cluster in deleted entries. FAT32 keeps it too, but a deleted short name loses its
   first letter (shown as `_`). A 0-byte entry usually has no first cluster.
@@ -175,8 +184,11 @@ read them.
   Recordings broken into more than 64 pieces stop at the 64th break.
 - Compressed disk images (`UDZO`, `.E01`, sparse bundles) are not read. Convert to raw first
   (`hdiutil convert -format UDTO in.dmg -o out`).
-- The repaired file's "recorded" time comes from the extracted file's modification time,
-  which is the time of the scan. The timecode still gives the time of day.
+- A recording with no matching entry (no first cluster, and no unique start-time match) is named
+  `recovered_<offset>.DAT`. Its repaired file gets no recording date ("unknown"), because the
+  copy's own file time is the time of the scan and is never used; the timecode track still
+  gives the time of day. A timecode preset to a value other than the clock defeats the
+  start-time match.
 
 ## 7. Performance
 

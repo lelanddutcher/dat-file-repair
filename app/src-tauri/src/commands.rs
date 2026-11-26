@@ -18,8 +18,9 @@ use crate::engine::card::{
 };
 use crate::engine::{
     self, AppError, AppResult, Capabilities, DatIndex, DatSummary, PartialView, Progress,
-    ReferenceMatch, RepairOutcome,
+    ReferenceMatch, RepairChoices, RepairOutcome,
 };
+use datfix_core::repair::RecordingHint;
 
 /// Shared state, owned by Tauri and handed to every command.
 #[derive(Default)]
@@ -101,6 +102,7 @@ async fn background<T: Send + 'static>(
                 next_step: "Please use Copy details and report this as a bug.".into(),
                 reasons: Vec::new(),
                 details: format!("background task failed: {e}"),
+                link: None,
             })
         })
 }
@@ -236,29 +238,46 @@ pub fn suggest_output(dat: PathBuf, dir: Option<PathBuf>, taken: Vec<PathBuf>) -
     engine::suggest_output(&dat, dir.as_deref(), &taken)
 }
 
-/// Repairs one `.DAT`. `reference` is a clip, or null for the built-in settings. Progress
-/// streams through `progress`; the result is the return value.
+/// Repairs one `.DAT`. `reference` is a clip, or null for the built-in settings. `choices`
+/// holds the "Advanced" options; `hint` is what a memory card said about a recording copied
+/// off it (from `card_prepare_repair`). Progress streams through `progress`; the result is the
+/// return value.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn repair_dat(
     state: State<'_, AppState>,
     job: String,
     dat: PathBuf,
     reference: Option<PathBuf>,
     output: PathBuf,
+    choices: Option<RepairChoices>,
+    hint: Option<RecordingHint>,
     progress: Channel<Progress>,
 ) -> AppResult<RepairOutcome> {
     // The index read when the file was added; the engine checks it still fits the file.
     let index = state.cached_index(&dat);
     let (cancel, _guard) = state.start_job(&job);
+    // Test hook: DATFIX_DEV_SLOW_MS pauses after each progress step, so the progress screen of
+    // a small test file can be seen and captured. Unset in normal use.
+    let slow = std::env::var("DATFIX_DEV_SLOW_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis);
     background(move || {
         engine::repair(
             &dat,
             reference.as_deref(),
             &output,
             index,
+            choices.unwrap_or_default(),
+            hint,
             cancel,
             &mut |p| {
+                let step = matches!(p, Progress::Step { .. });
                 let _ = progress.send(p);
+                if let Some(d) = slow.filter(|_| step) {
+                    std::thread::sleep(d);
+                }
             },
         )
     })

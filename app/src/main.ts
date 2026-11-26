@@ -15,8 +15,8 @@
 
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
-import { api, asAppError, type AppError, type AppInfo, type CardScanView, type DatSummary, type DevCardRun, type PartialView, type PreparedCard, type Progress, type ReferenceMatch, type RepairOutcome, type Stage } from "./api";
+import { openPath, openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { api, asAppError, type AppError, type AppInfo, type CardScanView, type DatSummary, type DevCardRun, type PartialView, type PreparedCard, type Progress, type RecordingHint, type ReferenceMatch, type RepairChoices, type RepairOutcome, type Stage } from "./api";
 import { card, initCard, openCard, renderCard, scanImage, makeImage, scanDirect, cancelJob as cancelCardJob, repairAll as cardRepairAll } from "./card";
 import * as fmt from "./format";
 import { h, type Child } from "./dom";
@@ -67,6 +67,10 @@ interface Item {
   /** True when the person picked the output name themselves (never renamed behind their back). */
   outputChosen?: boolean;
   run: RunState;
+  /** The "Advanced" options. */
+  choices: RepairChoices;
+  /** What the memory card said about a recording copied off it (name, card times). */
+  hint: RecordingHint | null;
 }
 
 const state = {
@@ -86,6 +90,8 @@ const state = {
   view: "main" as "main" | "card",
   /** Shown above the list after recordings were copied off a card. */
   cardNote: null as { text: string; problems: string[]; clipsDir: string | null } | null,
+  /** Ids of <details> sections the person opened, so a re-render keeps them open. */
+  open: new Set<string>(),
 };
 
 /** File types that are card images, not .DAT files. */
@@ -108,7 +114,7 @@ function enqueue<T>(work: () => Promise<T>): Promise<T> {
 // ---------------------------------------------------------------------------------------------
 
 /** Adds dropped or chosen paths: .DAT files and folders go to the list, .MP4s become the reference. */
-async function addPaths(paths: string[]) {
+async function addPaths(paths: string[], hints?: Map<string, RecordingHint>) {
   if (state.repairing || paths.length === 0) return;
   // A card image goes to the card screens and is searched right away.
   const image = paths.find((p) => IMAGE_RE.test(p));
@@ -145,6 +151,8 @@ async function addPaths(paths: string[]) {
       reading: true,
       ref: { status: "waiting" },
       run: { status: "idle" },
+      choices: { rotation: null, keepReferenceMetadata: false },
+      hint: hints?.get(dat) ?? null,
     };
     state.items.push(item);
     void prepare(item);
@@ -286,7 +294,7 @@ async function repairOne(item: Item) {
     if (!item.outputChosen) await refreshOutput(item);
     const m = item.ref.match!;
     const reference = m.source === "builtin" ? null : m.path;
-    const outcome = await api.repairDat(job, item.dat, reference, item.output!, (p) => onProgress(item, p));
+    const outcome = await api.repairDat(job, item.dat, reference, item.output!, item.choices, item.hint, (p) => onProgress(item, p));
     item.run = { status: "done", outcome };
   } catch (e) {
     const err = asAppError(e);
@@ -529,6 +537,7 @@ function renderItem(item: Item): HTMLElement {
     // In a batch, each file shows its own settings and name until it is repaired; the result
     // then says the same thing.
     if (state.items.length > 1 && item.run.status !== "done") rows.push(renderItemReference(item), renderItemOutput(item));
+    if (item.run.status !== "done" && item.run.status !== "running") rows.push(renderAdvanced(item));
   }
   rows.push(renderRun(item));
   return h("li", { class: "item" }, [
@@ -544,6 +553,82 @@ function renderItem(item: Item): HTMLElement {
     ]),
     ...rows,
   ]);
+}
+
+/** A <details> section that stays open across re-renders once opened. */
+function disclosure(id: string, cls: string, summary: string, children: Child): HTMLElement {
+  return h(
+    "details",
+    {
+      class: cls,
+      id,
+      open: state.open.has(id),
+      ontoggle: (ev: Event) => {
+        if ((ev.target as HTMLDetailsElement).open) state.open.add(id);
+        else state.open.delete(id);
+      },
+    },
+    [h("summary", {}, summary), children],
+  );
+}
+
+const ROTATIONS: [string, string][] = [
+  ["", "None"],
+  ["90", "90° clockwise"],
+  ["180", "180°"],
+  ["270", "90° counter-clockwise (270°)"],
+];
+
+/** Per-file options: display rotation and the reference clip's camera metadata. */
+function renderAdvanced(item: Item): HTMLElement {
+  const c = item.choices;
+  const off = state.repairing;
+  const rotId = `rotate-${item.id}`;
+  const metaId = `keep-meta-${item.id}`;
+  return disclosure(`advanced-${item.id}`, "advanced", "Advanced", [
+    h("div", { class: "adv-row" }, [
+      h("label", { for: rotId }, "Rotate"),
+      h(
+        "select",
+        {
+          id: rotId,
+          disabled: off,
+          onchange: (ev: Event) => {
+            const v = (ev.target as HTMLSelectElement).value;
+            c.rotation = v === "" ? null : Number(v);
+            render();
+          },
+        },
+        ROTATIONS.map(([v, label]) => h("option", { value: v, selected: String(c.rotation ?? "") === v }, label)),
+      ),
+    ]),
+    h("p", { class: "muted small adv-help" }, "Turns the picture when it plays, for clips filmed with the camera on its side. The video itself is not changed."),
+    h("div", { class: "adv-row" }, [
+      h("input", {
+        id: metaId,
+        type: "checkbox",
+        checked: c.keepReferenceMetadata,
+        disabled: off,
+        onchange: (ev: Event) => {
+          c.keepReferenceMetadata = (ev.target as HTMLInputElement).checked;
+          render();
+        },
+      }),
+      h("label", { for: metaId }, "Keep the reference clip's camera metadata"),
+    ]),
+    h(
+      "p",
+      { class: "muted small adv-help" },
+      "Off by default: that clip's thumbnail, serial numbers, lens, dates and location describe another recording, so they are left out.",
+    ),
+  ]);
+}
+
+/** The recording time written into the file, for "Details". */
+function recordedText(o: RepairOutcome): string {
+  if (o.creationTime == null) return o.dateSource;
+  const t = new Date(o.creationTime * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
+  return `${o.dateSource}: ${t}`;
 }
 
 function fact(label: string, value: string): Child[] {
@@ -799,9 +884,19 @@ function renderRun(item: Item): Child {
         h("button", { id: `reveal-${item.id}`, class: "primary", type: "button", onclick: () => void revealItemInDir(o.output).catch(openFailed) }, reveal),
         h("button", { id: `play-${item.id}`, type: "button", onclick: () => void openPath(o.output).catch(openFailed) }, "Play"),
       ]),
-      o.notes.length
-        ? h("details", {}, [h("summary", {}, "Details"), h("ul", { class: "small" }, o.notes.map((n) => h("li", {}, n)))])
-        : null,
+      disclosure(
+        `details-${item.id}`,
+        "",
+        "Details",
+        h("ul", { class: "small" }, [
+          h("li", {}, recordedText(o)),
+          o.rotationDegrees ? h("li", {}, `Rotated ${o.rotationDegrees}° clockwise when it plays`) : null,
+          o.withheldMetadata.length
+            ? h("li", {}, `Left out from the reference clip (privacy): ${o.withheldMetadata.join("; ")}`)
+            : null,
+          ...o.notes.map((n) => h("li", {}, n)),
+        ]),
+      ),
     ]);
   }
   if ((r.status === "failed" || r.status === "cancelled") && r.error) {
@@ -822,10 +917,20 @@ function errorBox(err: AppError, item?: Item): HTMLElement {
     err.reasons.length ? h("ul", {}, err.reasons.map((x) => h("li", {}, x))) : null,
     emptyDat
       ? h("div", {}, [
-          h("p", { class: "next" }, [h("strong", {}, "What to do: "), "The video may still be on the memory card. Stop using the card and don't format it. DATfix can search the card for this recording."]),
+          h("p", { class: "next" }, [
+            h("strong", {}, "What to do: "),
+            "The video may still be on the memory card. Stop using the card and don't format it. DATfix can search the card for this recording. If DATfix finds nothing, a general recovery tool such as PhotoRec may still help.",
+          ]),
           h("button", { id: `scan-card-${item.id}`, class: "primary", type: "button", disabled: state.repairing, onclick: () => enterCard({ lookingFor: item.name, hintPath: item.dat }) }, "Scan the memory card for this recording…"),
         ])
       : h("p", { class: "next" }, [h("strong", {}, "What to do: "), err.nextStep]),
+    err.link
+      ? h(
+          "button",
+          { id: `link-${item?.id ?? "x"}-${err.kind}`, type: "button", onclick: () => void openUrl(err.link!).catch(openFailed) },
+          err.kind === "layout_not_supported" ? "Report this recording…" : "Open the issue page…",
+        )
+      : null,
     err.details ? detailsBox(err.details) : null,
     h("button", { id: copyId, class: "link", type: "button", onclick: (ev: Event) => void copyDetails(err, item, ev.currentTarget as HTMLButtonElement) }, "Copy details"),
   ]);
@@ -920,7 +1025,8 @@ async function repairFromCard(prepared: PreparedCard, outDir: string, scan: Card
   state.view = "main";
   render();
   window.scrollTo(0, 0);
-  await addPaths(dats);
+  const hints = new Map(prepared.recordings.filter((r) => r.dat).map((r) => [r.dat!, r.hint] as [string, RecordingHint]));
+  await addPaths(dats, hints);
   await waitUntilReady();
   await repairAll();
 }
@@ -1005,9 +1111,18 @@ async function devAutorun() {
     const isClip = /\.mp4$/i.test(cfg.reference);
     state.refChoice = isClip ? { kind: "file", path: cfg.reference } : { kind: "folder", path: cfg.reference };
   }
+  devPauseMs = cfg.pauseMs ?? 0;
   await addPaths(cfg.dats);
   // Wait until every file is read and has a reference result.
   await waitUntilReady();
+  for (const i of state.items) {
+    if (cfg.rotation != null) i.choices.rotation = cfg.rotation;
+    if (cfg.keepReferenceMetadata) i.choices.keepReferenceMetadata = true;
+    if (cfg.openAdvanced) state.open.add(`advanced-${i.id}`);
+  }
+  render();
+  if (cfg.scrollY) window.scrollTo(0, cfg.scrollY);
+  await devScreen("ready");
   const report = () =>
     api.devReport(
       JSON.stringify(
@@ -1031,19 +1146,26 @@ async function devAutorun() {
         })),
       ),
     );
-  if (cfg.scrollY) window.scrollTo(0, cfg.scrollY);
   if (cfg.repair === false) {
     await report();
     return;
   }
   if (cfg.cancelAfterMs) setTimeout(() => void cancelRepair(), cfg.cancelAfterMs);
   const done = repairAll();
+  if (devPauseMs) {
+    await until(() => !state.repairing || state.items.some((i) => i.run.status === "running" && (i.run.done ?? 0) > 0), 60_000);
+    if (state.repairing) await devScreen("repairing");
+  }
   if (cfg.cleanPartials) {
     // Wait for the offer to appear, then accept it.
     for (let i = 0; i < 50 && state.partials.length === 0 && !state.partialsNote; i++) await new Promise((r) => setTimeout(r, 100));
     if (state.partials.length) await removePartials();
   }
   await done;
+  for (const i of state.items) state.open.add(`details-${i.id}`);
+  await devScreen("done");
+  window.scrollTo(0, document.body.scrollHeight);
+  await devScreen("done-bottom");
   await report();
 }
 

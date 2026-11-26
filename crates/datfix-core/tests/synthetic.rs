@@ -269,7 +269,9 @@ fn explains_inputs_that_are_not_repairable() {
     assert!(matches!(e, Error::EmptyDat { .. }), "{e}");
     let msg = e.to_string();
     assert!(
-        msg.contains("the data isn't in this file") && msg.contains("PhotoRec"),
+        msg.contains("the data isn't in this file")
+            && msg.contains("datfix scan")
+            && msg.contains("PhotoRec"),
         "{msg}"
     );
     // Only zeros: same advice.
@@ -519,6 +521,8 @@ fn user_messages_have_no_format_jargon() {
     let m = e.user_message();
     assert_eq!(m.kind, "empty_dat");
     assert!(m.next_step.contains("PhotoRec"), "{m:?}");
+    assert!(m.next_step.contains("Recover from a memory card"), "{m:?}");
+    assert!(m.next_step.contains("datfix scan"), "{m:?}");
 
     let mut eos_r = vec![
         0, 0, 0, 0, b'm', b'd', b'a', b't', 0, 0, 0, 8, b'w', b'i', b'd', b'e',

@@ -404,3 +404,115 @@ fn recovered_name_without_a_usable_entry() {
     assert_eq!(hint.name, None);
     assert!(hint.ignore_file_time);
 }
+
+/// A 0-byte entry has no first cluster. A recording at a cluster no entry points at, and the
+/// image with `entries` in `/DCIM`. The recording's timecode starts at `start` (seconds after
+/// midnight).
+fn image_with_unplaced_recording(entries: &[Vec<u8>], start: u32) -> (Vec<u8>, u64) {
+    use super::fs::tests::exfat_image;
+    // The synthetic stream's frame rate, learned from a scan of the stream alone.
+    let probe = canon_stream(200_000, 0, true, 20_000);
+    let fps = run(&probe).recordings[0].frame_rate.expect("frame rate");
+    let tc0 = (start as f64 * fps).round() as u32;
+    let dat = canon_stream(200_000, tc0, true, 20_000);
+    let mut img = exfat_image(entries, 0, 2 << 20);
+    let at = 32 * 512 + (40 - 2) * 4096;
+    img[at..at + dat.len()].copy_from_slice(&dat);
+    (img, at as u64)
+}
+
+#[test]
+fn canon_name_times() {
+    assert_eq!(
+        name_time_of_day("/XFVC/CLIPS001/A_0001C809H241214_1422235Q_LAD04.DAT"),
+        Some(14 * 3600 + 22 * 60 + 23)
+    );
+    assert_eq!(name_time_of_day("/DCIM/100EOSR5/LAD12345.DAT"), None);
+    assert_eq!(name_time_of_day("H241214_996060"), None);
+    assert_eq!(name_time_of_day("H241214_12345"), None);
+}
+
+#[test]
+fn names_a_recording_from_a_zero_byte_entry_by_the_time_in_its_name() {
+    use super::fs::tests::exfat_set;
+    let name = "A_0002C054H220424_102233C0_LAD04.DAT";
+    let entries = vec![
+        exfat_set("A_0001C001_LAD04.MP4", 10, 50_000, false, false),
+        exfat_set(name, 0, 0, false, false),
+    ];
+    let (img, at) = image_with_unplaced_recording(&entries, 10 * 3600 + 22 * 60 + 34);
+    let r = run(&img);
+    let rec = &r.recordings[0];
+    assert_eq!(rec.offset, at);
+    assert_eq!(rec.file_match, Some(FileMatch::StartTime));
+    let f = rec.file.as_ref().unwrap();
+    assert_eq!((f.path.as_str(), f.size), (&*format!("/DCIM/{name}"), 0));
+    assert_eq!(recovered_name(rec), PathBuf::from(name));
+    assert_eq!(hint_for(rec).name.as_deref(), Some(name));
+    let h = r
+        .dat_entries
+        .iter()
+        .find(|h| h.path.ends_with(name))
+        .unwrap();
+    assert_eq!(h.recording, Some(at));
+}
+
+#[test]
+fn names_a_recording_from_a_zero_byte_entry_by_its_creation_time() {
+    use super::fs::tests::exfat_set;
+    let mut set = exfat_set("LAD12345.DAT", 0, 0, false, false);
+    let date = (42u32 << 9) | (4 << 5) | 24;
+    let created = (date << 16) | (10 << 11) | (22 << 5) | 16; // 10:22:32
+    set[8..12].copy_from_slice(&created.to_le_bytes());
+    set[12..16].copy_from_slice(&created.to_le_bytes());
+    let (img, _) = image_with_unplaced_recording(&[set], 10 * 3600 + 22 * 60 + 33);
+    let r = run(&img);
+    let rec = &r.recordings[0];
+    assert_eq!(rec.file_match, Some(FileMatch::StartTime));
+    let hint = hint_for(rec);
+    assert_eq!(hint.name.as_deref(), Some("LAD12345.DAT"));
+    let local = crate::layout::days_from_civil(2022, 4, 24) * 86_400 + 10 * 3600 + 22 * 60 + 32;
+    assert_eq!(hint.created_local, Some(local));
+}
+
+#[test]
+fn does_not_name_by_time_when_the_match_is_ambiguous_or_off() {
+    use super::fs::tests::exfat_set;
+    let start = 10 * 3600 + 22 * 60 + 33;
+    // Two entries with the same start time: neither names the recording.
+    let entries = vec![
+        exfat_set("A_0002C054H220424_102233C0_LAD04.DAT", 0, 0, false, false),
+        exfat_set("B_0002C054H220424_102234C0_LAD04.DAT", 0, 0, false, false),
+    ];
+    let (img, _) = image_with_unplaced_recording(&entries, start);
+    let r = run(&img);
+    assert!(r.recordings[0].file.is_none());
+    assert_eq!(
+        recovered_name(&r.recordings[0]),
+        PathBuf::from(format!("recovered_{}.DAT", r.recordings[0].offset))
+    );
+    // A name 5 s away does not match.
+    let entries = vec![exfat_set(
+        "A_0002C054H220424_102238C0_LAD04.DAT",
+        0,
+        0,
+        false,
+        false,
+    )];
+    let (img, _) = image_with_unplaced_recording(&entries, start);
+    let r = run(&img);
+    assert!(r.recordings[0].file.is_none());
+    assert_eq!(r.recordings[0].file_match, None);
+}
+
+#[test]
+fn first_cluster_match_is_marked() {
+    use super::fs::tests::{exfat_image, exfat_set};
+    let entries = vec![exfat_set("LAD1.DAT", 40, 0, false, true)];
+    let dat = canon_stream(200_000, 42, true, 20_000);
+    let mut img = exfat_image(&entries, 0, 2 << 20);
+    let at = 32 * 512 + 38 * 4096;
+    img[at..at + dat.len()].copy_from_slice(&dat);
+    let r = run(&img);
+    assert_eq!(r.recordings[0].file_match, Some(FileMatch::FirstCluster));
+}

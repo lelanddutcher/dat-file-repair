@@ -17,12 +17,13 @@ use datfix_core::layout::{self, DatLayout};
 use datfix_core::mp4::reference::Reference;
 use datfix_core::read_at::FileSource;
 use datfix_core::repair::{
-    self, Checked, Event, Phase, RefKind, ReferenceSource, RepairOptions, SearchOptions, Verdict,
-    check_reference, choose_profile, search_references,
+    self, Checked, DateSource, Event, Phase, RecordingHint, RefKind, ReferenceSource,
+    RepairOptions, Rotation, SearchOptions, Verdict, check_reference, choose_profile,
+    search_references,
 };
 // Re-exported so `commands.rs` can cache indexes without importing the engine itself.
 pub use datfix_core::repi::DatIndex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Card recovery: scan a card image, copy recordings off it, image a card.
 pub mod card;
@@ -134,6 +135,24 @@ pub struct RepairOutcome {
     pub audio_tracks: usize,
     pub bytes_written: u64,
     pub notes: Vec<String>,
+    /// Recording start written into the file, UTC seconds since 1970.
+    pub creation_time: Option<i64>,
+    /// Where that time came from, in plain words ("Recording time from the file name").
+    pub date_source: String,
+    /// Display rotation written into the file, degrees clockwise, when not upright.
+    pub rotation_degrees: Option<u32>,
+    /// Reference-clip metadata left out of the file, for "Details".
+    pub withheld_metadata: Vec<String>,
+}
+
+/// Per-file choices from the page's "Advanced" section.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepairChoices {
+    /// 0, 90, 180 or 270 degrees clockwise. Null keeps the reference clip's orientation.
+    pub rotation: Option<Rotation>,
+    /// Copy the reference clip's camera metadata (thumbnail, serial numbers, dates, location).
+    pub keep_reference_metadata: bool,
 }
 
 /// A temporary file left by a repair that was killed.
@@ -190,6 +209,8 @@ pub struct AppError {
     pub reasons: Vec<String>,
     /// Full technical text for "Copy details".
     pub details: String,
+    /// A web page that helps, for example the issue form for a recording DATfix cannot read.
+    pub link: Option<String>,
 }
 
 impl AppError {
@@ -201,6 +222,7 @@ impl AppError {
             message,
             next_step: next_step.into(),
             reasons: Vec::new(),
+            link: None,
         }
     }
 
@@ -437,11 +459,16 @@ pub fn suggest_output(dat: &Path, dir: Option<&Path>, taken: &[PathBuf]) -> Path
 /// `reference` is the clip to use, or `None` for the built-in settings. `index` is the index
 /// read when the file was added, so a 40 GB file is not walked twice. `cancel` stops the job
 /// within about one 8 MB block; the engine deletes its temporary file when it stops.
+/// `hint` is what a memory card said about a recording copied off it
+/// (`datfix_core::carve::hint_for`); `None` for ordinary files.
+#[allow(clippy::too_many_arguments)]
 pub fn repair(
     dat: &Path,
     reference: Option<&Path>,
     output: &Path,
     index: Option<Arc<DatIndex>>,
+    choices: RepairChoices,
+    hint: Option<RecordingHint>,
     cancel: Arc<AtomicBool>,
     on_progress: &mut dyn FnMut(Progress),
 ) -> AppResult<RepairOutcome> {
@@ -451,6 +478,9 @@ pub fn repair(
         overwrite: false,
         cancel: Some(cancel),
         index,
+        rotation: choices.rotation,
+        keep_reference_metadata: choices.keep_reference_metadata,
+        hint,
         // Skip unreadable parts of a failing card (the engine default).
         ..Default::default()
     };
@@ -477,7 +507,27 @@ pub fn repair(
         audio_tracks,
         bytes_written: report.bytes_written,
         notes: report.notes,
+        creation_time: report.creation_time,
+        date_source: date_source_text(report.date_source).into(),
+        rotation_degrees: report.rotation.map(Rotation::degrees).filter(|&d| d != 0),
+        withheld_metadata: report.withheld_metadata,
     })
+}
+
+/// Where the recording time came from, in plain words.
+fn date_source_text(s: DateSource) -> &'static str {
+    match s {
+        DateSource::FileName => "Recording time from the file name",
+        DateSource::CardEntry => "Recording time from the memory card's list of files",
+        DateSource::Timecode => {
+            "Recording time from the camera's timecode, with the date from the file's date"
+        }
+        DateSource::FileTime => {
+            "Recording time estimated from the file's date (when it was last saved, minus its \
+             length)"
+        }
+        DateSource::Unknown => "Recording time unknown: nothing in the file gives it",
+    }
 }
 
 /// Lists `.DAT` files and `.MP4` clips in dropped paths. Folders are searched (a whole card can
@@ -704,7 +754,13 @@ pub fn map_error(e: CoreError) -> AppError {
         return AppError::cancelled();
     }
     let m = e.user_message();
+    let link = match m.kind {
+        "layout_not_supported" => Some(datfix_core::error::LAYOUT_ISSUE_URL.to_string()),
+        "unsupported" => Some(datfix_core::error::ISSUES_URL.to_string()),
+        _ => None,
+    };
     AppError {
+        link,
         kind: m.kind,
         title: m.title,
         message: m.message,
@@ -793,6 +849,7 @@ mod tests {
         std::fs::write(&dat, b"").unwrap();
         let err = inspect(&dat, Arc::default(), &mut |_| {}).unwrap_err();
         assert_eq!(err.kind, "empty_dat");
+        assert!(err.next_step.contains("Recover from a memory card"));
         assert!(err.next_step.contains("PhotoRec"));
         assert!(!err.details.is_empty());
     }
