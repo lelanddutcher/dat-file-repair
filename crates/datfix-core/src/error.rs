@@ -143,6 +143,60 @@ pub enum Error {
     #[error("the output path is the same file as the input. The input is never modified.")]
     OutputIsInput,
 
+    /// The file given as the healthy clip is something else (a photo, the `.DAT` itself...).
+    #[error("{} cannot be the reference clip: it is {what}", .path.display())]
+    NotAClip { path: PathBuf, what: String },
+
+    /// The `.DAT` is really a finished, playable MP4 (renamed, or copied under the wrong name).
+    #[error(
+        "{} is already a complete MP4 ({detail}); it does not need repairing. Rename it to .MP4 \
+         or open it directly.",
+        .path.display()
+    )]
+    AlreadyPlayable { path: PathBuf, detail: String },
+
+    /// The `.DAT` has a recovery index but not one complete video frame.
+    #[error("{} holds no complete video frame: {detail}", .path.display())]
+    NoFrames { path: PathBuf, detail: String },
+
+    /// The output volume cannot hold a file this large (FAT32: 4 GiB - 1 byte).
+    #[error(
+        "the repaired file would be {size} bytes, but {} is on a {fs} volume, which cannot hold \
+         files larger than {limit} bytes",
+        .dir.display()
+    )]
+    FileTooLargeForVolume {
+        dir: PathBuf,
+        fs: String,
+        size: u64,
+        limit: u64,
+    },
+
+    /// Not enough free space for the output.
+    #[error("the repaired file needs {need} bytes but {} has only {free} bytes free", .dir.display())]
+    NotEnoughSpace { dir: PathBuf, need: u64, free: u64 },
+
+    /// The output folder does not exist or cannot be written.
+    #[error("cannot write to the folder {}: {source}", .dir.display())]
+    OutputNotWritable {
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// So much of the `.DAT` could not be read that the card is probably gone or dead.
+    #[error(
+        "{unreadable} of {total} bytes could not be read (last error at byte {last_offset}: \
+         {source}); stopped, because a result this incomplete would not be useful"
+    )]
+    TooMuchUnreadable {
+        unreadable: u64,
+        total: u64,
+        last_offset: u64,
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The caller asked to stop.
     #[error("cancelled")]
     Cancelled,
@@ -286,6 +340,94 @@ impl Error {
                 "The save location is the .DAT file itself. The original is never changed.".into(),
                 "Choose another name for the repaired video.",
             ),
+            Error::NotAClip { path, what } => msg(
+                "not_a_clip",
+                "That file can't be the healthy clip",
+                format!(
+                    "{} is {what}. DATfix needs a video clip that plays normally.",
+                    file_name(path)
+                ),
+                "Choose an .MP4 clip that plays, recorded on the same camera with the same \
+                 settings. Or repair without a clip: DATfix then uses its built-in settings.",
+            ),
+            Error::AlreadyPlayable { path, .. } => msg(
+                "already_playable",
+                "This file already plays",
+                format!(
+                    "{} is a complete video file, not a broken recording. Only its name ends in \
+                     .DAT.",
+                    file_name(path)
+                ),
+                "Make a copy and give the copy a name that ends in .MP4, then open it in any \
+                 video player. Nothing needs repairing.",
+            ),
+            Error::NoFrames { path, .. } => msg(
+                "no_frames",
+                "No video was saved in this .DAT",
+                format!(
+                    "{} is a Canon recording, but it stopped before the first complete video \
+                     frame was written, so there is no picture to recover.",
+                    file_name(path)
+                ),
+                "If you expected a longer clip, the rest may still be on the card. Stop using \
+                 the card and recover it with PhotoRec (free, https://www.cgsecurity.org), \
+                 without writing anything to it.",
+            ),
+            Error::FileTooLargeForVolume {
+                dir,
+                fs,
+                size,
+                limit,
+            } => msg(
+                "file_too_large_for_volume",
+                "The save drive can't hold a file this big",
+                format!(
+                    "The repaired video will be {}, but the drive with {} uses {fs}, which \
+                     can't store files larger than {}.",
+                    gb(*size),
+                    dir.display(),
+                    gb(*limit)
+                ),
+                "Save to another drive (your computer's internal drive, or one formatted as \
+                 exFAT, APFS or NTFS).",
+            ),
+            Error::NotEnoughSpace { dir, need, free } => msg(
+                "disk_full",
+                "Not enough free space",
+                format!(
+                    "The repaired video needs about {} but {} has only {} free.",
+                    gb(*need),
+                    dir.display(),
+                    gb(*free)
+                ),
+                "Free up space, or choose another drive to save to.",
+            ),
+            Error::OutputNotWritable { dir, source } => msg(
+                "output_not_writable",
+                "DATfix can't save in that folder",
+                format!(
+                    "The folder {} {}.",
+                    dir.display(),
+                    match source.kind() {
+                        std::io::ErrorKind::NotFound => "does not exist",
+                        std::io::ErrorKind::ReadOnlyFilesystem =>
+                            "is on a read-only drive (a locked card or a read-only share)",
+                        _ => "can't be written to",
+                    }
+                ),
+                "Choose another folder to save the repaired video, for example one on your \
+                 computer's internal drive.",
+            ),
+            Error::TooMuchUnreadable { .. } => msg(
+                "too_much_unreadable",
+                "Too much of the card can't be read",
+                "Large parts of the .DAT can't be read. The card or drive may have been removed, \
+                 or it is failing."
+                    .into(),
+                "Reconnect the card and try again. If it still fails, make a full copy of the \
+                 card with a recovery tool (such as ddrescue or PhotoRec), then repair the .DAT \
+                 from that copy.",
+            ),
             Error::Cancelled => msg(
                 "cancelled",
                 "Stopped",
@@ -293,6 +435,14 @@ impl Error {
                 "Start the repair again when you are ready.",
             ),
         }
+    }
+}
+
+fn gb(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1} GB", bytes as f64 / 1e9)
+    } else {
+        format!("{:.0} MB", (bytes as f64 / 1e6).ceil())
     }
 }
 
@@ -325,6 +475,14 @@ pub fn io_message(source: &std::io::Error) -> UserMessage {
             "The disk is full",
             "The drive ran out of space while writing. The partial file was removed.",
             "Free up space, or choose another drive to save to.",
+        ),
+        K::FileTooLarge => (
+            "file_too_large_for_volume",
+            "The save drive can't hold a file this big",
+            "The drive refused to make the file any larger. Drives formatted as FAT32 can't \
+             store files of 4 GB or more.",
+            "Save to another drive (your computer's internal drive, or one formatted as exFAT, \
+             APFS or NTFS).",
         ),
         K::UnexpectedEof => (
             "read_error",

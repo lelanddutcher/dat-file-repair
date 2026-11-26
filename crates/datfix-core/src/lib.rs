@@ -36,6 +36,7 @@ pub mod repi;
 pub mod select;
 pub mod timeline;
 pub mod timing;
+pub mod volume;
 
 pub use error::{Error, Reason, Result, UserMessage};
 pub use fourcc::FourCC;
