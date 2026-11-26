@@ -44,7 +44,7 @@ pub const MAX_SAMPLES_PER_GROUP: u32 = 8_000_000;
 pub const MAX_SAMPLE_SIZE: u32 = 1 << 30;
 pub const MAX_GROUP_PAYLOAD: u64 = 8 << 30;
 /// Sample alignments tried for variable-size groups. 1 means "packed back to back".
-const ALIGNMENTS: [u32; 5] = [1, 4, 8, 16, 32];
+const ALIGNMENTS: [u32; 5] = [1, 8, 4, 16, 32];
 /// Samples checked per group when detecting alignment. Checking only a few is not enough: a
 /// wrong alignment can fit by chance when the padding happens to agree for the first frames.
 const ALIGN_CHECK_SAMPLES: u32 = 128;
@@ -73,8 +73,8 @@ pub struct Group {
     pub declared: u32,
     /// Number of samples whose bytes are entirely inside the file.
     pub complete: u32,
-    /// Each sample after the first starts at a multiple of this (file offset). 1 = packed.
-    /// R5 Mark II video is packed; R3 video is padded to 8-byte boundaries.
+    /// Each sample is padded to a multiple of this many bytes. 1 = packed.
+    /// R5 Mark II video is packed; R3/R5/R6 II (`CAEP`) video is padded to 8 bytes.
     pub align: u32,
 }
 
@@ -102,28 +102,35 @@ impl Group {
         }
     }
 
+    /// Bytes one sample occupies in the file: its size rounded up to the alignment unit.
+    fn stride(&self, size: u32) -> u64 {
+        align_up(size as u64, self.align)
+    }
+
     /// `(offset, size)` of the first `count` samples.
+    ///
+    /// Canon pads each sample to a multiple of `align` bytes. The rule is on the sample *size*,
+    /// not on the file offset: sample `i + 1` starts `round_up(size_i, align)` bytes after
+    /// sample `i` (spec section 5).
     pub fn samples(&self, count: u32) -> impl Iterator<Item = (u64, u32)> + '_ {
         let mut off = self.data_offset();
         (0..count as usize).map(move |i| {
-            if i > 0 {
-                off = align_up(off, self.align);
-            }
             let size = self.sample_size(i);
             let here = off;
-            off += size as u64;
+            off += self.stride(size);
             (here, size)
         })
     }
 
-    /// File offset just after the `count`-th sample.
+    /// File offset just after the `count`-th sample, its padding included.
     pub fn end_of(&self, count: u32) -> u64 {
         if self.align <= 1 {
             self.data_offset() + self.len_of(count)
         } else {
-            self.samples(count)
-                .last()
-                .map_or(self.data_offset(), |(o, s)| o + s as u64)
+            self.data_offset()
+                + (0..count as usize)
+                    .map(|i| self.stride(self.sample_size(i)))
+                    .sum::<u64>()
         }
     }
 
@@ -414,7 +421,7 @@ fn read_header<R: ReadAt + ?Sized>(src: &R, at: u64) -> std::io::Result<HeaderRe
 /// Works out how the samples of a variable-size group are laid out.
 ///
 /// Canon video samples are length-prefixed NAL units (4-byte big-endian lengths). For each
-/// candidate alignment, the first few samples are checked: their NAL lengths must add up to
+/// candidate alignment, the first samples are checked: their NAL lengths must add up to
 /// exactly the sample size. Sample 0 always starts right after the header, so at least two
 /// samples must be checked to tell alignments apart. Falls back to packed (1).
 fn detect_alignment<R: ReadAt + ?Sized>(src: &R, g: &Group) -> std::io::Result<u32> {
@@ -423,9 +430,6 @@ fn detect_alignment<R: ReadAt + ?Sized>(src: &R, g: &Group) -> std::io::Result<u
         let mut off = g.data_offset();
         let mut checked = 0;
         for i in 0..g.declared.min(ALIGN_CHECK_SAMPLES) as usize {
-            if i > 0 {
-                off = align_up(off, align);
-            }
             let size = g.sizes[i];
             if off + size as u64 > len {
                 break;
@@ -434,7 +438,7 @@ fn detect_alignment<R: ReadAt + ?Sized>(src: &R, g: &Group) -> std::io::Result<u
                 continue 'candidates;
             }
             checked += 1;
-            off += size as u64;
+            off += align_up(size as u64, align);
         }
         if checked >= 2 {
             return Ok(align);
@@ -660,23 +664,23 @@ pub(crate) mod tests {
         assert_eq!(idx.groups[0].align, 1);
         assert_eq!(idx.groups[0].declared_end(), d.len() as u64);
 
-        // Aligned: each sample after the first starts on a 16-byte boundary.
+        // Padded: each sample occupies its size rounded up to 8 bytes. The data starts at an
+        // offset that is 4 mod 8 (as in Canon family B), so sample starts are 4 mod 8 too.
         let mut d = dat_header();
         d.extend(&group_bytes(b"vide", 0, &sizes)[..36]);
-        for (i, &s) in sizes.iter().enumerate() {
-            if i > 0 {
-                while d.len() % 16 != 0 {
-                    d.push(0xee);
-                }
-            }
+        assert_eq!(d.len() % 8, 4);
+        for &s in &sizes {
             d.extend(nal_sample(s));
+            while d.len() % 8 != 4 {
+                d.push(0xee);
+            }
         }
         let idx = walk(&d, &mut no_progress()).unwrap();
         let g = &idx.groups[0];
-        assert_eq!(g.align, 16);
+        assert_eq!(g.align, 8);
         let offs: Vec<u64> = g.samples(4).map(|(o, _)| o).collect();
-        assert_eq!(offs[0], 16 + 36);
-        assert!(offs[1..].iter().all(|o| o % 16 == 0));
+        assert_eq!(offs, vec![52, 52 + 32, 52 + 64, 52 + 112]);
+        // The group ends after the last sample's padding.
         assert_eq!(g.declared_end(), d.len() as u64);
         assert!(idx.truncation.is_none());
     }
