@@ -170,15 +170,12 @@ pub fn video_gate<R: ReadAt + ?Sized>(
 
     // Every probed frame must pass the full header check.
     let frames = gate_frames(index);
-    for (i, &(off, size)) in frames.iter().enumerate() {
+    for &(off, size) in &frames {
         if let Err(e) = verify_frame(src, &codec, off, size) {
             return Err(vec![format!(
                 "the video frames do not fit the clip's settings ({}): frame at byte {off}: {e}",
                 describe_codec(&codec)
             )]);
-        }
-        if i == 0 {
-            continue;
         }
     }
     // POC parse of the first frames (the analyzer used for the tables).

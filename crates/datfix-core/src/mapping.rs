@@ -285,12 +285,26 @@ pub fn map_tracks(index: &DatIndex, reference: &Reference) -> Result<Mapping, Ve
             continue;
         }
         let ref_track = tgt[if g.kind.0 == *b"lpcm" { run_pos[gi] } else { 0 }];
+        // Some cameras store a whole PCM group as one big sample (for example 96096 bytes =
+        // 24024 stereo 16-bit frames); the last group of a recording can be shorter. MP4
+        // stores one sample per audio frame, so split every group into frames.
+        let rt = &reference.tracks[ref_track];
+        let frame = rt.fixed_sample_size;
+        let (g_fixed, g_samples) = if rt.kind == TrackKind::PcmAudio
+            && frame > 0
+            && g.fixed_size > frame
+            && g.fixed_size % frame == 0
+        {
+            (frame, g.complete * (g.fixed_size / frame))
+        } else {
+            (g.fixed_size, g.complete)
+        };
         let pi = *plan_of_track.entry(ref_track).or_insert_with(|| {
             plans.push(TrackPlan {
                 ref_track,
                 repi_type: g.kind,
                 chunks: Vec::new(),
-                fixed_size: g.fixed_size,
+                fixed_size: g_fixed,
                 sizes: Vec::new(),
                 sample_count: 0,
                 steps: Vec::new(),
@@ -298,7 +312,7 @@ pub fn map_tracks(index: &DatIndex, reference: &Reference) -> Result<Mapping, Ve
             plans.len() - 1
         });
         let p = &mut plans[pi];
-        if p.fixed_size != g.fixed_size {
+        if p.fixed_size != g_fixed {
             reasons.push(format!(
                 "'{}' groups change sample size inside the .DAT ({} then {}); this is not supported",
                 g.kind, p.fixed_size, g.fixed_size
@@ -307,7 +321,7 @@ pub fn map_tracks(index: &DatIndex, reference: &Reference) -> Result<Mapping, Ve
         }
         if g.align <= 1 {
             // Packed samples: the whole group is one chunk.
-            p.chunks.push(Chunk::data(g.data_offset(), g.complete, gi));
+            p.chunks.push(Chunk::data(g.data_offset(), g_samples, gi));
         } else {
             // Padded samples are not contiguous, so each one is its own chunk (as Canon does).
             p.chunks.extend(
@@ -318,24 +332,7 @@ pub fn map_tracks(index: &DatIndex, reference: &Reference) -> Result<Mapping, Ve
         if g.fixed_size == 0 {
             p.sizes.extend_from_slice(&g.sizes[..g.complete as usize]);
         }
-        p.sample_count += g.complete as u64;
-    }
-
-    // Some cameras store a whole PCM group as one big sample (for example 96096 bytes =
-    // 24024 stereo 16-bit frames). MP4 stores one sample per audio frame, so split it.
-    for p in &mut plans {
-        let rt = &reference.tracks[p.ref_track];
-        let frame = rt.fixed_sample_size;
-        if rt.kind == TrackKind::PcmAudio
-            && frame > 0
-            && p.fixed_size > frame
-            && p.fixed_size % frame == 0
-        {
-            let k = p.fixed_size / frame;
-            p.chunks.iter_mut().for_each(|c| c.samples *= k);
-            p.sample_count *= k as u64;
-            p.fixed_size = frame;
-        }
+        p.sample_count += g_samples as u64;
     }
 
     // Sample size must match the reference for fixed-size streams.
