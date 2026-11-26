@@ -325,3 +325,95 @@ Notes from moving the desktop app onto the reference-free engine.
   runs an AppleScript that lays out the Finder window. Without permission it fails and leaves
   `bundle/macos/rw.*.dmg`. `CI=true cargo tauri build --target universal-apple-darwin` skips
   that script; the `.dmg` is plain but valid (`hdiutil verify`).
+
+## Hardening: fuzzing, failing cards, drives
+
+Notes from making the engine survive hostile input and hostile environments.
+
+### Fuzzing with cargo-fuzz
+
+- `cargo-fuzz` drives libFuzzer. It needs a nightly toolchain:
+  `rustup toolchain install nightly --profile minimal` and `cargo install cargo-fuzz --locked`
+  (about 2 minutes together). Stable builds never see it.
+- The fuzz crate lives in `crates/datfix-core/fuzz/` with its own `[workspace]`, so the main
+  workspace ignores it. Its `.gitignore` keeps `corpus/`, `artifacts/`, `logs/` and `target/`
+  out of git. Seeds cut from real media stay on the media disk, never in git.
+- Run one target: `cargo +nightly fuzz run repi_walk fuzz/corpus/repi_walk <seed dir> --
+  -max_total_time=900 -max_len=4194304 -rss_limit_mb=3072 -malloc_limit_mb=2048 -timeout=20`
+  from `crates/datfix-core`. `-malloc_limit_mb` turns a huge allocation into a reported crash
+  instead of a slow swap; `-timeout` turns a hang into one.
+- Reproduce a crash: `cargo +nightly fuzz run <target> fuzz/artifacts/<target>/crash-<hash>`.
+- Fuzz builds keep debug assertions, so integer overflow panics. Release builds wrap
+  silently, which hides the bug and produces garbage. Fuzz or test in debug to catch them.
+- Every input is "untrusted": sizes read from the file must be checked against the bytes
+  left (`size > len - pos`, never `pos + size > len`, which overflows for a 64-bit size), and
+  allocations must grow with the data found, not with a count the file claims
+  (`Vec::with_capacity(count.min(1 << 20))`).
+- Exp-Golomb `ue(v)` can code values up to 2^32 - 2. Any later `+ 1`, `* 16` or `as i32`
+  overflows. Rejecting codes of 2^31 and up in the bit reader, plus spec range checks on the
+  few fields that matter (picture size, POC deltas), removed a whole class of panics.
+- Recursion on nested boxes needs a depth limit; a 100,000-deep `trak` chain is 800 KB.
+- A fuzz target over the whole pipeline needs the pipeline to run on bytes in memory. Split
+  "plan" (everything up to the bytes to write) from "write" and make the plan generic over
+  `ReadAt`. The same split made the failing-card second pass easy.
+- To let the fuzzer mutate two inputs at once (a `.DAT` and a reference clip), give the
+  input a small header: `REF1` + u32 length + clip + `.DAT`.
+- Keep a stable `cargo test` stand-in (`tests/fuzz_smoke.rs`): a fixed-seed xorshift
+  mutator over synthetic files hits the same entry points in a few seconds, so CI catches
+  regressions without nightly.
+
+### Failing cards
+
+- A failing SD/CFexpress card returns `EIO` (raw OS error 5) for unreadable sectors. A
+  removed card returns other errors (`ENXIO`, `ENOENT`). Only skip the first kind.
+- Mark unreadable regions in 64 KiB blocks and double the skip on consecutive failures (up
+  to 16 MiB), as ddrescue's first pass does. Each failed read can take seconds on a real
+  card; one read per sector would take hours over a dead region.
+- Never re-read a region known to be bad; return zeros for it.
+- Stop when a quarter of the file is unreadable: the card is gone, and a "repair" made of
+  zeros helps nobody.
+- A bad region found while copying the payload means the tables already point at zeros.
+  Plan again around it and write a second file, reading the payload back from the first
+  output instead of from the card. Name that file like any other temp file
+  (`.<name>.pass1.datfix-partial`), so the stale-file cleanup finds it after a crash.
+- Simulate a failing card with an in-memory `ReadAt` that returns
+  `io::Error::from_raw_os_error(5)` (23 on Windows) inside chosen ranges.
+
+### Output drives
+
+- FAT32 cannot hold a file of 4 GiB or more; the write fails at exactly 4 GiB with `EFBIG`
+  (`ErrorKind::FileTooLarge`). Detect the file system up front: `statfs` `f_fstypename` is
+  `msdos` on macOS; Linux reports `f_type` 0x4d44; Windows `GetVolumeInformationW` returns
+  `FAT32`. The `libc` and `windows-sys` crates give the calls; gate them with
+  `#[cfg(target_os = ...)]` and `[target.'cfg(windows)'.dependencies]`.
+- `statfs` field widths differ between platforms (`u32` on some), so a cast that is needless
+  on macOS is needed elsewhere. Allow `clippy::unnecessary_cast` on that function only.
+- Probe that the output folder accepts files by creating and deleting a small file before a
+  long job. It catches locked cards, read-only shares and missing folders in milliseconds.
+- File names are limited to 255 bytes. A hidden temp name built as `.<name>.datfix-partial`
+  can pass the limit when the user's name is long; shorten on a `char` boundary and add a
+  short hash so two long names stay distinct.
+- Rust's standard library adds the `\\?\` prefix for long absolute paths on Windows by
+  itself; no special handling is needed for paths over 260 characters.
+- Test drives on macOS without root: `hdiutil create -size 64m -fs "MS-DOS FAT32"` and
+  `hdiutil attach -nobrowse` (FAT32), a 150 MB HFS+ image with three concurrent repairs
+  (disk full mid-write), `hdiutil attach -readonly` (read-only volume). Detach afterwards.
+
+### Network shares
+
+- Over SMB, thousands of tiny header reads dominate the index walk, not bandwidth.
+  macOS's read-ahead makes each tiny read pull a large block; `fcntl(fd, F_RDAHEAD, 0)` for
+  the walk (and back to 1 for the copy) made cold walks 1.5-2x faster.
+- Measuring cold-cache times on a share is hard: the first read of a file warms the
+  client cache, and `purge` needs root. Compare different files of the same camera and size,
+  and record s/GB.
+
+### Toolchain drift
+
+- Another session ran `rustup update stable` (1.94 to 1.100) in the middle of this work.
+  The newer clippy flagged older code (`needless_range_loop`), and builds failed for a
+  minute with "the 'rustc' binary is not applicable" while the update ran. CI should pin
+  the toolchain (`rust-toolchain.toml`) if exact clippy results matter.
+- `cargo check --target x86_64-pc-windows-msvc` works from a Mac for pure-Rust crates after
+  `rustup target add x86_64-pc-windows-msvc`. The Tauri app's build script also needs
+  `llvm-rc` (a Windows resource compiler), so it does not check from a Mac without it.
