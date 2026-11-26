@@ -36,12 +36,53 @@ pub enum Error {
 
     /// No file in a reference folder matched.
     #[error(
-        "no compatible reference clip found in {dir}.\n{}",
+        "no compatible reference clip found in {}.\n{}",
+        .dir.display(),
         .tried.iter().map(|(p, r)| format!("  - {}: {r}", p.display())).collect::<Vec<_>>().join("\n")
     )]
     NoReference {
         dir: PathBuf,
         tried: Vec<(PathBuf, String)>,
+    },
+
+    /// The `.DAT` is empty, or holds only zero bytes.
+    #[error(
+        "{} holds no recording data ({0}). The data isn't in this file: the camera's file \
+         table points at nothing. Recover the memory card with PhotoRec (free, \
+         https://www.cgsecurity.org) first, without writing anything to the card, then run \
+         datfix on the .DAT or .MP4 pieces it finds.",
+        .path.display()
+    )]
+    EmptyDat { path: PathBuf, detail: String },
+
+    /// The file is not a Canon camera recording.
+    #[error("this isn't a Canon camera file: {0}")]
+    NotCanon(String),
+
+    /// A Canon recording that this version cannot repair.
+    #[error("{0}")]
+    Unsupported(String),
+
+    /// No built-in profile fits and no reference was given.
+    #[error(
+        "no built-in profile fits this .DAT ({summary}).\n{}\nPass --reference with a healthy MP4 \
+         recorded on the same camera with the same resolution, frame rate and codec.",
+        .tried.iter().map(|(p, r)| format!("  - {p}: {r}")).collect::<Vec<_>>().join("\n")
+    )]
+    NoProfile {
+        summary: String,
+        tried: Vec<(String, String)>,
+    },
+
+    /// Several built-in profiles fit and they would decode differently.
+    #[error(
+        "several built-in profiles fit this .DAT ({summary}) and the frames alone cannot tell \
+         them apart:\n{}\nPass --reference with a healthy clip from the same camera and mode.",
+        .candidates.iter().map(|c| format!("  - {c}")).collect::<Vec<_>>().join("\n")
+    )]
+    AmbiguousProfile {
+        summary: String,
+        candidates: Vec<String>,
     },
 
     /// The output already exists and the caller did not allow overwriting it.

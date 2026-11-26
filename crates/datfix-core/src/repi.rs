@@ -27,7 +27,7 @@
 //! - A group that runs past the end of the file keeps only its complete samples. The walk stops
 //!   there: a camera that lost power writes nothing after its last group.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::fourcc::FourCC;
@@ -234,7 +234,7 @@ impl DatIndex {
 }
 
 /// How one stream is laid out: a fingerprint of the camera's recording mode.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StreamShape {
     pub kind: FourCC,
     /// Most common samples per group (0 when no group is complete).

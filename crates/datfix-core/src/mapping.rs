@@ -22,9 +22,26 @@ use crate::repi::{DatIndex, StreamShape};
 /// A run of samples that sit back to back in the `.DAT` (one `repi` group).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Chunk {
-    /// File offset in the `.DAT` of the first sample.
+    /// File offset in the `.DAT` of the first sample. For a silence chunk, the offset of the
+    /// zero block the writer appends after the copied payload.
     pub offset: u64,
     pub samples: u32,
+    /// Index of the `repi` group the chunk comes from (into [`DatIndex::groups`]).
+    pub group: usize,
+    /// True for inserted silence (PCM zeros), not data from the `.DAT`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub silence: bool,
+}
+
+impl Chunk {
+    pub fn data(offset: u64, samples: u32, group: usize) -> Chunk {
+        Chunk {
+            offset,
+            samples,
+            group,
+            silence: false,
+        }
+    }
 }
 
 /// Everything needed to write one output track.
@@ -39,9 +56,33 @@ pub struct TrackPlan {
     #[serde(skip)]
     pub sizes: Vec<u32>,
     pub sample_count: u64,
+    /// Duration of each sample in units of the track's sample duration. Empty means every
+    /// sample lasts one unit. A sample before lost frames lasts longer, so later samples keep
+    /// their place in time.
+    #[serde(skip)]
+    pub steps: Vec<u32>,
 }
 
 impl TrackPlan {
+    /// Total duration in units of the track's sample duration.
+    pub fn duration_units(&self) -> u64 {
+        if self.steps.is_empty() {
+            self.sample_count
+        } else {
+            self.steps.iter().map(|&s| s as u64).sum()
+        }
+    }
+
+    /// Bytes of silence this plan needs appended to the payload.
+    pub fn silence_bytes(&self) -> u64 {
+        self.chunks
+            .iter()
+            .filter(|c| c.silence)
+            .map(|c| c.samples as u64 * self.fixed_size as u64)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// `(offset, size)` of every sample, in order.
     pub fn sample_locations(&self) -> impl Iterator<Item = (u64, u32)> + '_ {
         let mut index = 0usize;
@@ -76,8 +117,8 @@ impl TrackPlan {
             }
             let n = (c.samples as u64).min(left) as u32;
             chunks.push(Chunk {
-                offset: c.offset,
                 samples: n,
+                ..c.clone()
             });
             left -= n as u64;
         }
@@ -85,24 +126,32 @@ impl TrackPlan {
         if self.fixed_size == 0 {
             self.sizes.truncate(keep as usize);
         }
+        self.steps.truncate(keep as usize);
+        if let Some(last) = self.steps.last_mut() {
+            *last = 1;
+        }
         self.sample_count = keep;
     }
 
-    /// File offset just after the last sample.
+    /// File offset just after the last sample taken from the `.DAT` (silence excluded).
     pub fn end_offset(&self) -> u64 {
-        let Some(last) = self.chunks.last() else {
-            return 0;
-        };
-        let tail: u64 = if self.fixed_size > 0 {
-            self.fixed_size as u64 * last.samples as u64
-        } else {
-            let n = self.sizes.len();
-            self.sizes[n - last.samples as usize..]
-                .iter()
-                .map(|&s| s as u64)
-                .sum()
-        };
-        last.offset + tail
+        let mut end = 0u64;
+        let mut index = 0usize;
+        for c in &self.chunks {
+            let bytes: u64 = if self.fixed_size > 0 {
+                self.fixed_size as u64 * c.samples as u64
+            } else {
+                self.sizes[index..index + c.samples as usize]
+                    .iter()
+                    .map(|&s| s as u64)
+                    .sum()
+            };
+            index += c.samples as usize;
+            if !c.silence {
+                end = end.max(c.offset + bytes);
+            }
+        }
+        end
     }
 }
 
@@ -244,6 +293,7 @@ pub fn map_tracks(index: &DatIndex, reference: &Reference) -> Result<Mapping, Ve
                 fixed_size: g.fixed_size,
                 sizes: Vec::new(),
                 sample_count: 0,
+                steps: Vec::new(),
             });
             plans.len() - 1
         });
@@ -257,15 +307,12 @@ pub fn map_tracks(index: &DatIndex, reference: &Reference) -> Result<Mapping, Ve
         }
         if g.align <= 1 {
             // Packed samples: the whole group is one chunk.
-            p.chunks.push(Chunk {
-                offset: g.data_offset(),
-                samples: g.complete,
-            });
+            p.chunks.push(Chunk::data(g.data_offset(), g.complete, gi));
         } else {
             // Padded samples are not contiguous, so each one is its own chunk (as Canon does).
             p.chunks.extend(
                 g.samples(g.complete)
-                    .map(|(offset, _)| Chunk { offset, samples: 1 }),
+                    .map(|(offset, _)| Chunk::data(offset, 1, gi)),
             );
         }
         if g.fixed_size == 0 {
@@ -323,6 +370,7 @@ pub fn map_tracks(index: &DatIndex, reference: &Reference) -> Result<Mapping, Ve
         }
     }
 
+    reasons.dedup();
     if reasons.is_empty() {
         Ok(Mapping { plans, notes })
     } else {
@@ -449,19 +497,11 @@ mod tests {
         let mut p = TrackPlan {
             ref_track: 0,
             repi_type: FourCC::new(b"vide"),
-            chunks: vec![
-                Chunk {
-                    offset: 100,
-                    samples: 2,
-                },
-                Chunk {
-                    offset: 500,
-                    samples: 2,
-                },
-            ],
+            chunks: vec![Chunk::data(100, 2, 0), Chunk::data(500, 2, 1)],
             fixed_size: 0,
             sizes: vec![10, 20, 30, 40],
             sample_count: 4,
+            steps: Vec::new(),
         };
         assert_eq!(
             p.sample_locations().collect::<Vec<_>>(),

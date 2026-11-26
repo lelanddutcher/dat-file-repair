@@ -10,7 +10,10 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use datfix_core::inspect::{self, InspectReport};
-use datfix_core::repair::{self, Event, Phase, ReferenceSource, RepairOptions, RepairReport};
+use datfix_core::profile;
+use datfix_core::repair::{
+    self, Event, Phase, RefKind, ReferenceSource, RepairOptions, RepairReport,
+};
 
 #[derive(Parser)]
 #[command(
@@ -34,18 +37,18 @@ enum Command {
         /// The .DAT file.
         dat: PathBuf,
     },
-    /// Rebuild a playable MP4 from a .DAT and a healthy clip from the same camera.
+    /// Rebuild a playable MP4 from a .DAT. Without --reference, the decoder settings come
+    /// from a built-in profile chosen by inspecting the .DAT.
     Repair {
         /// The .DAT file. It is only read, never changed.
         dat: PathBuf,
-        /// A healthy MP4 recorded on the same camera with the same settings.
-        #[arg(
-            long,
-            conflicts_with = "reference_dir",
-            required_unless_present = "reference_dir"
-        )]
+        /// A healthy MP4 recorded on the same camera. Always wins over the built-in profiles.
+        /// If only its video matches, its video track is used and the other tracks are
+        /// synthesized.
+        #[arg(long, conflicts_with = "reference_dir")]
         reference: Option<PathBuf>,
-        /// A folder of healthy MP4s; the smallest compatible one is used.
+        /// A folder searched (3 levels deep) for a compatible camera-original MP4. Re-encodes
+        /// are skipped. Falls back to the built-in profiles when nothing fits.
         #[arg(long)]
         reference_dir: Option<PathBuf>,
         /// Output file. Default: <DAT name>_repaired.MP4 in the current folder.
@@ -55,6 +58,27 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// List the built-in decoder profiles, or rebuild them from camera originals.
+    Profiles {
+        #[command(subcommand)]
+        action: Option<ProfilesAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProfilesAction {
+    /// List the built-in profiles (the default).
+    List,
+    /// Build a profile bank from healthy camera MP4s (searched recursively). Keeps only codec
+    /// settings and track templates; no media, thumbnails or location data.
+    Harvest {
+        /// Files or folders of camera-original MP4s.
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Where to write the bank JSON.
+        #[arg(short, long)]
+        out: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -62,6 +86,10 @@ fn main() -> ExitCode {
     let json = cli.json;
     let result = match cli.command {
         Command::Inspect { dat } => run_inspect(&dat, json),
+        Command::Profiles { action } => match action.unwrap_or(ProfilesAction::List) {
+            ProfilesAction::List => run_profiles_list(json),
+            ProfilesAction::Harvest { paths, out } => run_harvest(&paths, &out, json),
+        },
         Command::Repair {
             dat,
             reference,
@@ -72,7 +100,7 @@ fn main() -> ExitCode {
             let source = match (reference, reference_dir) {
                 (Some(r), _) => ReferenceSource::File(r),
                 (None, Some(d)) => ReferenceSource::Dir(d),
-                (None, None) => unreachable!("clap requires one of them"),
+                (None, None) => ReferenceSource::Auto,
             };
             let output = output.unwrap_or_else(|| default_output(&dat));
             run_repair(&dat, &source, &output, force, json)
@@ -90,6 +118,72 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn run_profiles_list(json: bool) -> datfix_core::Result<()> {
+    let bank = profile::bank();
+    if json {
+        let list: Vec<_> = bank
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "id": p.id, "body": p.body, "body_code": p.body_code, "family": p.family,
+                    "codec": p.codec, "width": p.width, "height": p.height,
+                    "fps": p.frame_rate().fps(), "chroma": p.chroma, "bit_depth": p.bit_depth,
+                    "long_gop": p.long_gop, "audio": p.audio, "sources": p.sources,
+                })
+            })
+            .collect();
+        emit_json(&serde_json::json!({ "event": "result", "profiles": list }));
+        return Ok(());
+    }
+    println!(
+        "{} built-in profiles (decoder settings only, no media):",
+        bank.len()
+    );
+    for p in bank {
+        println!("  {}", p.id);
+        println!(
+            "      {}  [body code {}, family {:?}, from {} clip(s)]",
+            p.describe(),
+            p.body_code.as_deref().unwrap_or("?"),
+            p.family,
+            p.sources
+        );
+    }
+    Ok(())
+}
+
+fn run_harvest(paths: &[PathBuf], out: &Path, json: bool) -> datfix_core::Result<()> {
+    let (profiles, rejected) = profile::harvest_paths(paths, &mut |path, r| {
+        if json {
+            return;
+        }
+        match r {
+            Ok(id) => eprintln!("  {} -> {id}", path.display()),
+            Err(e) => eprintln!("  skipped {}: {e}", path.display()),
+        }
+    })?;
+    let bank = profile::Bank {
+        version: 1,
+        profiles,
+    };
+    let text = serde_json::to_string_pretty(&bank).expect("bank serializes");
+    std::fs::write(out, text + "\n")
+        .map_err(|e| datfix_core::Error::io(format!("cannot write {}", out.display()), e))?;
+    if json {
+        emit_json(&serde_json::json!({
+            "event": "result", "profiles": bank.profiles.len(), "rejected": rejected.len()
+        }));
+    } else {
+        println!(
+            "wrote {} profile(s) to {} ({} file(s) skipped)",
+            bank.profiles.len(),
+            out.display(),
+            rejected.len()
+        );
+    }
+    Ok(())
 }
 
 /// `<stem>_repaired.MP4` in the current directory. Never next to the input, which may be on a
@@ -138,7 +232,7 @@ fn event_printer(json: bool) -> impl FnMut(&Event) {
             }
             Event::ReferenceChosen { path } => {
                 clear_progress_line();
-                eprintln!("  using reference {}", path.display());
+                eprintln!("  using {}", path.display());
             }
             Event::Note { .. } => {} // notes are printed with the result
         }
@@ -177,6 +271,12 @@ fn print_inspect(r: &InspectReport) {
             "no"
         }
     );
+    if let Some(l) = &r.layout {
+        println!("  recording: {}", l.describe());
+        if let Some(code) = l.body_code {
+            println!("  body code: {:02x}{:02x}{:02x}", code[0], code[1], code[2]);
+        }
+    }
     println!("  repi groups: {}", r.groups);
     let pattern: Vec<String> = r.pattern.iter().map(|k| k.to_string()).collect();
     println!("  first interval: {}", pattern.join(" "));
@@ -245,7 +345,23 @@ fn run_repair(
 
 fn print_repair(r: &RepairReport) {
     println!("Repaired: {}", r.output.display());
-    println!("  reference: {}", r.reference.display());
+    println!("  recording: {}", r.recording);
+    let kind = match r.reference_kind {
+        RefKind::User => "reference clip",
+        RefKind::Hybrid => "reference clip's video + synthesized tracks",
+        RefKind::Profile => "built-in profile",
+    };
+    println!("  decoder settings: {} ({kind})", r.reference.display());
+    if !r.synthesized.is_empty() {
+        println!("  synthesized: {}", r.synthesized.join(", "));
+    }
+    if let Some(t) = r.creation_time {
+        println!(
+            "  recorded: {} UTC, from {}",
+            utc(t),
+            r.creation_time_source
+        );
+    }
     println!(
         "  duration: {}  video frames: {}  keyframes: {}{}",
         hms(r.duration_seconds),
@@ -268,6 +384,28 @@ fn print_repair(r: &RepairReport) {
     for n in &r.notes {
         println!("  note: {n}");
     }
+}
+
+/// Formats Unix seconds as `YYYY-MM-DD hh:mm:ss`.
+fn utc(t: i64) -> String {
+    let days = t.div_euclid(86_400);
+    let secs = t.rem_euclid(86_400);
+    // Civil date from days since 1970 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60
+    )
 }
 
 /// Formats seconds as h:mm:ss.mmm.

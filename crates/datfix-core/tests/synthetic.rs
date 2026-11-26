@@ -100,17 +100,52 @@ fn repairs_truncated_long_gop_dat() {
 }
 
 #[test]
-fn refuses_reference_with_wrong_audio_track_count() {
+fn hybrid_replaces_audio_tracks_that_do_not_fit() {
     let dir = tempfile::tempdir().unwrap();
     let dat_path = dir.path().join("clip.DAT");
     write(&dat_path, &common::dat(2, 4));
+    // The clip has 2 PCM tracks; the .DAT has 4 PCM streams. The video fits.
     let ref_path = dir.path().join("ref.MP4");
     write(&ref_path, &common::reference(2, &common::dat(2, 2)[16..]));
+    let out = dir.path().join("out.MP4");
+    let report = repair(&dat_path, &ref_path, &out).unwrap();
+    assert_eq!(report.reference_kind, repair::RefKind::Hybrid);
+    assert!(
+        report.synthesized.iter().any(|s| s.contains("4 x ipcm")),
+        "{:?}",
+        report.synthesized
+    );
+    let parsed = Reference::open(&out).unwrap();
+    let pcm = parsed
+        .tracks
+        .iter()
+        .filter(|t| t.kind == TrackKind::PcmAudio)
+        .count();
+    assert_eq!(pcm, 4);
+    assert!(
+        report
+            .tracks
+            .iter()
+            .all(|t| (t.duration_seconds - 0.48).abs() < 1e-9)
+    );
+}
+
+#[test]
+fn refuses_reference_with_other_frame_rate() {
+    let dir = tempfile::tempdir().unwrap();
+    let dat_path = dir.path().join("clip.DAT");
+    write(&dat_path, &common::dat(2, 2));
+    // Same streams, but the clip's video runs at 50 fps (the .DAT's audio says 25 fps).
+    let ref_path = dir.path().join("ref.MP4");
+    write(
+        &ref_path,
+        &common::reference_at(2, &common::dat(2, 2)[16..], 500),
+    );
     let out = dir.path().join("out.MP4");
     match repair(&dat_path, &ref_path, &out) {
         Err(Error::Incompatible { reasons, .. }) => {
             assert!(
-                reasons.iter().any(|r| r.contains("4 PCM audio stream")),
+                reasons.iter().any(|r| r.contains("frame rate differs")),
                 "{reasons:?}"
             );
         }
@@ -120,30 +155,25 @@ fn refuses_reference_with_wrong_audio_track_count() {
 }
 
 #[test]
-fn refuses_reference_from_another_mode() {
-    let dir = tempfile::tempdir().unwrap();
-    let dat_path = dir.path().join("clip.DAT");
-    write(&dat_path, &common::dat(2, 2));
-    // Reference mdat has one extra lpcm stream: a different recording mode.
-    let ref_path = dir.path().join("ref.MP4");
-    write(&ref_path, &common::reference(2, &common::dat(2, 3)[16..]));
-    let out = dir.path().join("out.MP4");
-    let err = repair(&dat_path, &ref_path, &out).unwrap_err();
-    assert!(matches!(err, Error::Incompatible { .. }), "{err}");
-}
-
-#[test]
 fn chooses_compatible_reference_from_folder_and_protects_output() {
     let dir = tempfile::tempdir().unwrap();
     let dat_path = dir.path().join("clip.DAT");
     write(&dat_path, &common::dat(2, 2));
     let refs = dir.path().join("refs");
     std::fs::create_dir(&refs).unwrap();
-    // The smaller file is incompatible (4 audio tracks); the bigger one fits.
+    // The smaller file only fits as a hybrid (4 audio tracks); the bigger one fits exactly
+    // and wins. A third clip runs at another frame rate and is rejected.
     write(&refs.join("a_small.MP4"), &common::reference(4, &[]));
+    // The exact match sits in a subfolder: the search is recursive.
+    let sub = refs.join("day2");
+    std::fs::create_dir(&sub).unwrap();
     write(
-        &refs.join("b_big.mp4"),
+        &sub.join("b_big.mp4"),
         &common::reference(2, &common::dat(4, 2)[16..]),
+    );
+    write(
+        &refs.join("c_fast.MP4"),
+        &common::reference_at(2, &common::dat(2, 2)[16..], 500),
     );
     write(&refs.join("notes.txt"), b"not a clip");
     let out = dir.path().join("out.MP4");
@@ -163,6 +193,7 @@ fn chooses_compatible_reference_from_folder_and_protects_output() {
     .unwrap();
     assert_eq!(rejected, 1);
     assert!(report.reference.ends_with("b_big.mp4"));
+    assert_eq!(report.reference_kind, repair::RefKind::User);
 
     // A second run must not overwrite without permission.
     let again = repair::repair(
@@ -188,7 +219,7 @@ fn chooses_compatible_reference_from_folder_and_protects_output() {
     // Writing over the input is always refused.
     let onto_input = repair::repair(
         &dat_path,
-        &ReferenceSource::File(dir.path().join("refs/b_big.mp4")),
+        &ReferenceSource::File(dir.path().join("refs/day2/b_big.mp4")),
         &dat_path,
         &forced,
         &mut |_| {},

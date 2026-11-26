@@ -8,5 +8,6 @@
 pub mod atom;
 pub mod bytes;
 pub mod reference;
+pub mod synth;
 pub mod tables;
 pub mod writer;
