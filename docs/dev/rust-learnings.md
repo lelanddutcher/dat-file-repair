@@ -331,3 +331,65 @@ Notes from moving the desktop app onto the reference-free engine.
 CI installs the latest stable Rust. This Mac had 1.94 while CI had 1.100, so a new clippy lint
 (`needless_range_loop`) failed CI but passed locally. Run `rustup update stable` before a work session,
 or the local `cargo clippy` will not match CI.
+
+## App: Recover from a memory card (2026-11-26)
+
+Notes from adding the card flow to the desktop app. The engine side is `carve` (see
+`docs/format/card-carving.md`); the app wraps it.
+
+### Where it lives
+
+| Path | Holds |
+|---|---|
+| `app/src-tauri/src/engine/card.rs` | A child module of `engine.rs`: scan, copy off the card, list cards, image a card. Plain-words types for the page. Added as a new module so `engine.rs` itself only gained one `pub mod card;` line. |
+| `app/src-tauri/src/commands.rs` | `list_cards`, `image_card`, `scan_card`, `card_prepare_repair`, `card_save`. The last scan (`ImageSource` + `ScanReport`) is kept in `AppState.card` for "Repair all". |
+| `app/src/card.ts` | The card screens: choose, imaging, scanning, results, copying. main.ts lends it render and UI helpers through a `Host` object. |
+
+"Repair all" copies each chosen recording into the output folder, copies up to 3 nearby finished
+clips per recording into `<folder>/Card clips/`, then hands the copies to the normal repair flow
+with that folder as the reference search folder. The engine falls back to built-in settings when
+no clip fits. Nothing new was needed in the repair path.
+
+### Things learned
+
+- **A 0-byte entry can still be named.** It has no first cluster, so the scan cannot tie it to a
+  recording. But Canon XF names hold the start time (`…H241214_142223…`), and the recording's first
+  `tmcd` counter divided by the frame rate is the same time of day (6202965 / 119.88 = 14:22:23.4).
+  A unique match within 2 s names the copy after the original file, which also gives the repaired
+  MP4 the right creation time instead of the scan time.
+- **Raw device permissions.** A real card reader's `/dev/rdiskN` is `root:operator`, so a normal
+  user cannot read it. A disk image attached with `hdiutil attach` belongs to the user who attached
+  it, so the in-process imaging path can be tested without a password. The admin path runs `dd`
+  through `osascript … with administrator privileges` (the standard macOS password prompt). A user
+  process cannot signal a root `dd`, so the root shell watches for a stop file and ends `dd` itself.
+  The admin path is **not tested** in this session (it needs a person to type a password).
+- **`diskutil info` can be slow.** Asking it about every mounted volume took 16 s here (network
+  shares, big APFS disks). Filter `mount` output first: only `/dev/disk…` mounted under `/Volumes`
+  with `exfat` or `msdos`. Cameras use only those, and the list then takes about a second.
+- **`plutil -convert json -o - -`** turns `diskutil -plist` output into JSON for `serde_json`.
+  No plist crate needed.
+- **Writing to the card is refused by device number.** For a raw device source, the output folder's
+  `st_dev` is compared with the `st_rdev` of `/dev/diskN` and its partitions.
+
+### Dev hooks added
+
+- `DATFIX_DEV_AUTORUN='{"card": {…}}'` drives the card flow (`DevCardRun` in `app/src/api.ts`):
+  `image`, or `device` + `imageDir` (make an image), or `device` + `direct`; `fromEmptyDat`
+  (drop a 0-byte `.DAT` first and enter from its error); `outDir`; `repair`; `cancelAfterMs`;
+  `pauseMs`. With `pauseMs`, each screen prints `DATFIX_DEV_REPORT {"screen":"<name>"}` and waits,
+  so a script can take a screenshot.
+- `DATFIX_DEV_SCAN_MBPS=300` slows the scan and imaging reads, so progress and Cancel can be seen
+  on a 2 GB test image (it otherwise scans in under a second).
+- With `DATFIX_DEV_AUTORUN` set, the window is kept on top. **macOS stops painting a WKWebView
+  whose window is hidden behind others**: screenshots came out blank or stale, and
+  `requestAnimationFrame` stopped firing, so a dev wait built on it stalled for minutes.
+- An always-on-top window is on CoreGraphics layer 3, not 0. A window-id helper that filters on
+  layer 0 finds nothing and `screencapture -l` silently writes no file.
+
+### Test card images
+
+`hdiutil create -size 2g -fs ExFAT -volname EOS_DIGITAL -layout MBRSPUD card.dmg` gives a raw
+read/write image with an MBR partition, like an SD card. Attach, copy a corpus `.DAT` and a real
+camera clip from the same body, then delete the `.DAT` (deleted entry) or truncate it with
+`: > file` (0-byte entry), and detach. Use a camera original as the neighbour clip: one corpus
+"neighbour" MP4 turned out to be an AV1 transcode (`ftyp isom`), which the scan rightly ignores.
