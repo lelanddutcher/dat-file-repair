@@ -147,7 +147,7 @@ pub fn video_gate<R: ReadAt + ?Sized>(
         if !rate.matches(ref_fps) {
             return Err(vec![Reason::new(
                 format!(
-                    "It was recorded at {} frames per second; this .DAT at {}.",
+                    "It was recorded at {} frames per second, but this .DAT was recorded at {}.",
                     fps_text(ref_fps),
                     fps_text(rate.fps())
                 ),

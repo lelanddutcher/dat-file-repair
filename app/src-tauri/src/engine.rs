@@ -301,12 +301,10 @@ pub fn auto_search_dirs(dat: &Path) -> (Vec<PathBuf>, bool) {
     let Some(parent) = dat.parent() else {
         return (Vec::new(), false);
     };
+    // A camera card has a DCIM (or XFVC, PRIVATE, CONTENTS) folder at its top. A plain drive
+    // root does not count: searching a whole external disk would take far too long.
     for dir in parent.ancestors().take(4) {
-        // A mounted card: `/Volumes/<name>` on macOS, a drive root such as `E:\` on Windows.
-        let is_volume_root = dir.parent().is_some_and(|p| p == Path::new("/Volumes"))
-            || (cfg!(windows) && dir.parent().is_none());
-        let has_marker = CARD_MARKERS.iter().any(|m| dir.join(m).is_dir());
-        if has_marker || is_volume_root {
+        if CARD_MARKERS.iter().any(|m| dir.join(m).is_dir()) {
             return (vec![dir.to_path_buf()], true);
         }
     }
@@ -343,9 +341,10 @@ pub fn find_reference(
         return Ok(matched(c, None, checked, candidates));
     }
 
+    // Folder names only; the full path is in the tooltip of the clip list.
     let where_ = dirs
         .iter()
-        .map(|d| d.display().to_string())
+        .map(|d| format!("the folder “{}”", file_name(d)))
         .collect::<Vec<_>>()
         .join(", ");
     let note = if checked == 0 {

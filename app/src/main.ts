@@ -476,7 +476,9 @@ function renderItem(item: Item): HTMLElement {
         ),
       ]),
     );
-    if (state.items.length > 1) rows.push(renderItemReference(item), renderItemOutput(item));
+    // In a batch, each file shows its own settings and name until it is repaired; the result
+    // then says the same thing.
+    if (state.items.length > 1 && item.run.status !== "done") rows.push(renderItemReference(item), renderItemOutput(item));
   }
   rows.push(renderRun(item));
   return h("li", { class: "item" }, [
@@ -674,10 +676,17 @@ function renderAction(): HTMLElement {
     state.repairing
       ? h("button", { id: "cancel", class: "danger big-btn", type: "button", disabled: state.stopRequested, onclick: () => void cancelRepair() }, state.stopRequested ? "Stopping…" : "Cancel")
       : h("button", { id: "repair", class: "primary big-btn", type: "button", disabled: ready === 0, onclick: () => void repairAll() }, label),
-    !state.repairing && ready === 0
-      ? h("p", { class: "muted small" }, waiting ? "Getting ready…" : "Add a .DAT file and a matching clip to start.")
-      : null,
+    !state.repairing && ready === 0 ? h("p", { class: "muted small" }, idleHint(waiting)) : null,
   ]);
+}
+
+/** Why the Repair button is off, in plain words. */
+function idleHint(waiting: boolean): string {
+  if (waiting) return "Getting ready…";
+  const open = state.items.filter((i) => i.run.status !== "done");
+  if (open.length > 0 && open.every((i) => i.readError)) return "Nothing here can be repaired. Remove it, or add another .DAT file.";
+  if (open.some((i) => i.ref.status === "mismatch" || i.ref.status === "error")) return "Choose matching settings above to start.";
+  return "Add a .DAT file to start.";
 }
 
 /** Offer to delete unfinished files left by a repair that was killed. */
