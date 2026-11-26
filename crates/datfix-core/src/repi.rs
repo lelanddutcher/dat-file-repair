@@ -43,6 +43,8 @@ pub const HEADER_MIN: u64 = 20;
 pub const MAX_SAMPLES_PER_GROUP: u32 = 8_000_000;
 pub const MAX_SAMPLE_SIZE: u32 = 1 << 30;
 pub const MAX_GROUP_PAYLOAD: u64 = 8 << 30;
+/// Rejected header offsets kept in [`DatIndex::rejected_headers`]; the rest are only counted.
+pub const MAX_REJECTED_LISTED: usize = 10_000;
 /// Sample alignments tried for variable-size groups. 1 means "packed back to back".
 const ALIGNMENTS: [u32; 5] = [1, 8, 4, 16, 32];
 /// Samples checked per group when detecting alignment. Checking only a few is not enough: a
@@ -174,8 +176,10 @@ pub struct DatIndex {
     pub groups: Vec<Group>,
     /// Unindexed bytes between groups. Normal for many cameras.
     pub gaps: Vec<Gap>,
-    /// Places where `repi` appeared but the header failed validation.
+    /// Places where `repi` appeared but the header failed validation (the first
+    /// [`MAX_REJECTED_LISTED`]; `rejected_count` has the total).
     pub rejected_headers: Vec<u64>,
+    pub rejected_count: u64,
     /// Bytes after the last group that hold no complete header.
     pub trailing_bytes: u64,
     pub truncation: Option<Truncation>,
@@ -274,6 +278,21 @@ pub fn walk_from<R: ReadAt + ?Sized>(
     max_groups: usize,
     progress: &mut dyn FnMut(u64) -> bool,
 ) -> Result<DatIndex> {
+    walk_window(src, start, max_groups, u64::MAX, progress)
+}
+
+/// Like [`walk_from`], but gives up once `max_gap` bytes after the last group (or after
+/// `start`) hold no `repi` header.
+///
+/// Used to sample the index inside a healthy clip: a clip from a body without `repi` would
+/// otherwise be scanned to its end, which takes minutes for a large file on a network share.
+pub fn walk_window<R: ReadAt + ?Sized>(
+    src: &R,
+    start: u64,
+    max_groups: usize,
+    max_gap: u64,
+    progress: &mut dyn FnMut(u64) -> bool,
+) -> Result<DatIndex> {
     let len = src.size();
     let io = |e| Error::io("cannot read the .DAT", e);
     let mut index = DatIndex {
@@ -290,7 +309,8 @@ pub fn walk_from<R: ReadAt + ?Sized>(
     let mut last_end = start;
     let mut scan_from = start;
     while index.groups.len() < max_groups {
-        let Some(at) = find_magic(src, scan_from).map_err(io)? else {
+        let until = last_end.saturating_add(max_gap).min(len);
+        let Some(at) = find_magic(src, scan_from, until).map_err(io)? else {
             index.trailing_bytes = len - last_end;
             break;
         };
@@ -341,7 +361,11 @@ pub fn walk_from<R: ReadAt + ?Sized>(
                 break;
             }
             HeaderResult::Invalid => {
-                index.rejected_headers.push(at);
+                // Cap the list: a file full of near-miss headers must not grow it without bound.
+                if index.rejected_headers.len() < MAX_REJECTED_LISTED {
+                    index.rejected_headers.push(at);
+                }
+                index.rejected_count += 1;
                 scan_from = at + 1;
             }
         }
@@ -469,12 +493,13 @@ fn nal_chain_fits<R: ReadAt + ?Sized>(src: &R, off: u64, size: u32) -> std::io::
     Ok(false)
 }
 
-/// Finds the next `repi` magic at or after `from`.
+/// Finds the next `repi` magic at or after `from` that starts before `until`.
 ///
 /// The common case is that the magic sits exactly at `from`, so that is checked with a 4-byte
 /// read first. Otherwise the file is scanned in blocks that grow from 64 KiB to 4 MiB.
-fn find_magic<R: ReadAt + ?Sized>(src: &R, from: u64) -> std::io::Result<Option<u64>> {
-    let len = src.size();
+fn find_magic<R: ReadAt + ?Sized>(src: &R, from: u64, until: u64) -> std::io::Result<Option<u64>> {
+    // The magic may start up to 3 bytes before `until` and still end inside the window.
+    let len = src.size().min(until.saturating_add(3));
     if from + 4 > len {
         return Ok(None);
     }
