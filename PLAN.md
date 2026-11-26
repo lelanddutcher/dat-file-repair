@@ -1,15 +1,17 @@
 # DAT file repair — plan
 
-Status (2026-11-26): **green-lit; M0, M1, M2 done; M3 and M4 in progress.**
+Status (2026-11-26, end of day): **M0–M4 done. M5 waits on the wedding .DAT.**
 
-- Engine + CLI (`crates/`): repairs all 36 corpus `.DAT`s (R3, R5, R5 II), with a user clip, a hybrid
-  clip, or the built-in profile bank (no clip needed). Mid-file damage keeps A/V sync.
-- Desktop app (`app/`, Tauri): one-window flow, batch, cancel, universal macOS `.dmg` (7 MB).
-  Windows bundle configured in CI, not yet run.
-- In progress: hardening + full-corpus regression, card-image carving (`datfix scan`),
-  editing-app compatibility (QuickTime/Resolve/Premiere).
-- Waiting on Leland: final name (recommended DATfix), public repo, Windows CI run.
-- License: MIT.
+- Engine + CLI: all 36 corpus `.DAT`s (R3, R5, R5 II) repair in both modes (folder clip, built-in
+  settings) with full clean decodes (72/72). Fuzzed; failing-card, FAT32, disk-full and Windows
+  read-error paths handled. Reference metadata is not copied (privacy). Dates, rotation, AAC hybrids.
+- Card recovery: `datfix scan` and the app's "Recover from a memory card" find deleted and 0-byte
+  `.DAT`s in a card image, rejoin split recordings, restore original names and times.
+- App: Tauri, macOS universal `.dmg` + Windows installers built in CI. Verified in QuickTime and Resolve.
+- Release: `release.yml` builds all README assets and drafts a GitHub Release on a `v*` tag.
+- Open (see `docs/backlog/next.md`): real-Windows run, signing/notarization, admin-password card
+  imaging, Premiere test, card time-zone check on a real Canon card.
+- Name DATfix; repo `lelanddutcher/dat-file-repair` (private). License MIT.
 
 ## Goal
 
