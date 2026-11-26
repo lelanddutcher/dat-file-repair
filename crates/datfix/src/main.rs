@@ -61,6 +61,10 @@ enum Command {
         /// Replace the output if it already exists.
         #[arg(long)]
         force: bool,
+        /// Stop at the first read error. By default unreadable parts of a failing card are
+        /// skipped and treated as damage, and the report says how many seconds were lost.
+        #[arg(long)]
+        stop_on_read_error: bool,
     },
     /// Find hidden temporary files left by repairs that were killed, and delete them with --yes.
     Clean {
@@ -112,6 +116,7 @@ fn main() -> ExitCode {
             builtin,
             output,
             force,
+            stop_on_read_error,
         } => {
             let source = match (reference, reference_dir) {
                 (Some(r), _) => ReferenceSource::File(r),
@@ -120,7 +125,12 @@ fn main() -> ExitCode {
                 (None, None) => ReferenceSource::Auto,
             };
             let output = output.unwrap_or_else(|| default_output(&dat));
-            run_repair(&dat, &source, &output, force, json)
+            let opts = RepairOptions {
+                overwrite: force,
+                stop_on_read_error,
+                ..Default::default()
+            };
+            run_repair(&dat, &source, &output, &opts, json)
         }
     };
     match result {
@@ -375,13 +385,9 @@ fn run_repair(
     dat: &Path,
     source: &ReferenceSource,
     output: &Path,
-    force: bool,
+    opts: &RepairOptions,
     json: bool,
 ) -> datfix_core::Result<()> {
-    let opts = RepairOptions {
-        overwrite: force,
-        ..Default::default()
-    };
     let out_dir = match output.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
@@ -398,7 +404,7 @@ fn run_repair(
             out_dir.display()
         );
     }
-    let report = repair::repair(dat, source, output, &opts, &mut event_printer(json))?;
+    let report = repair::repair(dat, source, output, opts, &mut event_printer(json))?;
     if json {
         emit_json(&serde_json::json!({ "event": "result", "repair": report }));
     } else {
@@ -495,6 +501,17 @@ fn print_repair(r: &RepairReport) {
         );
     }
     println!("  size: {:.2} GB", r.bytes_written as f64 / 1e9);
+    if r.unreadable_bytes > 0 {
+        println!(
+            "  unreadable: {:.1} MB in {} place(s) could not be read from the card; {:.2} s of \
+             video lost (the picture holds, sound is silent there)",
+            r.unreadable_bytes as f64 / 1e6,
+            r.unreadable.len(),
+            r.lost_seconds
+        );
+    } else if r.lost_seconds > 0.0 {
+        println!("  damaged: {:.2} s of video lost", r.lost_seconds);
+    }
     for n in &r.notes {
         println!("  note: {n}");
     }

@@ -352,6 +352,13 @@ pub fn classify_input<R: ReadAt + ?Sized>(path: &Path, src: &R) -> Result<()> {
         && head[0..8] == [0, 0, 0, 0, b'm', b'd', b'a', b't']
         && &head[12..16] == b"wide";
     let has_repi = head.windows(4).any(|w| w == repi::MAGIC);
+    if canon_header && !has_repi && len == head.len() as u64 && head[16..].iter().all(|&b| b == 0) {
+        // The camera wrote the header and stopped before the first group.
+        return Err(Error::NoFrames {
+            path: path.to_path_buf(),
+            detail: format!("the file is only {len} bytes and holds no recovery index"),
+        });
+    }
     if canon_header && !has_repi {
         return Err(Error::Unsupported(
             "this is an unfinished Canon recording, but from a body that does not write a \
@@ -898,10 +905,7 @@ pub fn repair_from<R: ReadAt>(
     // were written as zeros. Plan again around every bad region and write a second file,
     // reading the payload back from the first one instead of from the failing card.
     if src.bad_regions().len() != known_bad {
-        let first = tmp.with_file_name(format!(
-            "{}.pass1",
-            tmp.file_name().map_or("".into(), |n| n.to_string_lossy())
-        ));
+        let first = temp_path_tagged(output, ".pass1");
         let cleanup = |e: Error| {
             let _ = std::fs::remove_file(&first);
             e
@@ -1094,11 +1098,37 @@ pub const PARTIAL_SUFFIX: &str = ".datfix-partial";
 
 /// Hidden temp file next to the output; renamed into place on success.
 pub fn temp_path(output: &Path) -> PathBuf {
+    temp_path_tagged(output, "")
+}
+
+/// Longest file name most file systems accept (bytes on macOS/Linux, UTF-16 units on
+/// Windows; the byte count is the stricter of the two).
+const MAX_NAME: usize = 255;
+
+/// `.<name><tag>.datfix-partial` next to `output`. A long name is shortened (on a character
+/// boundary) and given a short hash of the full name, so the temporary name stays within
+/// [`MAX_NAME`] and two long names that share a prefix do not collide.
+fn temp_path_tagged(output: &Path, tag: &str) -> PathBuf {
     let name = output
         .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("output.mp4");
-    output.with_file_name(format!(".{name}{PARTIAL_SUFFIX}"))
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output.mp4".into());
+    let budget = MAX_NAME - 1 - tag.len() - PARTIAL_SUFFIX.len();
+    let short = if name.len() <= budget {
+        name
+    } else {
+        // FNV-1a: stable across runs and platforms, no dependency.
+        let hash = name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
+        });
+        let keep = budget - 9;
+        let mut cut = keep;
+        while !name.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}~{:08x}", &name[..cut], hash as u32)
+    };
+    output.with_file_name(format!(".{short}{tag}{PARTIAL_SUFFIX}"))
 }
 
 /// A temporary file left by a repair that was killed (power loss, force quit).
