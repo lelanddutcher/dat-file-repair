@@ -325,3 +325,9 @@ Notes from moving the desktop app onto the reference-free engine.
   runs an AppleScript that lays out the Finder window. Without permission it fails and leaves
   `bundle/macos/rw.*.dmg`. `CI=true cargo tauri build --target universal-apple-darwin` skips
   that script; the `.dmg` is plain but valid (`hdiutil verify`).
+
+## Keep the local toolchain current (2026-11-26)
+
+CI installs the latest stable Rust. This Mac had 1.94 while CI had 1.100, so a new clippy lint
+(`needless_range_loop`) failed CI but passed locally. Run `rustup update stable` before a work session,
+or the local `cargo clippy` will not match CI.

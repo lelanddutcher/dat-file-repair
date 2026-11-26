@@ -429,8 +429,11 @@ fn detect_alignment<R: ReadAt + ?Sized>(src: &R, g: &Group) -> std::io::Result<u
     'candidates: for align in ALIGNMENTS {
         let mut off = g.data_offset();
         let mut checked = 0;
-        for i in 0..g.declared.min(ALIGN_CHECK_SAMPLES) as usize {
-            let size = g.sizes[i];
+        for &size in g
+            .sizes
+            .iter()
+            .take(g.declared.min(ALIGN_CHECK_SAMPLES) as usize)
+        {
             if off + size as u64 > len {
                 break;
             }
