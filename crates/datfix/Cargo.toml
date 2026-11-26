@@ -1,0 +1,18 @@
+[package]
+name = "datfix"
+description = "Command-line tool that repairs interrupted Canon .DAT recordings into MP4"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "datfix"
+path = "src/main.rs"
+
+[dependencies]
+datfix-core.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
