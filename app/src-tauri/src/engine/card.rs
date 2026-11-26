@@ -112,7 +112,7 @@ pub struct CardScanView {
     pub size_bytes: u64,
     pub is_device: bool,
     pub seconds: f64,
-    /// For example "exFAT, 128 KB clusters, 12 files (3 deleted)". Null when none was found.
+    /// For example "exFAT, 12 files (3 deleted)". Null when none was found.
     pub file_system: Option<String>,
     pub recordings: Vec<RecordingView>,
     pub fragments: Vec<RecordingView>,
@@ -310,17 +310,16 @@ fn describe(image: &Path, r: &ScanReport, src: &ImageSource) -> CardScanView {
         .collect();
     let clips = r.clips.iter().map(clip_view).collect();
     let file_system = r.volumes.first().map(|v| {
-        format!(
-            "{}, {} KB clusters, {} file{} ({} deleted)",
-            match v.kind {
-                FsKind::ExFat => "exFAT",
-                FsKind::Fat32 => "FAT32",
-            },
-            v.cluster_size / 1024,
-            v.files,
-            if v.files == 1 { "" } else { "s" },
-            v.deleted
-        )
+        let kind = match v.kind {
+            FsKind::ExFat => "exFAT",
+            FsKind::Fat32 => "FAT32",
+        };
+        let files = format!("{} file{}", v.files, if v.files == 1 { "" } else { "s" });
+        if v.deleted > 0 {
+            format!("{kind}, {files} ({} deleted)", v.deleted)
+        } else {
+            format!("{kind}, {files}")
+        }
     });
 
     let mut notes = Vec::new();
@@ -881,9 +880,6 @@ fn whole_disk_of_device(path: &Path) -> Option<String> {
 /// Memory cards and other removable disks that are mounted now. Camera cards first.
 #[cfg(target_os = "macos")]
 pub fn list_cards() -> Vec<CardDevice> {
-    let boot = diskutil_info("/")
-        .and_then(|v| v["ParentWholeDisk"].as_str().map(String::from))
-        .unwrap_or_default();
     let mut out: Vec<CardDevice> = Vec::new();
     for mount in local_volumes() {
         if file_name(&mount).starts_with('.') {
@@ -895,7 +891,7 @@ pub fn list_cards() -> Vec<CardDevice> {
         let Some(disk) = info["ParentWholeDisk"].as_str().map(String::from) else {
             continue;
         };
-        if disk == boot || out.iter().any(|c| c.device == disk) {
+        if out.iter().any(|c| c.device == disk) {
             continue;
         }
         let flag = |k: &str| info[k].as_bool().unwrap_or(false);
@@ -940,8 +936,9 @@ pub fn list_cards() -> Vec<CardDevice> {
     Vec::new()
 }
 
-/// Mount points under `/Volumes` of local disks (`/dev/disk…`), from `mount`. Network shares
-/// are skipped without touching them: `diskutil info` on a slow SMB share can take minutes.
+/// Mount points under `/Volumes` of local exFAT and FAT disks (`/dev/disk…`), from `mount`.
+/// Cameras format cards with these file systems. Everything else (network shares, APFS backup
+/// drives, the system disk) is skipped without asking `diskutil`, which is slow on some of them.
 #[cfg(target_os = "macos")]
 fn local_volumes() -> Vec<PathBuf> {
     let Ok(out) = std::process::Command::new("/sbin/mount").output() else {
@@ -952,8 +949,10 @@ fn local_volumes() -> Vec<PathBuf> {
         .filter(|l| l.starts_with("/dev/disk"))
         .filter_map(|l| {
             let (_, rest) = l.split_once(" on ")?;
-            let (mount, _) = rest.rsplit_once(" (")?;
-            mount.starts_with("/Volumes/").then(|| PathBuf::from(mount))
+            let (mount, opts) = rest.rsplit_once(" (")?;
+            let fs = opts.split(',').next()?.trim();
+            (mount.starts_with("/Volumes/") && matches!(fs, "exfat" | "msdos"))
+                .then(|| PathBuf::from(mount))
         })
         .collect()
 }
