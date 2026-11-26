@@ -1,0 +1,65 @@
+# Builds the DATfix desktop app installers when a version tag is pushed (for example v0.2.0).
+# Results are attached to the workflow run as artifacts; publishing a release is a manual step.
+#
+# Signing is off until certificates exist. To turn it on, add the repository secrets named in
+# the commented `env` blocks below (see docs/dev/rust-learnings.md, "Desktop app (Tauri)").
+name: app
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  bundle:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            # One app for Apple Silicon and Intel Macs.
+            target: universal-apple-darwin
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+            bundle-dir: target/universal-apple-darwin/release/bundle/dmg
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            rust-targets: x86_64-pc-windows-msvc
+            bundle-dir: target/x86_64-pc-windows-msvc/release/bundle
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install web dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Build installers
+        working-directory: app
+        run: npx tauri build --target ${{ matrix.target }}
+        # env:
+        #   # macOS signing and notarization
+        #   APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}            # base64 .p12
+        #   APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        #   APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}  # "Developer ID Application: ..."
+        #   APPLE_ID: ${{ secrets.APPLE_ID }}
+        #   APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}                  # app-specific password
+        #   APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: datfix-${{ matrix.target }}
+          path: |
+            ${{ matrix.bundle-dir }}/**/*.dmg
+            ${{ matrix.bundle-dir }}/**/*.exe
+            ${{ matrix.bundle-dir }}/**/*.msi
+          if-no-files-found: error

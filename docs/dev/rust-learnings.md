@@ -133,3 +133,101 @@ cargo build --release                        # optimized binary in target/releas
   because those leading pictures cannot be decoded when playback starts at the CRA.
 - Files mirrored from the NAS can arrive with mode `070` (no owner read). Reads fail with
   "Permission denied" until the mirror's final `chmod 444` runs.
+
+## Desktop app (Tauri)
+
+### What Tauri is
+
+Tauri builds a desktop app from two parts. A Rust program (the "backend") opens a native window.
+The window shows a web page (the "frontend") that the system web view draws: WebKit on macOS,
+WebView2 on Windows. No browser engine ships inside the app, so the `.dmg` is about 6 MB.
+
+The page calls Rust functions marked `#[tauri::command]` with `invoke("name", { args })`. Rust
+sends progress back through a `tauri::ipc::Channel`, which the page creates and passes as an
+argument.
+
+### Layout
+
+| Path | Holds |
+|---|---|
+| `app/src/` | The page: `main.ts` (state and rendering), `api.ts` (typed command wrappers), `dom.ts` (element builder), `format.ts`, `styles.css`. Plain TypeScript, built by Vite. |
+| `app/src-tauri/src/engine.rs` | The only module that calls `datfix-core`. Converts engine results and errors into plain-words types. Fix this file when the engine API changes. |
+| `app/src-tauri/src/commands.rs` | The commands. Each moves slow work to `spawn_blocking`, keeps cancel flags and cached `.DAT` indexes. |
+| `app/src-tauri/src/lib.rs` | Builds the app, registers plugins and commands, handles window close. |
+| `app/src-tauri/tauri.conf.json` | Product name, window, bundle and signing settings. |
+| `app/src-tauri/capabilities/default.json` | What the page may call (Tauri v2 denies everything not listed). |
+| `app/src-tauri/tests/engine_media.rs` | Real-media tests of the engine layer, gated on environment variables. |
+
+The app's name is `productName` in `tauri.conf.json`. The window title and page heading read it at
+start-up, so a rename is a one-line change (plus `identifier` if the bundle id should change).
+
+### Commands
+
+```sh
+cd app
+npm ci                                   # once; installs Vite, TypeScript and the Tauri JS API
+cargo tauri dev                          # runs Vite and the app with hot reload of the page
+npm run typecheck                        # TypeScript check
+cargo tauri build --bundles app          # quick release .app for this Mac only
+cargo tauri build --target universal-apple-darwin   # .app + .dmg for Apple Silicon and Intel
+```
+
+- The universal build needs both Rust targets: `rustup target add x86_64-apple-darwin`.
+- Outputs land in the workspace `target/`, for example
+  `target/universal-apple-darwin/release/bundle/dmg/DATfix_0.1.0_universal.dmg`.
+- The app is a workspace member but not a `default-members` entry. Plain `cargo build`, `test`
+  and `clippy` at the root skip it, because it needs `app/dist` (the built page) and, on Linux,
+  WebKitGTK. Check it with `cargo clippy -p datfix-app --all-targets -- -D warnings` after
+  `npm run build`.
+- Media tests: `DATFIX_APP_DAT=<.DAT> DATFIX_APP_REFS=<folder> DATFIX_APP_OUT=<folder>
+  [DATFIX_APP_BIG_DAT=<multi-GB .DAT>] cargo test --release -p datfix-app -- --nocapture`.
+
+### Gotchas met
+
+- **Versions must match.** `tauri build` refuses to run when the npm packages
+  (`@tauri-apps/api`, `plugin-dialog`, `plugin-opener`) are on a different minor version than the
+  Rust crates. The workspace `rust-version = "1.85"` makes Cargo pick the newest crate versions
+  that support Rust 1.85 (tauri 2.11), which are older than the newest npm packages. Pin the npm
+  packages with `~` to the same minor. Check with `cargo tree -p datfix-app -d` and
+  `npm ls`.
+- **Clippy `result_large_err`.** A rich error struct (title, message, next step, reasons) trips
+  this lint. The app allows it at crate level; errors are rare and become JSON.
+- **Long work must leave the main thread.** A command that blocks freezes the window. Use
+  `async fn` commands plus `tauri::async_runtime::spawn_blocking`.
+- **Cancel = shared `AtomicBool`.** The engine checks it about every 8 MB and deletes its
+  temporary file. Closing the window during a repair sets every flag and waits (up to 15 s) for
+  jobs to finish before the process exits. A forced kill (`kill`, Activity Monitor) still leaves
+  a hidden `.<name>.datfix-partial` file next to the output.
+- **Drag and drop gives real paths only through Tauri.** HTML5 drop events in the web view do
+  not carry file paths. Use `getCurrentWebview().onDragDropEvent`.
+- **The web view cannot be clicked by test tools on macOS** (WKWebView has no WebDriver). The app
+  reads `DATFIX_DEV_AUTORUN` (JSON: `dats`, `reference`, `outDir`, `repair`, `cancelAfterMs`,
+  `scrollY`) and drives its own UI, then prints `DATFIX_DEV_REPORT <json>` to stdout.
+  `DATFIX_DEV_THEME=light|dark` forces the theme. Window screenshots: find the window id with
+  `CGWindowListCopyWindowInfo` (a 10-line Swift program) and run `screencapture -x -o -l <id>`.
+
+### Signing and notarization (not done yet)
+
+Unsigned builds work, but macOS Gatekeeper warns ("cannot be opened because the developer cannot
+be verified") and Windows SmartScreen shows "Windows protected your PC". Before a public release:
+
+macOS:
+
+1. Join the Apple Developer Program (99 USD/year).
+2. Create a "Developer ID Application" certificate in Xcode or on developer.apple.com. Export it
+   as `.p12` with a password.
+3. Create an app-specific password for the Apple ID at appleid.apple.com.
+4. Set these environment variables (or GitHub secrets, see `.github/workflows/app.yml`):
+   `APPLE_CERTIFICATE` (base64 of the `.p12`), `APPLE_CERTIFICATE_PASSWORD`,
+   `APPLE_SIGNING_IDENTITY` (`Developer ID Application: Name (TEAMID)`), `APPLE_ID`,
+   `APPLE_PASSWORD` (the app-specific password), `APPLE_TEAM_ID`.
+5. `cargo tauri build` then signs with the hardened runtime (already on in `tauri.conf.json`) and
+   notarizes. Check with `spctl -a -vv DATfix.app` and `xcrun stapler validate DATfix.dmg`.
+
+Windows:
+
+1. Buy a code-signing certificate (OV or EV), or use Azure Trusted Signing.
+2. Put its thumbprint in `bundle.windows.certificateThumbprint` and set a `timestampUrl`
+   (for example `http://timestamp.digicert.com`), or configure `bundle.windows.signCommand`
+   for Azure Trusted Signing.
+3. Install the certificate on the build machine (a CI step imports it from a secret).
