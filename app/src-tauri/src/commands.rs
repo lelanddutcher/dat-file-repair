@@ -18,8 +18,9 @@ use crate::engine::card::{
 };
 use crate::engine::{
     self, AppError, AppResult, Capabilities, DatIndex, DatSummary, PartialView, Progress,
-    ReferenceMatch, RepairOutcome,
+    ReferenceMatch, RepairChoices, RepairOutcome,
 };
+use datfix_core::repair::RecordingHint;
 
 /// Shared state, owned by Tauri and handed to every command.
 #[derive(Default)]
@@ -101,6 +102,7 @@ async fn background<T: Send + 'static>(
                 next_step: "Please use Copy details and report this as a bug.".into(),
                 reasons: Vec::new(),
                 details: format!("background task failed: {e}"),
+                link: None,
             })
         })
 }
@@ -236,15 +238,20 @@ pub fn suggest_output(dat: PathBuf, dir: Option<PathBuf>, taken: Vec<PathBuf>) -
     engine::suggest_output(&dat, dir.as_deref(), &taken)
 }
 
-/// Repairs one `.DAT`. `reference` is a clip, or null for the built-in settings. Progress
-/// streams through `progress`; the result is the return value.
+/// Repairs one `.DAT`. `reference` is a clip, or null for the built-in settings. `choices`
+/// holds the "Advanced" options; `hint` is what a memory card said about a recording copied
+/// off it (from `card_prepare_repair`). Progress streams through `progress`; the result is the
+/// return value.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn repair_dat(
     state: State<'_, AppState>,
     job: String,
     dat: PathBuf,
     reference: Option<PathBuf>,
     output: PathBuf,
+    choices: Option<RepairChoices>,
+    hint: Option<RecordingHint>,
     progress: Channel<Progress>,
 ) -> AppResult<RepairOutcome> {
     // The index read when the file was added; the engine checks it still fits the file.
@@ -256,6 +263,8 @@ pub async fn repair_dat(
             reference.as_deref(),
             &output,
             index,
+            choices.unwrap_or_default(),
+            hint,
             cancel,
             &mut |p| {
                 let _ = progress.send(p);

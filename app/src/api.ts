@@ -70,7 +70,25 @@ export interface RepairOutcome {
   audioTracks: number;
   bytesWritten: number;
   notes: string[];
+  /** Recording start written into the file, UTC seconds since 1970. */
+  creationTime: number | null;
+  /** Where that time came from, in plain words. */
+  dateSource: string;
+  /** Display rotation written into the file, degrees clockwise, or null when upright. */
+  rotationDegrees: number | null;
+  /** Reference-clip metadata left out of the file. */
+  withheldMetadata: string[];
 }
+
+/** The "Advanced" options of one file. */
+export interface RepairChoices {
+  /** 0, 90, 180 or 270 degrees clockwise; null keeps the reference clip's orientation. */
+  rotation: number | null;
+  keepReferenceMetadata: boolean;
+}
+
+/** What a memory card said about a recording copied off it (engine `RecordingHint`). Opaque to the page. */
+export type RecordingHint = Record<string, unknown>;
 
 export type Stage = "indexing" | "checkingReference" | "analyzingVideo" | "writing";
 
@@ -88,6 +106,8 @@ export interface AppError {
   nextStep: string;
   reasons: string[];
   details: string;
+  /** A web page that helps (for example the issue form), or null. */
+  link?: string | null;
 }
 
 /** Turns anything thrown by `invoke` into an AppError. */
@@ -156,7 +176,7 @@ export interface CardScanView {
 }
 
 export interface PreparedCard {
-  recordings: { offset: number; dat: string | null; error: AppError | null }[];
+  recordings: { offset: number; dat: string | null; hint: RecordingHint; error: AppError | null }[];
   clipsDir: string | null;
   clips: number;
 }
@@ -202,8 +222,15 @@ export const api = {
   suggestOutput: (dat: string, dir: string | null, taken: string[]) =>
     invoke<string>("suggest_output", { dat, dir, taken }),
   /** `reference` null = built-in settings. */
-  repairDat: (job: string, dat: string, reference: string | null, output: string, onProgress: (p: Progress) => void) =>
-    invoke<RepairOutcome>("repair_dat", { job, dat, reference, output, progress: channel(onProgress) }),
+  repairDat: (
+    job: string,
+    dat: string,
+    reference: string | null,
+    output: string,
+    choices: RepairChoices,
+    hint: RecordingHint | null,
+    onProgress: (p: Progress) => void,
+  ) => invoke<RepairOutcome>("repair_dat", { job, dat, reference, output, choices, hint, progress: channel(onProgress) }),
   findPartials: (dirs: string[]) => invoke<PartialView[]>("find_partials", { dirs }),
   removePartials: (paths: string[]) => invoke<number>("remove_partials", { paths }),
   cancelJob: (job: string) => invoke<void>("cancel_job", { job }),
@@ -225,6 +252,13 @@ export interface DevAutorun {
   cancelAfterMs?: number;
   /** Scroll the page down this many pixels once ready (for screenshots). */
   scrollY?: number;
+  /** "Advanced" options for every file: rotation in degrees, keep the reference's metadata. */
+  rotation?: number;
+  keepReferenceMetadata?: boolean;
+  /** Open the "Advanced" section of every file (for screenshots). */
+  openAdvanced?: boolean;
+  /** Wait this long on each screen, after announcing it, so a script can take a screenshot. */
+  pauseMs?: number;
   /** Drive the "Recover from a memory card" flow instead (see card.ts). */
   card?: DevCardRun;
 }
