@@ -133,3 +133,49 @@ cargo build --release                        # optimized binary in target/releas
   because those leading pictures cannot be decoded when playback starts at the CRA.
 - Files mirrored from the NAS can arrive with mode `070` (no owner read). Reads fail with
   "Permission denied" until the mirror's final `chmod 444` runs.
+
+## Engine v2: repair without a matching reference
+
+Notes from adding the profile bank, hybrid references and damage handling.
+
+### Canon facts learned on the way
+
+- **Padding is on the size, not the offset.** In family B (`CAEP` + LPCM) the video data
+  starts at 4 mod 8, so "align each sample to an 8-byte file offset" puts every frame 4 bytes
+  off and the NAL check fails. Sample `i + 1` starts `round_up(size_i, 8)` after sample `i`.
+  Family A hid the bug because its data happens to start at 0 mod 8.
+- **`tmcd` is time of day.** The first timecode counter divided by the frame rate is the
+  local time when recording started (it matched the file name `H241221_134042` to the
+  second). It is a 32-bit frame count, so it measures lost frames exactly.
+- **The record frame counter is 7 bits** (byte `0x54` of each 128-byte record, `& 0x7f`). It
+  wraps every 128 frames; combine it with a byte-count estimate to pick the wrap.
+- **The `moov` `uuid` box holds a JPEG thumbnail with Exif** (`CNTH`), and `udta/loci` holds
+  GPS. Never ship either; the profile bank strips them.
+- **Video settings do not depend on the audio mode.** An R5 Long-GOP AAC clip's `hvcC`
+  decoded R5 All-Intra LPCM `.DAT` frames cleanly. All Canon 4K 4:2:2 10-bit HEVC bodies in
+  the corpus share the same SPS/PPS fields; a full slice-header parse cannot tell R3 from
+  R5 Mark II, so the body code from the records is part of the profile key.
+- **Profiles that differ only in VUI** (colour tags) or in the `tkhd` matrix (rotation)
+  decode identically. Reset the matrix at harvest; group the rest by parsed SPS/PPS fields.
+
+### Techniques
+
+- **Verify settings by parsing to the end of the slice header.** A wrong SPS/PPS almost
+  never lands on `byte_alignment()` (a 1 bit, then zeros). With wavefronts (WPP), the entry
+  point count must equal CTB rows - 1 for a one-slice picture; slice addresses must be inside
+  the picture. Reading 4 KiB per slice NAL is enough for the entry point table.
+- **Embed data with `include_str!` + `serde_json`.** The bank is ~40 KB of JSON with hex
+  strings; diffs stay reviewable and a unit test checks every entry still parses and holds no
+  `uuid`/`loci`/`CNTH`.
+- **A virtual offset for inserted data.** Silence chunks point at a zero block appended after
+  the copied payload. Give them the `.DAT` offset `copy_end`; the same offset shift as every
+  other chunk then lands them on the zero block.
+- **Lost video frames: stretch the previous frame's `stts` delta**, do not invent frames.
+  Later frames keep their time, the picture holds over the gap.
+- **Testing sync: compare two repairs.** Repair a clean copy and a damaged copy; map every
+  output sample back to its `.DAT` offset and assert the decode time is the same in both.
+  It checks every track at once, with no media knowledge in the test.
+- `Result::unwrap_err()` needs `T: Debug`. For results holding big structs, use
+  `let Err(e) = ... else { panic!() };` instead of deriving `Debug` everywhere.
+- Shell: `scp` with a remote path in escaped quotes fails under the SFTP protocol ("No such
+  file"). `ssh host "cat \"$path\"" > file` works.
