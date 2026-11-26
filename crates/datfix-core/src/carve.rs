@@ -206,11 +206,29 @@ pub struct Recovered {
     pub partial: Option<String>,
     /// Offsets of finished clips whose bytes overlap this recording.
     pub overlaps_clips: Vec<u64>,
-    /// The file-system entry that points here, if any.
+    /// The file-system entry this recording came from, if any.
     pub file: Option<FileRef>,
+    /// How `file` was tied to the recording.
+    pub file_match: Option<FileMatch>,
     /// Headers reached by a forward search instead of at the exact expected place.
     pub resyncs: u64,
 }
+
+/// How a recording was tied to its directory entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileMatch {
+    /// The entry's first cluster is where the recording starts.
+    FirstCluster,
+    /// The entry points nowhere useful (usually a 0-byte entry with no cluster), but the start
+    /// time in its Canon name, or else its creation time, equals the time of day of the
+    /// recording's first timecode within [`START_TIME_TOLERANCE`] seconds. Only a match that is
+    /// unique both ways counts.
+    StartTime,
+}
+
+/// Seconds a name or entry time may differ from the start timecode and still match.
+pub const START_TIME_TOLERANCE: f64 = 2.0;
 
 /// A file-system entry matched to a finding.
 #[derive(Clone, Debug, Serialize)]
@@ -246,7 +264,8 @@ pub struct DatHint {
     pub size: u64,
     pub deleted: bool,
     pub data_offset: Option<u64>,
-    /// Offset of the recording found at that place.
+    /// Offset of the recording this entry belongs to: the one found at `data_offset`, or one
+    /// matched by its start time ([`FileMatch::StartTime`]).
     pub recording: Option<u64>,
 }
 
@@ -1168,6 +1187,7 @@ fn finish<R: ReadAt + ?Sized>(
         partial: w.partial.take(),
         overlaps_clips: Vec::new(),
         file: None,
+        file_match: None,
         resyncs: w.resyncs,
     };
     if let Ok(index) = repi::walk(&view, &mut |_| true) {
@@ -1310,6 +1330,7 @@ pub fn scan<R: ReadAt + Sync + ?Sized>(
             .filter(|e| !e.deleted && e.size > 0)
             .map(|e| e.size);
         let mut rec = finish(&f, w, start, true, known);
+        rec.file_match = file.as_ref().map(|_| FileMatch::FirstCluster);
         rec.file = file;
         on_event(&ScanEvent::Found {
             what: Found::Recording,
@@ -1357,21 +1378,37 @@ pub fn scan<R: ReadAt + Sync + ?Sized>(
     }
 
     // `.DAT` directory entries and what is at their first cluster.
-    let mut dat_entries = Vec::new();
-    for v in &volumes {
-        for e in v.entries.iter().filter(|e| e.is_dat()) {
-            let found = e
+    let dat_dir: Vec<&DirEntry> = volumes
+        .iter()
+        .flat_map(|v| &v.entries)
+        .filter(|e| e.is_dat())
+        .collect();
+    let mut dat_entries: Vec<DatHint> = dat_dir
+        .iter()
+        .map(|e| DatHint {
+            path: e.path.clone(),
+            size: e.size,
+            deleted: e.deleted,
+            data_offset: e.data_offset,
+            recording: e
                 .data_offset
                 .and_then(|o| recordings.iter().find(|r| r.offset == o))
-                .map(|r| r.offset);
-            dat_entries.push(DatHint {
-                path: e.path.clone(),
-                size: e.size,
-                deleted: e.deleted,
-                data_offset: e.data_offset,
-                recording: found,
-            });
-        }
+                .map(|r| r.offset),
+        })
+        .collect();
+    // Entries that point nowhere (0-byte entries) may still be named by their start time.
+    for (ri, ei) in match_by_start_time(&recordings, &dat_dir, &dat_entries) {
+        let e = dat_dir[ei];
+        let rec = &mut recordings[ri];
+        rec.file = Some(FileRef {
+            path: e.path.clone(),
+            size: e.size,
+            deleted: e.deleted,
+            created: e.created,
+            modified: e.modified,
+        });
+        rec.file_match = Some(FileMatch::StartTime);
+        dat_entries[ei].recording = Some(rec.offset);
     }
     for h in &dat_entries {
         if h.recording.is_none() && h.data_offset.is_some() {
@@ -1409,6 +1446,81 @@ pub fn scan<R: ReadAt + Sync + ?Sized>(
         seconds: t0.elapsed().as_secs_f64(),
         notes,
     })
+}
+
+/// Seconds after midnight from a Canon file name with a date and time, such as
+/// `A_0001C809H241214_1422235Q_LAD04.DAT` (`H` + `YYMMDD_HHMMSS`). `None` for names without
+/// one (`LAD12345.DAT`).
+pub fn name_time_of_day(path: &str) -> Option<u32> {
+    let name = path.rsplit('/').next()?.as_bytes();
+    (0..name.len().saturating_sub(13)).find_map(|i| {
+        let w = &name[i..i + 14];
+        let digits = |r: std::ops::Range<usize>| w[r].iter().all(u8::is_ascii_digit);
+        if w[0] != b'H' || w[7] != b'_' || !digits(1..7) || !digits(8..14) {
+            return None;
+        }
+        let n = |a: usize| (w[a] - b'0') as u32 * 10 + (w[a + 1] - b'0') as u32;
+        let (h, m, s) = (n(8), n(10), n(12));
+        (h < 24 && m < 60 && s < 60).then_some(h * 3600 + m * 60 + s)
+    })
+}
+
+/// Time of day (seconds after midnight) the recording's first timecode stands for.
+fn start_time_of_day(rec: &Recovered) -> Option<f64> {
+    let fps = rec.frame_rate.filter(|f| *f > 0.0)?;
+    Some((rec.start_timecode? as f64 / fps).rem_euclid(86_400.0))
+}
+
+/// Time of day an entry says its recording started: from the Canon name, else its creation
+/// time.
+fn entry_time_of_day(e: &DirEntry) -> Option<f64> {
+    name_time_of_day(&e.path)
+        .map(f64::from)
+        .or_else(|| e.created.map(|t| t.local.rem_euclid(86_400) as f64))
+}
+
+fn same_time_of_day(a: f64, b: f64) -> bool {
+    let d = (a - b).rem_euclid(86_400.0);
+    d.min(86_400.0 - d) <= START_TIME_TOLERANCE
+}
+
+/// Pairs (recording index, entry index) of unnamed recordings and unplaced `.DAT` entries whose
+/// start times agree. A pair counts only when neither side matches anything else.
+fn match_by_start_time(
+    recordings: &[Recovered],
+    entries: &[&DirEntry],
+    hints: &[DatHint],
+) -> Vec<(usize, usize)> {
+    let open_recs: Vec<(usize, f64)> = recordings
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.file.is_none())
+        .filter_map(|(i, r)| Some((i, start_time_of_day(r)?)))
+        .collect();
+    let open_entries: Vec<(usize, f64)> = entries
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| hints[*i].recording.is_none())
+        .filter_map(|(i, e)| Some((i, entry_time_of_day(e)?)))
+        .collect();
+    let mut pairs = Vec::new();
+    for &(ri, rt) in &open_recs {
+        let mut hits = open_entries
+            .iter()
+            .filter(|(_, et)| same_time_of_day(rt, *et));
+        let (Some(&(ei, et)), None) = (hits.next(), hits.next()) else {
+            continue;
+        };
+        if open_recs
+            .iter()
+            .filter(|(_, t)| same_time_of_day(*t, et))
+            .count()
+            == 1
+        {
+            pairs.push((ri, ei));
+        }
+    }
+    pairs
 }
 
 /// Copies a recovered stream into a new `.DAT` file. Never overwrites: the output must not
@@ -1515,8 +1627,8 @@ pub fn reference_candidates<'a>(
     v
 }
 
-/// File name for a recovered stream: the original `.DAT` name when a directory entry points
-/// at it (`LAD12345.DAT`), else `recovered_<offset>.DAT`. A deleted FAT32 short name has lost
+/// File name for a recovered stream: the original `.DAT` name when a directory entry belongs
+/// to it (see [`Recovered::file`] and [`FileMatch`]), else `recovered_<offset>.DAT`. A deleted FAT32 short name has lost
 /// its first letter (`_AD12345.DAT`); it is kept as it is.
 pub fn recovered_name(rec: &Recovered) -> PathBuf {
     original_name(rec)

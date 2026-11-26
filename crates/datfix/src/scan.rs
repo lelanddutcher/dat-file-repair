@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use datfix_core::carve::{
-    self, FinishedClip, ImageSource, Recovered, ScanEvent, ScanOptions, ScanPhase, ScanReport,
-    StreamEnd,
+    self, FileMatch, FinishedClip, ImageSource, Recovered, ScanEvent, ScanOptions, ScanPhase,
+    ScanReport, StreamEnd,
 };
 use datfix_core::repair::{self, ReferenceSource, RepairOptions};
 
@@ -301,6 +301,9 @@ fn print_report(image: &Path, r: &ScanReport) {
                 h.size,
                 if h.deleted { ", deleted" } else { "" },
                 match (h.recording, h.data_offset) {
+                    (Some(o), d) if d != Some(o) => {
+                        format!("recording at byte {o} (matched by start time)")
+                    }
                     (Some(o), _) => format!("recording at byte {o}"),
                     (None, Some(o)) => format!("nothing found at byte {o}"),
                     (None, None) => "no start cluster recorded".into(),
@@ -320,6 +323,8 @@ fn print_recovered(rec: &Recovered, label: &str) {
             f.path,
             if f.deleted {
                 " (deleted)"
+            } else if rec.file_match == Some(FileMatch::StartTime) {
+                " (0-byte entry, matched by start time)"
             } else if f.size == 0 {
                 " (0-byte entry)"
             } else {
