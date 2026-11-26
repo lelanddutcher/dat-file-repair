@@ -463,6 +463,7 @@ function renderFiles(): HTMLElement {
   );
   return h("section", { class: "card", "aria-labelledby": "files-h" }, [
     h("h2", { id: "files-h" }, [h("span", { class: "step" }, "1"), "Your .DAT file" + (state.items.length > 1 ? "s" : "")]),
+    renderCardNote(),
     zone,
     empty
       ? h("p", { class: "hint" }, [
@@ -471,7 +472,6 @@ function renderFiles(): HTMLElement {
           " and DATfix will find every .DAT on it.",
         ])
       : h("ul", { class: "items", "aria-label": "Files to repair" }, state.items.map(renderItem)),
-    renderCardNote(),
     empty
       ? h("div", { class: "card-entry" }, [
           h("p", { class: "small" }, "Is the .DAT file 0 bytes, missing or deleted? The video may still be on the memory card."),
@@ -1052,7 +1052,7 @@ let devPauseMs = 0;
 async function devScreen(name: string) {
   if (!devPauseMs) return;
   render();
-  await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 150)));
+  await new Promise((r) => setTimeout(r, 150));
   await api.devReport(JSON.stringify({ screen: name }));
   await new Promise((r) => setTimeout(r, devPauseMs));
 }
@@ -1110,7 +1110,8 @@ async function devCardRun(cfg: DevCardRun) {
   if (card.screen === "scanning") await devScreen("scanning");
   await scanning;
   await devScreen("results");
-  for (const id of ["clips", "fragments"]) (document.getElementById(id) as HTMLDetailsElement | null)?.setAttribute("open", "");
+  card.open.add("clips");
+  card.open.add("fragments");
   window.scrollTo(0, document.body.scrollHeight);
   await devScreen("results-bottom");
   const summary = {

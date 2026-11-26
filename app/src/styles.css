@@ -712,6 +712,11 @@ details.group > summary {
   margin: 6px 0 0;
 }
 
+.plain-list button {
+  white-space: nowrap;
+  flex: none;
+}
+
 .plain-list li {
   display: flex;
   justify-content: space-between;
@@ -735,7 +740,9 @@ details.group > summary {
 }
 
 .card-note {
-  margin: 14px 0 0;
+  margin: 0 0 12px;
+  background: var(--accent-soft);
+  border-left-color: var(--accent);
 }
 
 .card-note p {

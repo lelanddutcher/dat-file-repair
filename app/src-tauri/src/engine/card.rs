@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use datfix_core::Error as CoreError;
 use datfix_core::carve::{
-    self, FinishedClip, Found, FsKind, ImageSource, Recovered, ScanEvent, ScanOptions, ScanPhase,
-    ScanReport, StreamEnd,
+    self, DatHint, FinishedClip, Found, FsKind, ImageSource, Recovered, ScanEvent, ScanOptions,
+    ScanPhase, ScanReport, StreamEnd,
 };
 use datfix_core::read_at::ReadAt;
 use serde::Serialize;
@@ -394,7 +394,8 @@ fn describe(image: &Path, r: &ScanReport, src: &ImageSource) -> CardScanView {
 }
 
 fn recording_view(r: &ScanReport, rec: &Recovered) -> RecordingView {
-    let badge = rec.file.as_ref().and_then(|f| {
+    let entry = card_entry(r, rec);
+    let badge = entry.as_ref().and_then(|f| {
         if f.deleted {
             Some("deleted")
         } else if f.size == 0 {
@@ -403,7 +404,7 @@ fn recording_view(r: &ScanReport, rec: &Recovered) -> RecordingView {
             None
         }
     });
-    let card_path = rec.file.as_ref().map(|f| f.path.clone());
+    let card_path = entry.as_ref().map(|f| f.path.clone());
     let end = match rec.end {
         StreamEnd::DatUnit => "ends at a 32 MiB unit, like the camera's .DAT",
         StreamEnd::LastGroup => "ends after the last complete group",
@@ -445,6 +446,15 @@ fn recording_view(r: &ScanReport, rec: &Recovered) -> RecordingView {
     }
     if !rec.has_dat_header {
         details.push("headerless: no .DAT start leads here".into());
+    }
+    if rec.file.is_none()
+        && let Some(e) = &entry
+    {
+        details.push(format!(
+            "named after the file entry {} ({} bytes): its name's time matches the recording's \
+             start timecode",
+            e.path, e.size
+        ));
     }
     RecordingView {
         offset: rec.offset,
@@ -545,7 +555,7 @@ pub fn prepare_repair(
                 format!("Copying recording {} of {n} from the card", i + 1)
             },
         });
-        let path = recording_path(out_dir, rec);
+        let path = recording_path(out_dir, r, rec);
         let mut forward = progress_forwarder(on_progress);
         match carve::extract(&session.src, rec, &path, &opts, &mut |ev| {
             if !matches!(ev, ScanEvent::Phase { .. }) {
@@ -651,7 +661,7 @@ pub fn save_item(
                 .ok_or_else(not_found)?;
             check_space(out_dir, rec.length)?;
             let path = if rec.has_dat_header {
-                recording_path(out_dir, rec)
+                recording_path(out_dir, r, rec)
             } else {
                 unique_path(out_dir, &format!("fragment_{}", rec.offset), ".DAT")
             };
@@ -663,11 +673,76 @@ pub fn save_item(
     Ok(path)
 }
 
+/// The card's file entry for a recording: the one whose first cluster points at it, or else a
+/// `.DAT` entry the scan could not place (usually a 0-byte entry with no cluster) whose name
+/// holds the time the recording's timecode starts at.
+fn card_entry(r: &ScanReport, rec: &Recovered) -> Option<EntryRef> {
+    if let Some(f) = &rec.file {
+        return Some(EntryRef {
+            path: f.path.clone(),
+            size: f.size,
+            deleted: f.deleted,
+        });
+    }
+    let starts = |rec: &Recovered| -> Option<f64> {
+        Some(rec.start_timecode? as f64 / rec.frame_rate.filter(|f| *f > 0.0)?)
+    };
+    let matches = |h: &DatHint, rec: &Recovered| -> bool {
+        match (name_time(&h.path), starts(rec)) {
+            (Some(t), Some(s)) => {
+                let d = (s - t as f64).rem_euclid(86_400.0);
+                d.min(86_400.0 - d) <= 2.0
+            }
+            _ => false,
+        }
+    };
+    let mut hits = r
+        .dat_entries
+        .iter()
+        .filter(|h| h.recording.is_none() && matches(h, rec));
+    let hit = hits.next()?;
+    // Only a single, unambiguous match names the recording.
+    if hits.next().is_some()
+        || r.recordings
+            .iter()
+            .filter(|o| o.file.is_none() && matches(hit, o))
+            .count()
+            != 1
+    {
+        return None;
+    }
+    Some(EntryRef {
+        path: hit.path.clone(),
+        size: hit.size,
+        deleted: hit.deleted,
+    })
+}
+
+struct EntryRef {
+    path: String,
+    size: u64,
+    deleted: bool,
+}
+
+/// Seconds after midnight from a Canon file name with a date and time, such as
+/// `A_0001C809H241214_1422235Q_LAD04.DAT` (`H` + `YYMMDD_HHMMSS`).
+fn name_time(path: &str) -> Option<u32> {
+    let name = path.rsplit('/').next()?.as_bytes();
+    (0..name.len().saturating_sub(13)).find_map(|i| {
+        let w = &name[i..i + 14];
+        let digits = |r: std::ops::Range<usize>| w[r].iter().all(u8::is_ascii_digit);
+        if w[0] != b'H' || w[7] != b'_' || !digits(1..7) || !digits(8..14) {
+            return None;
+        }
+        let n = |a: usize| (w[a] - b'0') as u32 * 10 + (w[a + 1] - b'0') as u32;
+        let (h, m, s) = (n(8), n(10), n(12));
+        (h < 24 && m < 60 && s < 60).then_some(h * 3600 + m * 60 + s)
+    })
+}
+
 /// `<card name>.DAT` when the card's file list names it, else `recovered_<offset>.DAT`.
-fn recording_path(dir: &Path, rec: &Recovered) -> PathBuf {
-    let stem = rec
-        .file
-        .as_ref()
+fn recording_path(dir: &Path, r: &ScanReport, rec: &Recovered) -> PathBuf {
+    let stem = card_entry(r, rec)
         .and_then(|f| safe_stem(&f.path))
         .unwrap_or_else(|| format!("recovered_{}", rec.offset));
     unique_path(dir, &stem, ".DAT")
@@ -809,12 +884,8 @@ pub fn list_cards() -> Vec<CardDevice> {
     let boot = diskutil_info("/")
         .and_then(|v| v["ParentWholeDisk"].as_str().map(String::from))
         .unwrap_or_default();
-    let Ok(entries) = std::fs::read_dir("/Volumes") else {
-        return Vec::new();
-    };
     let mut out: Vec<CardDevice> = Vec::new();
-    for e in entries.filter_map(Result::ok) {
-        let mount = e.path();
+    for mount in local_volumes() {
         if file_name(&mount).starts_with('.') {
             continue;
         }
@@ -829,9 +900,11 @@ pub fn list_cards() -> Vec<CardDevice> {
         }
         let flag = |k: &str| info[k].as_bool().unwrap_or(false);
         let looks_like_camera_card = CARD_MARKERS.iter().any(|m| mount.join(m).is_dir());
-        // Only removable media (card readers) and anything holding camera folders. A big
-        // external work disk is not offered.
-        if !(looks_like_camera_card || flag("RemovableMedia")) {
+        // Cameras format cards as exFAT or FAT32. Only removable media (card readers) and
+        // anything holding camera folders count; a backup drive or a system disk image does not.
+        let fs_type = info["FilesystemType"].as_str().unwrap_or("");
+        let camera_format = matches!(fs_type, "exfat" | "msdos");
+        if !camera_format || !(looks_like_camera_card || flag("RemovableMedia")) {
             continue;
         }
         let whole = diskutil_info(&disk);
@@ -865,6 +938,24 @@ pub fn list_cards() -> Vec<CardDevice> {
 #[cfg(not(target_os = "macos"))]
 pub fn list_cards() -> Vec<CardDevice> {
     Vec::new()
+}
+
+/// Mount points under `/Volumes` of local disks (`/dev/disk…`), from `mount`. Network shares
+/// are skipped without touching them: `diskutil info` on a slow SMB share can take minutes.
+#[cfg(target_os = "macos")]
+fn local_volumes() -> Vec<PathBuf> {
+    let Ok(out) = std::process::Command::new("/sbin/mount").output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.starts_with("/dev/disk"))
+        .filter_map(|l| {
+            let (_, rest) = l.split_once(" on ")?;
+            let (mount, _) = rest.rsplit_once(" (")?;
+            mount.starts_with("/Volumes/").then(|| PathBuf::from(mount))
+        })
+        .collect()
 }
 
 /// `diskutil info -plist <what>` as JSON (converted with `plutil`, so no plist crate is needed).
@@ -1201,6 +1292,16 @@ mod tests {
             unique_path(dir.path(), "A", ".DAT"),
             dir.path().join("A (2).DAT")
         );
+    }
+
+    #[test]
+    fn times_in_canon_names() {
+        assert_eq!(
+            name_time("/XFVC/CLIPS001/A_0001C809H241214_1422235Q_LAD04.DAT"),
+            Some(14 * 3600 + 22 * 60 + 23)
+        );
+        assert_eq!(name_time("/DCIM/100EOSR5/LAD12345.DAT"), None);
+        assert_eq!(name_time("H241214_996060"), None);
     }
 
     #[cfg(unix)]

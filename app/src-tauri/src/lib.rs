@@ -42,6 +42,12 @@ pub fn run() {
                 Ok("light") => window.set_theme(Some(tauri::Theme::Light))?,
                 _ => {}
             }
+            // Test hook: keep a script-driven window in front, so the web view keeps drawing
+            // (macOS stops painting hidden windows) and screenshots show the current screen.
+            if std::env::var_os("DATFIX_DEV_AUTORUN").is_some() {
+                window.set_always_on_top(true)?;
+                let _ = window.set_focus();
+            }
             Ok(())
         })
         .on_window_event(|window, event| {

@@ -69,6 +69,8 @@ export const card = {
   /** Per-item save results for clips and fragments, by offset. */
   saved: new Map<number, string>(),
   saving: null as number | null,
+  /** Sections the person opened ("clips", "fragments"); kept across re-renders. */
+  open: new Set<string>(),
 };
 
 let host: Host;
@@ -94,6 +96,7 @@ export function openCard(opts: { lookingFor?: string; hintPath?: string; image?:
     saved: new Map(),
   });
   card.chosen = new Set();
+  card.open = new Set();
   host.render();
   window.scrollTo(0, 0);
   void loadCards();
@@ -484,8 +487,8 @@ function renderResults(s: CardScanView): HTMLElement[] {
     n > 0 ? h("ul", { class: "items", "aria-label": "Recordings found" }, s.recordings.map((r) => renderRecording(r))) : null,
   ]);
   const extras = h("section", { class: "card", "aria-label": "Other things found" }, [
-    renderClips(s.clips),
-    renderFragments(s.fragments),
+    s.clips.length ? renderClips(s.clips) : null,
+    s.fragments.length ? renderFragments(s.fragments) : null,
     host.detailsBox(s.details),
     h("div", { class: "row" }, [
       h("button", { id: "card-again", type: "button", onclick: () => openCard({ lookingFor: card.lookingFor ?? undefined, hintPath: card.hintPath ?? undefined }) }, "Search another card"),
@@ -547,7 +550,7 @@ function renderRecording(r: RecordingView): HTMLElement {
       fact("Camera", r.camera ? (r.frameRate ? `${r.camera}, ${r.frameRate} frames per second` : r.camera) : "Canon (model unknown)"),
       fact("Size", fmt.bytes(r.sizeBytes)),
       fact("On the card", r.pieces > 1 ? `Joined from ${r.pieces} pieces` : "In one piece"),
-      fact("Settings", r.references > 0 ? `From ${plural(r.references, "finished clip")} on the same card, else built-in` : "DATfix's built-in settings"),
+      fact("Video settings", r.references > 0 ? "Copied from a finished clip on the same card (or DATfix's built-in settings if none matches)" : "DATfix's built-in settings for this camera"),
     ]),
     warnings.some(Boolean) ? h("ul", { class: "warn-list small" }, warnings) : null,
     host.detailsBox(r.details),
@@ -566,7 +569,7 @@ function sentence(t: string) {
 
 function renderClips(clips: ClipView[]): HTMLElement {
   const deleted = clips.filter((c) => c.deleted).length;
-  return h("details", { class: "group", id: "clips" }, [
+  return group("clips", [
     h("summary", {}, `Finished clips on the card (${clips.length}${deleted ? `, ${deleted} deleted` : ""})`),
     clips.length === 0
       ? h("p", { class: "muted small" }, "None found.")
@@ -592,7 +595,7 @@ function renderClips(clips: ClipView[]): HTMLElement {
 }
 
 function renderFragments(frags: RecordingView[]): HTMLElement {
-  return h("details", { class: "group", id: "fragments" }, [
+  return group("fragments", [
     h("summary", {}, `Pieces without a start (${frags.length})`),
     frags.length === 0
       ? h("p", { class: "muted small" }, "None found.")
@@ -613,6 +616,23 @@ function renderFragments(frags: RecordingView[]): HTMLElement {
           ),
         ]),
   ]);
+}
+
+/** A collapsed section that stays open across re-renders once opened. */
+export function group(id: string, children: Child): HTMLElement {
+  return h(
+    "details",
+    {
+      class: "group",
+      id,
+      open: card.open.has(id),
+      ontoggle: (ev: Event) => {
+        if ((ev.target as HTMLDetailsElement).open) card.open.add(id);
+        else card.open.delete(id);
+      },
+    },
+    children,
+  );
 }
 
 function saveButton(kind: "clip" | "fragment", offset: number): Child {
