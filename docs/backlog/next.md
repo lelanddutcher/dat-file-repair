@@ -11,3 +11,11 @@ Queued while `feat/hardening` and `feat/card-carve` own `crates/`.
    records; document limits.
 3. **Error text** for layout failures must not tell the user to pick another reference when the engine is at fault.
 4. **AAC synthesis** for hybrid references (no corpus DAT needs it yet).
+5. **Carved recordings get the scan time as "recorded" time.** Pass the directory-entry timestamp or
+   original `.DAT` name from `carve` into repair.
+
+# App backlog
+
+1. **"Recover from card" flow** for `datfix scan` (see the UI suggestions in `docs/format/card-carving.md`
+   and the card-carve agent's report): offer it on the `EmptyDat` error and as its own action; image the
+   card first; live progress and results; "Repair all" using the card's own clips as references.
