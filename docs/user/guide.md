@@ -9,7 +9,8 @@ This guide covers:
 2. [Repair with the app](#repair-with-the-app)
 3. [Repair with the command line](#repair-with-the-command-line)
 4. [Recover a 0-byte or missing `.DAT`](#recover-a-0-byte-or-missing-dat)
-5. [Troubleshooting](#troubleshooting)
+5. [The recording date](#the-recording-date)
+6. [Troubleshooting](#troubleshooting)
 
 ## Before you start
 
@@ -29,7 +30,10 @@ camera's normal clips, for example `LAD12345.DAT` or `A_0012C345H250101_120000AB
 
 Open DATfix. Drop the `.DAT` file into the window, or click the drop zone and choose it.
 
-![The DATfix window with an empty drop zone](img/01-drop-zone.png)
+![The DATfix window with an empty drop zone and a "Recover from a memory card" button](img/01-drop-zone.png)
+
+If the `.DAT` is 0 bytes, missing or deleted, click **Recover from a memory card…** instead. See
+[Recover a 0-byte or missing `.DAT`](#recover-a-0-byte-or-missing-dat).
 
 You can add several `.DAT` files at once. To repair everything on a card, click
 **Choose the card folder** under the drop zone. DATfix finds every `.DAT` on it.
@@ -42,7 +46,22 @@ DATfix reads the file. For a large file this takes up to a minute. It then shows
 - **Cut off at the end**: "Yes" means the camera stopped in the middle of a group. DATfix leaves
   out that unfinished last moment, which is under one second.
 
-![The file summary after DATfix read a .DAT](img/02-file-summary.png)
+![The file summary after DATfix read a .DAT: camera, contents, size, cut off at the end](img/02-file-summary.png)
+
+### Advanced options
+
+Each file has an **Advanced** section under its summary. Most people never need it.
+
+- **Rotate**: turns the picture when it plays. Use it for a clip filmed with the camera on its
+  side. Choose **90° clockwise**, **180°** or **90° counter-clockwise (270°)**. **None** keeps the
+  orientation of the reference clip (upright with the built-in settings). Only a display flag is
+  written; the video itself is not changed, so an editor can still undo it.
+- **Keep the reference clip's camera metadata**: off by default. A healthy clip used for the video
+  settings also holds its own thumbnail, camera and lens serial numbers, owner, dates and location.
+  These describe that other recording, so DATfix leaves them out. Turn this on only if you need
+  them in the repaired file.
+
+![The Advanced section with Rotate set to 90° clockwise](img/06-advanced.png)
 
 ### 2. Video settings
 
@@ -54,7 +73,7 @@ The step shows which source it chose, for example
 "Using DATfix's built-in settings for your camera. No clip needed." or
 "Using the clip you chose: LAD12344.MP4."
 
-![The Video settings step showing built-in settings](img/03-video-settings.png)
+![The Video settings step: "Using built-in settings for Canon EOS R5 Mark II, 4K 119.88p"](img/03-video-settings.png)
 
 To choose yourself:
 
@@ -79,12 +98,20 @@ Press **Repair**. The progress bar shows the three steps: checking the settings,
 frames and writing the repaired video. You can stop at any time. A stopped repair leaves no partial
 file behind.
 
-![A repair in progress](img/04-progress.png)
+![A repair in progress: step 2 of 3, reading the video frames](img/04-progress.png)
 
 When it finishes, DATfix shows "Your video is repaired." and the recovered length. Click
 **Show in Finder** (macOS) or **Show in Explorer** (Windows) to find the file.
 
-![The finished screen](img/05-done.png)
+Open **Details** under the result to see:
+
+- the recording time written into the file, and where it came from (see
+  [The recording date](#the-recording-date));
+- the rotation, when you chose one;
+- what DATfix left out from the reference clip for privacy;
+- technical notes, for example how much of an unfinished last moment was dropped.
+
+![The finished screen with Details open](img/05-done.png)
 
 ### Leftover files from a stopped repair
 
@@ -122,6 +149,9 @@ first tries the clips in the `.DAT`'s own folder, then its built-in settings.
 | `--builtin` | Use the built-in settings only. |
 | `-o, --output <file>` | Where to write the MP4. |
 | `--force` | Replace the output file if it exists. |
+| `--rotate <degrees>` | Turn the picture clockwise when it plays: 0, 90, 180 or 270. Default: the reference clip's orientation (upright with the built-in settings). |
+| `--keep-reference-metadata` | Copy the reference clip's own metadata (thumbnail, serial numbers, owner, dates, location). Off by default. |
+| `--stop-on-read-error` | Stop at the first unreadable part of a failing card instead of skipping it. |
 
 Examples:
 
@@ -149,17 +179,49 @@ datfix clean ~/Movies --yes   # delete them
 ## Recover a 0-byte or missing `.DAT`
 
 A `.DAT` of 0 bytes holds no video, and some cards show no `.DAT` at all after a cut. The
-recording is often still on the card, outside any file. `datfix scan` finds it by its content.
-This feature is in the command line only for now.
+recording is often still on the card, outside any file. DATfix can search the whole card and find
+it by its content. The app and the command line (`datfix scan`) do the same search.
 
 ### 1. Stop using the card
 
 Do not record on it, format it, or let the computer or camera "repair" it. Each write can overwrite
 your video.
 
-### 2. Make a raw image of the card
+### 2. Search the card with the app
 
-The scan only reads, but an image protects you if the card fails during a second read.
+Click **Recover from a memory card…** on the first screen. If you added a 0-byte `.DAT`, DATfix
+shows "This .DAT file is empty" with a **Scan the memory card for this recording…** button; it
+opens the same screens and tells you which file it is looking for.
+
+![The "This .DAT file is empty" message with the Scan the memory card button](img/07-empty-dat.png)
+
+Choose how to read the card:
+
+- **Choose a card image** (recommended): a raw image you already made (`.img`, `.dmg`, `.dd`).
+- **Make an image of the card**: DATfix copies the whole card into one file on your computer,
+  then searches the copy. Nothing is written to the card. On a Mac this asks for your password,
+  because only administrators may read a whole card.
+- **Scan the card directly (advanced)**: faster, but the card is read again for every scan.
+
+![The Recover from a memory card screen](img/08-card-choose.png)
+
+DATfix lists each recording it finds: the name it had on the card (when the card's file list
+still knows it), a badge such as **Deleted** or **0-byte file on the card**, the camera, the length
+and whether it is in one piece. Choose where to save, then press **Repair all**. DATfix copies
+each recording off the card into that folder, repairs it with the normal flow, and uses finished
+clips from the same card for the video settings when they fit.
+
+![Scan results: a 0-byte recording and a deleted recording, ready to repair](img/09-card-results.png)
+
+A recording keeps its original name, also when its card entry has 0 bytes: DATfix matches the
+entry by the start time in its name (or its creation time) against the recording's timecode. The
+repaired video then gets its date from that name or from the card's file list, not from the time
+of the scan.
+
+### 3. Or use the command line
+
+Make a raw image first. The scan only reads, but an image protects you if the card fails during a
+second read.
 
 **macOS, Disk Utility:**
 
@@ -185,13 +247,16 @@ device such as `\\.\PhysicalDrive2`. Save a raw image (`.img`), not a compressed
 **Linux:** `sudo dd if=/dev/sdX of=card.img bs=4M status=progress conv=noerror,sync`. For a
 failing card, use `ddrescue`.
 
-### 3. Scan the image
+Then scan the image:
 
 ```sh
 datfix scan card.img                          # report only
-datfix scan card.img -o recovered             # save recovered_<offset>.DAT files
+datfix scan card.img -o recovered             # save each recording as a .DAT
 datfix scan card.img -o recovered --repair    # also repair each one to an MP4
 ```
+
+Saved recordings keep their name from the card (`LAD12345.DAT`) when it is known. Otherwise, or
+when two recordings would get the same name, they are named `recovered_<offset>.DAT`.
 
 `--repair` uses finished clips from the same card as references, then the built-in settings.
 
@@ -205,12 +270,28 @@ datfix scan card.img -o recovered --repair    # also repair each one to an MP4
 
 The scan finds a recording only while its data has not been overwritten. It cannot find recordings
 from the EOS R or M50 Mark II. It reads raw images and exFAT/FAT32 cards; convert a compressed
-`.dmg` first with `hdiutil convert -format UDTO in.dmg -o out`. The repaired file's date is the scan
-time; the timecode still has the time of day. Full details:
+`.dmg` first with `hdiutil convert -format UDTO in.dmg -o out`. Full details:
 [card scanning](../format/card-carving.md).
 
-Another free option is [PhotoRec](https://www.cgsecurity.org). Open the `.DAT` or `.MP4` files it
-finds in DATfix.
+If DATfix finds nothing, a general recovery tool such as [PhotoRec](https://www.cgsecurity.org)
+may still help. Open the `.DAT` or `.MP4` files it finds in DATfix.
+
+## The recording date
+
+A repaired file carries the time the recording started, so editors and photo apps sort it
+correctly. A `.DAT` holds no date of its own, so DATfix takes it from the first of these that it
+has. The result's **Details** (and the command line's `recorded:` line) say which one:
+
+| Details says | Where the time comes from |
+|---|---|
+| Recording time from the file name | A Canon file name that holds the date and time, such as `A_0002D054H241221_134042C0.DAT` (21 December 2024, 13:40:42). |
+| Recording time from the memory card's list of files | Card recovery only: the time the camera created the file, from the card's file list. |
+| Recording time from the camera's timecode, with the date from the file's date | The timecode gives the time of day; the `.DAT`'s own file date gives the day. |
+| Recording time estimated from the file's date | The time the `.DAT` was last saved, minus the recording's length. |
+| Recording time unknown | Nothing gives a time. Set the date in your editor. |
+
+A camera with a wrong clock, or a timecode preset to another value, gives a wrong date. A `.DAT`
+copied with a tool that does not keep file dates also loses the day. Fix the date in your editor.
 
 ## Troubleshooting
 
@@ -220,7 +301,16 @@ technical text for a bug report. The command line prints the same words.
 ### This .DAT file is empty
 
 The `.DAT` holds no recording data. The camera created the file but never saved the video into it.
-Follow [Recover a 0-byte or missing `.DAT`](#recover-a-0-byte-or-missing-dat).
+Click **Scan the memory card for this recording…** and follow
+[Recover a 0-byte or missing `.DAT`](#recover-a-0-byte-or-missing-dat).
+
+### DATfix can't read this recording yet
+
+The video settings fit, but the camera arranged the video inside the `.DAT` in a way DATfix does
+not understand yet. This is a gap in DATfix, not a problem with your clip, so another clip will not
+help. Keep the `.DAT` unchanged. Click **Report this recording…** (or open the
+[report form](https://github.com/lelanddutcher/dat-file-repair/issues/new?template=unreadable-recording.yml))
+and paste the text from **Copy details**.
 
 ### This file can't be repaired
 
@@ -321,8 +411,7 @@ This is a bug. Click **Copy details** and paste the text into a
 
 ### The repaired file shows the wrong date
 
-DATfix dates the file from, in order: the date in the Canon file name, the card's directory entry
-(card recovery only), the timecode, and the file's own time. The report's "date source" line says
-which one it used. A camera whose clock or timecode was set wrong gives a wrong date; fix it in
-your editor. DATfix never copies the reference clip's thumbnail, serial numbers or location unless
-you pass `--keep-reference-metadata`.
+See [The recording date](#the-recording-date) for where the date comes from. **Details** under the
+result says which source DATfix used. DATfix never copies the reference clip's dates, thumbnail,
+serial numbers or location unless you turn on **Keep the reference clip's camera metadata** (or
+pass `--keep-reference-metadata`).

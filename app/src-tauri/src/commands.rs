@@ -257,6 +257,12 @@ pub async fn repair_dat(
     // The index read when the file was added; the engine checks it still fits the file.
     let index = state.cached_index(&dat);
     let (cancel, _guard) = state.start_job(&job);
+    // Test hook: DATFIX_DEV_SLOW_MS pauses after each progress step, so the progress screen of
+    // a small test file can be seen and captured. Unset in normal use.
+    let slow = std::env::var("DATFIX_DEV_SLOW_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis);
     background(move || {
         engine::repair(
             &dat,
@@ -267,7 +273,11 @@ pub async fn repair_dat(
             hint,
             cancel,
             &mut |p| {
+                let step = matches!(p, Progress::Step { .. });
                 let _ = progress.send(p);
+                if let Some(d) = slow.filter(|_| step) {
+                    std::thread::sleep(d);
+                }
             },
         )
     })

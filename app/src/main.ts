@@ -1120,6 +1120,8 @@ async function devAutorun() {
     if (cfg.keepReferenceMetadata) i.choices.keepReferenceMetadata = true;
     if (cfg.openAdvanced) state.open.add(`advanced-${i.id}`);
   }
+  render();
+  if (cfg.scrollY) window.scrollTo(0, cfg.scrollY);
   await devScreen("ready");
   const report = () =>
     api.devReport(
@@ -1144,13 +1146,16 @@ async function devAutorun() {
         })),
       ),
     );
-  if (cfg.scrollY) window.scrollTo(0, cfg.scrollY);
   if (cfg.repair === false) {
     await report();
     return;
   }
   if (cfg.cancelAfterMs) setTimeout(() => void cancelRepair(), cfg.cancelAfterMs);
   const done = repairAll();
+  if (devPauseMs) {
+    await until(() => !state.repairing || state.items.some((i) => i.run.status === "running" && (i.run.done ?? 0) > 0), 60_000);
+    if (state.repairing) await devScreen("repairing");
+  }
   if (cfg.cleanPartials) {
     // Wait for the offer to appear, then accept it.
     for (let i = 0; i < 50 && state.partials.length === 0 && !state.partialsNote; i++) await new Promise((r) => setTimeout(r, 100));

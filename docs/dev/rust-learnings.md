@@ -582,3 +582,40 @@ read/write image with an MBR partition, like an SD card. Attach, copy a corpus `
 camera clip from the same body, then delete the `.DAT` (deleted entry) or truncate it with
 `: > file` (0-byte entry), and detach. Use a camera original as the neighbour clip: one corpus
 "neighbour" MP4 turned out to be an AV1 transcode (`ftyp isom`), which the scan rightly ignores.
+
+## Final integration (2026-11-26)
+
+### One matching rule, in the engine
+
+- The app had its own "0-byte entry ↔ recording" matching (Canon name time vs. first timecode).
+  Moving it into `carve::scan` as `Recovered::file` + `file_match: start_time` made the CLI,
+  `recovered_name` and `hint_for` pick it up with no other change. When two front ends need the
+  same rule, put it where both already read the result.
+- A match must be unique both ways: one entry for the recording, and one open recording for the
+  entry. Checking only one side named two copies of the same recording after one entry.
+- The match also accepts the entry's creation time when the name has no time (`LAD12345.DAT`).
+
+### Passing engine data through the page
+
+- `RecordingHint` derives `Serialize` and `Deserialize`, so the app sends it to the page with
+  each prepared card recording and the page hands it back to `repair_dat` unchanged. No
+  server-side map keyed by path, and nothing to go stale.
+- `Rotation` serializes as a plain number (`#[serde(into = "u32", try_from = "u32")]`), so
+  `rotation: 90 | null` from TypeScript deserializes straight into `Option<Rotation>`.
+- Opening a web page from the app needs `opener:allow-open-url` with a URL scope in
+  `capabilities/default.json`. The scope is a glob; `*` also covers the `?template=…` query.
+
+### Test hooks added
+
+- `DATFIX_DEV_AUTORUN` (main flow) also takes `rotation`, `keepReferenceMetadata`,
+  `openAdvanced` and `pauseMs`. With `pauseMs` it announces `ready`, `repairing`, `done` and
+  `done-bottom` screens, like the card flow.
+- `DATFIX_DEV_SLOW_MS=20` pauses after each repair progress step, so the progress screen of the
+  64 MB test sample can be captured.
+
+### exFAT time zones written by macOS
+
+A card image written by macOS (Mac at UTC-05:00) stored the creation time as 02:33 with a zone
+byte of UTC+05:00 for a file created at 16:33 local. The UTC instant (21:33) is right, but the
+zone is not the Mac's. A Canon name time combined with that zone is off by twice the zone. Test
+dates on macOS-written images against the UTC instant, not the zone.
