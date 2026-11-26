@@ -193,11 +193,11 @@ pub fn map_tracks(index: &DatIndex, reference: &Reference) -> Result<Mapping, Ve
         }
         if candidates.is_empty() {
             let what = match kind {
-                TrackKind::Video => "a video track",
-                TrackKind::PcmAudio => "a PCM audio track",
-                TrackKind::CompressedAudio => "an AAC audio track",
-                TrackKind::Timecode => "a timecode track",
-                _ => "a Canon metadata track",
+                TrackKind::Video => "video track",
+                TrackKind::PcmAudio => "PCM audio track",
+                TrackKind::CompressedAudio => "AAC audio track",
+                TrackKind::Timecode => "timecode track",
+                _ => "Canon metadata track",
             };
             if kind == TrackKind::Video
                 || kind == TrackKind::PcmAudio

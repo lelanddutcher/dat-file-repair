@@ -187,7 +187,14 @@ impl DatIndex {
         let mut run = 0u32;
         let mut prev: Option<FourCC> = None;
         for g in &self.groups {
-            run = if prev == Some(g.kind) { run + 1 } else { 1 };
+            // A run counts only once another type ends it; a video-only file has no runs.
+            if prev != Some(g.kind) {
+                if let Some(p) = prev.and_then(|p| out.iter().position(|s| s.kind == p)) {
+                    out[p].streams = out[p].streams.max(run);
+                }
+                run = 0;
+            }
+            run += 1;
             prev = Some(g.kind);
             let i = match out.iter().position(|s| s.kind == g.kind) {
                 Some(i) => i,
@@ -208,7 +215,6 @@ impl DatIndex {
                 *counts[i].entry(g.declared).or_default() += 1;
             }
             out[i].align = out[i].align.max(g.align);
-            out[i].streams = out[i].streams.max(run);
         }
         for (s, c) in out.iter_mut().zip(counts) {
             s.typical_samples = c
@@ -673,6 +679,33 @@ pub(crate) mod tests {
         assert!(offs[1..].iter().all(|o| o % 16 == 0));
         assert_eq!(g.declared_end(), d.len() as u64);
         assert!(idx.truncation.is_none());
+    }
+
+    #[test]
+    fn shapes_count_streams_per_interval() {
+        let mut d = dat_header();
+        for _ in 0..3 {
+            d.extend(group_bytes(b"tmcd", 4, &[4; 6]));
+            for _ in 0..4 {
+                d.extend(group_bytes(b"lpcm", 3, &[3; 10]));
+            }
+            d.extend(group_bytes(b"vide", 0, &[10; 6]));
+        }
+        let shapes = walk(&d, &mut no_progress()).unwrap().shapes();
+        let kinds: Vec<String> = shapes.iter().map(|s| s.kind.to_string()).collect();
+        assert_eq!(kinds, ["tmcd", "lpcm", "vide"]);
+        assert_eq!(shapes[1].streams, 4);
+        assert_eq!(shapes[1].typical_samples, 10);
+        assert_eq!(shapes[2].streams, 1);
+
+        // Video only: consecutive groups are one stream, not many.
+        let mut d = dat_header();
+        for _ in 0..5 {
+            d.extend(group_bytes(b"vide", 0, &[10; 15]));
+        }
+        let shapes = walk(&d, &mut no_progress()).unwrap().shapes();
+        assert_eq!(shapes[0].streams, 1);
+        assert_eq!(shapes[0].typical_samples, 15);
     }
 
     #[test]

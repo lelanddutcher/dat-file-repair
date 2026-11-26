@@ -358,15 +358,21 @@ pub fn repair(
     check_output(dat, output, opts)?;
     let src = FileSource::open(dat)
         .map_err(|e| Error::io(format!("cannot open {}", dat.display()), e))?;
+    // Open a single reference first so a typo fails before a long index walk.
+    let given = match reference {
+        ReferenceSource::File(p) => Some(Reference::open(p)?),
+        ReferenceSource::Dir(_) => None,
+    };
     let index = index_dat(&src, opts, on_event)?;
 
     on_event(&Event::Phase {
         phase: Phase::CheckingReference,
         message: "checking the reference clip".into(),
     });
-    let checked = match reference {
-        ReferenceSource::File(p) => check_reference(&src, &index, Reference::open(p)?)?,
-        ReferenceSource::Dir(d) => choose_reference(&src, &index, d, on_event)?,
+    let checked = match (given, reference) {
+        (Some(r), _) => check_reference(&src, &index, r)?,
+        (None, ReferenceSource::Dir(d)) => choose_reference(&src, &index, d, on_event)?,
+        (None, ReferenceSource::File(_)) => unreachable!("opened above"),
     };
     let Checked {
         reference,
