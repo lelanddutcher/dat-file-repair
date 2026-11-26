@@ -321,3 +321,7 @@ Notes from moving the desktop app onto the reference-free engine.
   players dropped a frame. Use `shift_frames × sample_delta` for video always.
 - **`count_frames` on 4K ALL-I files decodes every frame.** Checking a few GB takes minutes;
   run it in the background.
+- **The `.dmg` step fails in a session without Finder automation rights.** `bundle_dmg.sh`
+  runs an AppleScript that lays out the Finder window. Without permission it fails and leaves
+  `bundle/macos/rw.*.dmg`. `CI=true cargo tauri build --target universal-apple-darwin` skips
+  that script; the `.dmg` is plain but valid (`hdiutil verify`).
