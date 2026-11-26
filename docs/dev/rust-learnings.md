@@ -475,3 +475,48 @@ Notes from making the engine survive hostile input and hostile environments.
   indentation. Check generated string literals for runs of spaces.
 - Adding a field to a public struct breaks callers that build it with a literal. Give new
   option structs `Default` and tell callers to use `..Default::default()`.
+
+## Releasing
+
+### What the release workflow is
+
+A GitHub Actions workflow (`release`) builds every file the README "Download" table lists. It
+runs on GitHub's servers, never on a developer's Mac. It starts automatically when someone pushes
+a tag named `v<version>` (for example `v0.2.0`). A maintainer can also start it by hand
+("Run workflow" in the Actions tab, or `gh workflow run release.yml`) as a dry run.
+
+Jobs:
+
+1. `version` (Linux) works out `<v>`. On a tag, `<v>` is the tag without the `v`, and the job
+   fails unless the Tauri app version, `app/package.json` and the `datfix`, `datfix-core` and
+   `datfix-app` crates all equal `<v>`. `tauri.conf.json` has no `version` field, so the app
+   version is the workspace version in `Cargo.toml`. On a dry run, `<v>` is
+   `0.0.0-dev+<short sha>`; only file names carry it, the binaries keep the `Cargo.toml` version
+   (WiX refuses a non-numeric pre-release in an MSI version).
+2. `build` (one macOS and one Windows runner). Each builds the Tauri app, then the CLI with
+   `cargo build --release --locked -p datfix --target ...`. The universal app build already
+   compiled `datfix-core` for both Mac architectures, so the CLI build only adds the CLI crate
+   and `clap`. Each runner renames its files to the README names.
+3. `release` (Linux) checks that all five README files exist, writes `SHA256SUMS.txt`, and
+   uploads everything as the run artifact `datfix-release-<v>`. On a tag only, it creates a
+   **draft** GitHub Release. The notes come from `.github/workflows/release-notes.md` plus the
+   camera table copied from the README. A human edits "Changes" and presses Publish.
+
+### To cut a release
+
+1. Set `version` in `[workspace.package]` (`Cargo.toml`) and in `app/package.json`. Run
+   `cargo build` so `Cargo.lock` follows. Commit to `main`.
+2. `git tag v<version> && git push origin v<version>`.
+3. Wait for the `release` run (about 10 minutes). Open the draft release, edit "Changes",
+   publish.
+
+### Gotchas met
+
+- **`workflow_dispatch` only works once the workflow file is on the default branch.** Before
+  that, `gh workflow run --ref <branch>` returns HTTP 404. To test a new workflow on a branch,
+  add a temporary `push: branches: [<branch>]` trigger and remove it before merging.
+- GitHub sets `CI=true`, so the `.dmg` step skips the Finder layout script (see "App on engine
+  v2"). The dmg is plain but valid.
+- The CLI archives are flat: `datfix` (or `datfix.exe`), `README.md`, `LICENSE`. A user runs
+  `./datfix` right after extracting.
+- Check a download: `shasum -a 256 -c SHA256SUMS.txt --ignore-missing`.

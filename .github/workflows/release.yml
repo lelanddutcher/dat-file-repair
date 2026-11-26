@@ -1,0 +1,255 @@
+# Builds every DATfix release asset that the README promises.
+#
+#   DATfix_<v>_macos_universal.dmg               desktop app, Apple silicon + Intel
+#   DATfix_<v>_windows_x64-setup.exe             desktop app installer (NSIS)
+#   DATfix_<v>_windows_x64_en-US.msi             desktop app installer (MSI), extra
+#   datfix-cli-<v>-aarch64-apple-darwin.tar.gz   CLI + README.md + LICENSE
+#   datfix-cli-<v>-x86_64-apple-darwin.tar.gz
+#   datfix-cli-<v>-x86_64-pc-windows-msvc.zip
+#   SHA256SUMS.txt                               checksum of every file above
+#
+# Triggers:
+#   - Tag `v*` (for example v0.2.0): <v> = tag without the "v". The job fails fast unless the
+#     app and crate versions equal <v>. The assets go to a DRAFT GitHub Release; a human
+#     reviews the notes and presses Publish.
+#   - workflow_dispatch (dry run): <v> = 0.0.0-dev+<short sha>. Only the file names carry <v>;
+#     the binaries keep the version in Cargo.toml. Assets are uploaded as the run artifact
+#     `datfix-release-<v>`. No release is created.
+#
+# Signing is off until certificates exist. The commented `env` block in the "Build desktop app"
+# step lists the secrets to add (see docs/dev/rust-learnings.md, "Signing and notarization").
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Work out the version and check it matches the tag
+        id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            # tauri.conf.json has no "version" field today, so Tauri uses the crate version.
+            tauri_version="$(jq -r '.version // empty' app/src-tauri/tauri.conf.json)"
+            [[ -n "$tauri_version" ]] || tauri_version="$(cargo metadata --no-deps --format-version 1 \
+              | jq -r '.packages[] | select(.name == "datfix-app") | .version')"
+            fail=0
+            check() {
+              if [[ "$2" != "$version" ]]; then
+                echo "::error::$1 version is '$2', but the tag says '$version'"; fail=1
+              else
+                echo "$1 version $2 matches the tag"
+              fi
+            }
+            check "Tauri app (app/src-tauri/tauri.conf.json)" "$tauri_version"
+            check "app/package.json" "$(jq -r .version app/package.json)"
+            for crate in datfix datfix-core datfix-app; do
+              check "crate $crate" "$(cargo metadata --no-deps --format-version 1 \
+                | jq -r --arg n "$crate" '.packages[] | select(.name == $n) | .version')"
+            done
+            if (( fail )); then
+              echo "::error::Bump the versions (Cargo.toml [workspace.package], app/package.json) or fix the tag."
+              exit 1
+            fi
+          else
+            version="0.0.0-dev+$(git rev-parse --short=7 HEAD)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Release version: $version"
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            # One universal app for Apple silicon and Intel Macs. The universal build compiles
+            # both architectures, so the CLI for each one reuses those compiled dependencies.
+            app-target: universal-apple-darwin
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+            cli-targets: aarch64-apple-darwin x86_64-apple-darwin
+          - os: windows-latest
+            app-target: x86_64-pc-windows-msvc
+            rust-targets: x86_64-pc-windows-msvc
+            cli-targets: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.app-target }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install web dependencies
+        working-directory: app
+        run: npm ci
+
+      # GitHub sets CI=true, which makes Tauri skip the Finder layout script in the .dmg step
+      # (it needs Finder automation rights). The .dmg is plain but valid.
+      - name: Build desktop app
+        working-directory: app
+        run: npx tauri build --target ${{ matrix.app-target }}
+        # To sign and notarize, uncomment this block and add the repository secrets.
+        # env:
+        #   # macOS signing and notarization
+        #   APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}            # base64 .p12
+        #   APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        #   APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}  # "Developer ID Application: ..."
+        #   APPLE_ID: ${{ secrets.APPLE_ID }}
+        #   APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}                  # app-specific password
+        #   APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        #   # Windows: set bundle.windows.certificateThumbprint (or signCommand) in
+        #   # tauri.conf.json and import the certificate in a step before this one.
+
+      - name: Build command-line tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          for t in ${{ matrix.cli-targets }}; do args+=(--target "$t"); done
+          cargo build --release --locked -p datfix "${args[@]}"
+
+      - name: Collect and rename assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          one() {  # exactly one file must match, or the build is wrong
+            # shellcheck disable=SC2206  # $1 is a glob on purpose
+            local matches=( $1 )
+            if [[ ${#matches[@]} -ne 1 || ! -f "${matches[0]}" ]]; then
+              echo "::error::expected one file for '$1', found: ${matches[*]}" >&2; exit 1
+            fi
+            echo "${matches[0]}"
+          }
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            cp "$(one 'target/universal-apple-darwin/release/bundle/dmg/DATfix_*_universal.dmg')" \
+              "dist/DATfix_${VERSION}_macos_universal.dmg"
+            for t in ${{ matrix.cli-targets }}; do
+              stage="$RUNNER_TEMP/cli-$t"
+              mkdir -p "$stage"
+              cp "target/$t/release/datfix" README.md LICENSE "$stage/"
+              tar -czf "dist/datfix-cli-${VERSION}-$t.tar.gz" -C "$stage" datfix README.md LICENSE
+            done
+          else
+            bundle=target/x86_64-pc-windows-msvc/release/bundle
+            cp "$(one "$bundle/nsis/DATfix_*_x64-setup.exe")" "dist/DATfix_${VERSION}_windows_x64-setup.exe"
+            cp "$(one "$bundle/msi/DATfix_*_x64_en-US.msi")" "dist/DATfix_${VERSION}_windows_x64_en-US.msi"
+            t=x86_64-pc-windows-msvc
+            stage="$RUNNER_TEMP/cli-$t"
+            mkdir -p "$stage"
+            cp "target/$t/release/datfix.exe" README.md LICENSE "$stage/"
+            (cd "$stage" && 7z a -tzip -bd "$GITHUB_WORKSPACE/dist/datfix-cli-${VERSION}-$t.zip" datfix.exe README.md LICENSE)
+          fi
+          ls -l dist
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: bundle-${{ matrix.app-target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 3
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # only used on a tag, to create the draft release
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: bundle-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check names and write SHA256SUMS.txt
+        shell: bash
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          for f in \
+            "DATfix_${VERSION}_macos_universal.dmg" \
+            "DATfix_${VERSION}_windows_x64-setup.exe" \
+            "datfix-cli-${VERSION}-aarch64-apple-darwin.tar.gz" \
+            "datfix-cli-${VERSION}-x86_64-apple-darwin.tar.gz" \
+            "datfix-cli-${VERSION}-x86_64-pc-windows-msvc.zip"; do
+            [[ -s "$f" ]] || { echo "::error::missing asset $f"; exit 1; }
+          done
+          sha256sum -- * | LC_ALL=C sort -k2 > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+          ls -l
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: datfix-release-${{ env.VERSION }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Write release notes
+        shell: bash
+        run: |
+          python3 -I - "$VERSION" "${GITHUB_REF_NAME}" <<'PY'
+          import re, sys
+          version, tag = sys.argv[1], sys.argv[2]
+          readme = open("README.md", encoding="utf-8").read()
+          # The camera table from the README's "Supported cameras" section.
+          section = readme.split("## Supported cameras", 1)[1].split("\n## ", 1)[0]
+          table = "\n".join(l for l in section.splitlines() if l.startswith("|"))
+          if not table:
+              sys.exit("README.md has no Supported cameras table")
+          notes = open(".github/workflows/release-notes.md", encoding="utf-8").read()
+          notes = (notes.replace("{{VERSION}}", version)
+                        .replace("{{TAG}}", tag)
+                        .replace("{{CAMERAS}}", "## Supported cameras\n\n" + table))
+          open("release-notes.md", "w", encoding="utf-8").write(notes)
+          PY
+          cat release-notes.md
+
+      - name: Create draft GitHub Release
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --verify-tag \
+            --title "DATfix $VERSION" \
+            --notes-file release-notes.md
