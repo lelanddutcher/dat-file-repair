@@ -1,6 +1,15 @@
 # DAT file repair — plan
 
-Status: **draft, awaiting green light.** Nothing is built yet beyond two research scripts in `tools/`.
+Status (2026-11-26): **green-lit; M0, M1, M2 done; M3 and M4 in progress.**
+
+- Engine + CLI (`crates/`): repairs all 36 corpus `.DAT`s (R3, R5, R5 II), with a user clip, a hybrid
+  clip, or the built-in profile bank (no clip needed). Mid-file damage keeps A/V sync.
+- Desktop app (`app/`, Tauri): one-window flow, batch, cancel, universal macOS `.dmg` (7 MB).
+  Windows bundle configured in CI, not yet run.
+- In progress: hardening + full-corpus regression, card-image carving (`datfix scan`),
+  editing-app compatibility (QuickTime/Resolve/Premiere).
+- Waiting on Leland: final name (recommended DATfix), public repo, Windows CI run.
+- License: MIT.
 
 ## Goal
 
