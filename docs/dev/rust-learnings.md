@@ -277,3 +277,47 @@ Notes from adding the profile bank, hybrid references and damage handling.
   `let Err(e) = ... else { panic!() };` instead of deriving `Debug` everywhere.
 - Shell: `scp` with a remote path in escaped quotes fails under the SFTP protocol ("No such
   file"). `ssh host "cat \"$path\"" > file` works.
+
+## App on engine v2
+
+Notes from moving the desktop app onto the reference-free engine.
+
+### API shape that worked for a GUI
+
+- **Two texts per error.** `Error`'s `Display` stays technical (paths, offsets, codec names).
+  `Error::user_message()` returns a title, a message, a next step and plain reasons. The CLI
+  prints the user message first and the technical text under `details:`; the app shows the
+  technical text behind a "Details" disclosure. One source of words keeps the CLI and the app
+  saying the same thing.
+- **Reasons are pairs.** A clip that does not fit gets a `Reason { user, detail }`. Producing
+  both where the check happens is easier than translating jargon afterwards with string
+  matching.
+- **Search returns verdicts, not just a winner.** `search_references` lists every clip it
+  checked (fits, video only, skipped + reason) and the chosen one. The app shows "N clips
+  checked" with a reason per clip, and the fallback note ("None of the 4 clips in the folder
+  “100CANON” matches this file") comes from the same data.
+- **Reuse the index.** `RepairOptions::index` takes the index `inspect_with` returned. A 38 GB
+  file's walk takes about 40 s; the app reads it once when the file is added. The engine
+  ignores a cached index whose file size no longer matches the file.
+- **Stale temp files.** A killed repair leaves `.<name>.datfix-partial`. A running repair writes
+  continuously, so "not modified for 60 s" separates a dead file from a live one.
+  `remove_partials` refuses any name that is not a temp-file name.
+
+### Gotchas met
+
+- **`window.set_theme()` does not reach the page on macOS.** It changes the title bar, but
+  WKWebView's `prefers-color-scheme` keeps following the system. Force the page theme with a
+  `data-theme` attribute on `<html>` and write the dark tokens twice:
+  `@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {…} }` and
+  `:root[data-theme="dark"] {…}`.
+- **Testing system light mode.** `osascript -e 'tell application "System Events" to tell
+  appearance preferences to set dark mode to false'` switches the whole Mac; set it back
+  afterwards.
+- **A drive root is not a camera card.** Treating every `/Volumes/<disk>` as a card made a
+  `.DAT` on a 14 TB work disk scan the whole disk. Only folders with `DCIM`, `XFVC`,
+  `PRIVATE` or `CONTENTS` count as a card.
+- **The video edit list must come from the rebuilt tables.** Copying the reference's `elst`
+  media time onto an All-Intra repair (no reordering) shifted playback by one frame, and
+  players dropped a frame. Use `shift_frames × sample_delta` for video always.
+- **`count_frames` on 4K ALL-I files decodes every frame.** Checking a few GB takes minutes;
+  run it in the background.
