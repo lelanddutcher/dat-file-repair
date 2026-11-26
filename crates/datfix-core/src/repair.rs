@@ -790,6 +790,7 @@ fn write_plan<R: ReadAt + ?Sized>(
     opts: &RepairOptions,
     on_event: &mut dyn FnMut(&Event),
 ) -> Result<u64> {
+    src.sequential_hint(true);
     let mut throttle = Throttle::new();
     let written = writer::write_file(
         tmp,
@@ -851,6 +852,8 @@ pub fn repair_from<R: ReadAt>(
 ) -> Result<RepairReport> {
     check_output(dat, output, opts)?;
     let src = Tolerant::new(source, !opts.stop_on_read_error);
+    // Index walk and frame analysis read small scattered pieces.
+    src.sequential_hint(false);
     classify_input(dat, &src).map_err(|e| unreadable_error(&src, e))?;
     let out_dir = volume::parent_dir(output);
     // Fail before a long index walk: a folder that can't be written, or a drive that can't
@@ -922,6 +925,7 @@ pub fn repair_from<R: ReadAt>(
             copy_offset: plan.payload_offset(),
         };
         let index = exclude_unreadable(index, &src.bad_regions());
+        overlay.sequential_hint(false);
         on_event(&Event::Note {
             message: format!(
                 "{} unreadable region(s) found while copying; rebuilding the tables around them",

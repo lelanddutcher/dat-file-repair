@@ -34,6 +34,11 @@ pub trait ReadAt {
         Ok(())
     }
 
+    /// Tells the source whether reads will be large and sequential (`true`, the payload copy)
+    /// or small and scattered (`false`, index walk and frame analysis). Sources that cannot
+    /// use the hint ignore it.
+    fn sequential_hint(&self, _sequential: bool) {}
+
     /// Reads exactly `len` bytes at `offset` into a new vector.
     fn read_vec(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         let mut v = vec![0u8; len];
@@ -91,6 +96,26 @@ impl FileSource {
 impl ReadAt for FileSource {
     fn size(&self) -> u64 {
         self.len
+    }
+
+    /// On macOS, turns the kernel's read-ahead off for scattered reads. Each small header
+    /// read on an SMB share otherwise pulls a large read-ahead block over the network; the
+    /// index walk of a cold 1.7 GB file took 9.0 s with read-ahead and 5.5 s without.
+    fn sequential_hint(&self, sequential: bool) {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: plain fcntl on an open descriptor; failure only loses the speed-up.
+            unsafe {
+                libc::fcntl(
+                    self.file.as_raw_fd(),
+                    libc::F_RDAHEAD,
+                    sequential as libc::c_int,
+                )
+            };
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = sequential;
     }
 
     #[cfg(unix)]
@@ -278,6 +303,10 @@ impl<R: ReadAt> ReadAt for Tolerant<R> {
         self.inner.size()
     }
 
+    fn sequential_hint(&self, sequential: bool) {
+        self.inner.sequential_hint(sequential)
+    }
+
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         if !self.skip {
             return self.inner.read_at(buf, offset);
@@ -329,6 +358,9 @@ impl<R: ReadAt + ?Sized> ReadAt for &R {
     fn size(&self) -> u64 {
         (**self).size()
     }
+    fn sequential_hint(&self, sequential: bool) {
+        (**self).sequential_hint(sequential)
+    }
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         (**self).read_at(buf, offset)
     }
@@ -349,6 +381,11 @@ pub struct Overlay<'a, R: ?Sized> {
 impl<R: ReadAt + ?Sized> ReadAt for Overlay<'_, R> {
     fn size(&self) -> u64 {
         self.base.size()
+    }
+
+    fn sequential_hint(&self, sequential: bool) {
+        self.base.sequential_hint(sequential);
+        self.copy.sequential_hint(sequential);
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {

@@ -8,7 +8,7 @@ use serde::Serialize;
 use crate::error::{Error, Result};
 use crate::fourcc::FourCC;
 use crate::layout::{self, DatLayout};
-use crate::read_at::{FileSource, Tolerant};
+use crate::read_at::{FileSource, ReadAt, Tolerant};
 use crate::repair::{Event, RepairOptions, classify_input, index_dat, not_a_dat};
 use crate::repi::{DatIndex, Truncation};
 
@@ -197,6 +197,7 @@ pub fn inspect_with(
     let file = FileSource::open(path)
         .map_err(|e| Error::io(format!("cannot open {}", path.display()), e))?;
     let src = Tolerant::new(file, !opts.stop_on_read_error);
+    src.sequential_hint(false);
     classify_input(path, &src)?;
     let index = index_dat(&src, opts, on_event).map_err(|e| not_a_dat(path, &src, e))?;
     if index.groups.is_empty() {

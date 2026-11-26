@@ -308,6 +308,8 @@ pub fn walk_window<R: ReadAt + ?Sized>(
     // `last_end` is where the previous group ended; the scan starts there.
     let mut last_end = start;
     let mut scan_from = start;
+    // Alignment seen per stream: (type, alignment, groups in a row that agreed).
+    let mut aligns: Vec<(FourCC, u32, u32)> = Vec::new();
     while index.groups.len() < max_groups {
         let until = last_end.saturating_add(max_gap).min(len);
         let Some(at) = find_magic(src, scan_from, until).map_err(io)? else {
@@ -317,7 +319,23 @@ pub fn walk_window<R: ReadAt + ?Sized>(
         match read_header(src, at).map_err(io)? {
             HeaderResult::Valid(mut g) => {
                 if g.fixed_size == 0 && g.declared >= 2 {
-                    g.align = detect_alignment(src, &g).map_err(io)?;
+                    // Once full checks of two groups agree on a stream's alignment, later
+                    // groups only confirm it on a few samples. A full check reads every NAL
+                    // length of up to 128 frames; over a network share that cost ~15 ms per
+                    // group.
+                    let known = aligns
+                        .iter()
+                        .find(|(k, _, n)| *k == g.kind && *n >= 2)
+                        .map(|&(_, a, _)| a);
+                    g.align = match known {
+                        Some(a) if confirm_alignment(src, &g, a).map_err(io)? => a,
+                        _ => detect_alignment(src, &g).map_err(io)?,
+                    };
+                    match aligns.iter_mut().find(|(k, _, _)| *k == g.kind) {
+                        Some(e) if e.1 == g.align => e.2 += 1,
+                        Some(e) => *e = (g.kind, g.align, 1),
+                        None => aligns.push((g.kind, g.align, 1)),
+                    }
                 }
                 // The first gap (before the first group) is the file header, not a gap.
                 if at > last_end && !index.groups.is_empty() {
@@ -469,6 +487,30 @@ fn detect_alignment<R: ReadAt + ?Sized>(src: &R, g: &Group) -> std::io::Result<u
         }
     }
     Ok(1)
+}
+
+/// Checks a known alignment on a few samples: the first two, one in the middle and the last
+/// two complete ones. A wrong alignment shifts every later sample, so the last ones catch it.
+fn confirm_alignment<R: ReadAt + ?Sized>(src: &R, g: &Group, align: u32) -> std::io::Result<bool> {
+    let len = src.size();
+    let n = g.declared as usize;
+    let mut picks = [0, 1, n / 2, n.saturating_sub(2), n - 1];
+    picks.sort_unstable();
+    let mut off = g.data_offset();
+    let mut checked = 0;
+    for (i, &size) in g.sizes.iter().enumerate() {
+        if off + size as u64 > len {
+            break;
+        }
+        if picks.contains(&i) {
+            if !nal_chain_fits(src, off, size)? {
+                return Ok(false);
+            }
+            checked += 1;
+        }
+        off += align_up(size as u64, align);
+    }
+    Ok(checked >= 2)
 }
 
 /// True when the 4-byte NAL length prefixes starting at `off` add up to exactly `size`.
@@ -708,6 +750,35 @@ pub(crate) mod tests {
         // The group ends after the last sample's padding.
         assert_eq!(g.declared_end(), d.len() as u64);
         assert!(idx.truncation.is_none());
+    }
+
+    /// A variable-size group whose samples are single NAL units, each padded to `align`.
+    fn nal_group(d: &mut Vec<u8>, sizes: &[u32], align: usize) {
+        let start = d.len();
+        d.extend(&group_bytes(b"vide", 0, sizes)[..20 + 4 * sizes.len()]);
+        let base = d.len();
+        for &s in sizes {
+            d.extend(nal_sample(s));
+            while (d.len() - base) % align != 0 {
+                d.push(0xee);
+            }
+        }
+        assert!(d.len() > start);
+    }
+
+    #[test]
+    fn known_alignment_is_confirmed_cheaply_and_rechecked_on_change() {
+        let sizes = [29u32, 30, 45, 17, 33, 61, 12, 90];
+        let mut d = dat_header();
+        for _ in 0..4 {
+            nal_group(&mut d, &sizes, 8);
+        }
+        // The camera switched to packed samples (another body or mode mid-file).
+        nal_group(&mut d, &sizes, 1);
+        let idx = walk(&d, &mut no_progress()).unwrap();
+        let aligns: Vec<u32> = idx.groups.iter().map(|g| g.align).collect();
+        assert_eq!(aligns, [8, 8, 8, 8, 1]);
+        assert_eq!(idx.groups[4].declared_end(), d.len() as u64);
     }
 
     #[test]
