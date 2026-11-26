@@ -319,8 +319,10 @@ You stopped the repair. No partial file was left. Press **Repair** to start agai
 This is a bug. Click **Copy details** and paste the text into a
 [bug report](https://github.com/lelanddutcher/dat-file-repair/issues/new/choose).
 
-### The repaired file shows the wrong thumbnail, date or location
+### The repaired file shows the wrong date
 
-Known limitation. DATfix copies the Canon metadata block from the reference clip, so the thumbnail,
-lens, serial number, dates and GPS come from that clip. A fix is planned. The video, audio and
-timecode come from your `.DAT`.
+DATfix dates the file from, in order: the date in the Canon file name, the card's directory entry
+(card recovery only), the timecode, and the file's own time. The report's "date source" line says
+which one it used. A camera whose clock or timecode was set wrong gives a wrong date; fix it in
+your editor. DATfix never copies the reference clip's thumbnail, serial numbers or location unless
+you pass `--keep-reference-metadata`.

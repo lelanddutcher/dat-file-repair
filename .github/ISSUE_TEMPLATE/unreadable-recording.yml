@@ -1,0 +1,64 @@
+name: Recording layout DATfix cannot read
+description: DATfix said the settings fit but it cannot read this recording's layout yet ("Please report it").
+title: "[layout] <model>, <recording mode>"
+labels: ["layout-not-supported"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you. Your report helps DATfix support more cameras.
+        Keep your `.DAT` unchanged until the issue is closed. Do not attach video files here.
+  - type: input
+    id: camera
+    attributes:
+      label: Camera model
+      placeholder: EOS R6 Mark II
+    validations:
+      required: true
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware version
+      placeholder: "1.3.1 (Menu > Set-up > Firmware)"
+    validations:
+      required: true
+  - type: textarea
+    id: settings
+    attributes:
+      label: Recording settings
+      description: Codec, resolution, frame rate, compression (All-I or Long GOP), audio format, and any special mode (HDR PQ, Canon Log, high frame rate, proxy).
+      placeholder: HEVC, 4K UHD, 59.94p, Long GOP, 10-bit, LPCM audio
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: How the recording was cut off, and what DATfix showed. Paste the app's "Copy details" text or the command's output.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: inspect
+    attributes:
+      label: Output of `datfix inspect --json <file>.DAT`
+      description: This lists the streams and sample counts. It holds no video.
+      render: json
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: DATfix version and operating system
+      placeholder: DATfix 0.1.0, macOS 26.1
+  - type: dropdown
+    id: sample
+    attributes:
+      label: Can you share a sample?
+      description: The .DAT and one healthy .MP4 from the same camera and mode. A short clip is enough. We will agree a private way to send it, and use it only to test DATfix.
+      options:
+        - Yes, the .DAT and a healthy clip
+        - Yes, but only a healthy clip
+        - No
+    validations:
+      required: true

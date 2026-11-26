@@ -146,9 +146,10 @@ Details: [Canon `.DAT` format](docs/format/canon-dat-format.md) ·
 
 DATfix runs on your computer. It never uploads your files and works without an internet connection.
 
-Known limitation: a repaired file currently carries the Canon camera-metadata block of the
-reference clip, including its thumbnail, lens, serial number, dates and GPS location. Check this
-before you share a repaired file that used someone else's clip. A fix is planned.
+A repaired file does not carry another clip's identity. DATfix copies only the settings a player
+needs from the reference clip. It leaves out that clip's thumbnail, lens, serial numbers, dates and
+location, and takes the camera model and recording date from your `.DAT`. To keep the reference
+clip's Canon metadata instead, use `--keep-reference-metadata`.
 
 ## FAQ
 
