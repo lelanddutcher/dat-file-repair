@@ -104,6 +104,88 @@ export function asAppError(e: unknown): AppError {
   };
 }
 
+// ---------------------------------------------------------------------------------------------
+// Recover from a memory card (src-tauri/src/engine/card.rs)
+// ---------------------------------------------------------------------------------------------
+
+export type CardProgress =
+  | { type: "stage"; label: string }
+  | { type: "step"; done: number; total: number }
+  | { type: "found"; what: "recording" | "clip" | "fragment"; offset: number; length: number };
+
+export interface RecordingView {
+  /** Byte position on the card; identifies the recording. */
+  offset: number;
+  sizeBytes: number;
+  camera: string | null;
+  durationSeconds: number | null;
+  videoFrames: number;
+  frameRate: string | null;
+  fileName: string | null;
+  cardPath: string | null;
+  badge: "deleted" | "empty" | null;
+  pieces: number;
+  mayBeIncomplete: string | null;
+  overlapsClip: boolean;
+  references: number;
+  details: string;
+}
+
+export interface ClipView {
+  offset: number;
+  sizeBytes: number;
+  camera: string | null;
+  durationSeconds: number | null;
+  fileName: string | null;
+  deleted: boolean;
+  complete: boolean;
+}
+
+export interface CardScanView {
+  image: string;
+  imageName: string;
+  sizeBytes: number;
+  isDevice: boolean;
+  seconds: number;
+  fileSystem: string | null;
+  recordings: RecordingView[];
+  fragments: RecordingView[];
+  clips: ClipView[];
+  notes: string[];
+  details: string;
+}
+
+export interface PreparedCard {
+  recordings: { offset: number; dat: string | null; error: AppError | null }[];
+  clipsDir: string | null;
+  clips: number;
+}
+
+export interface CardDevice {
+  name: string;
+  mountPoint: string;
+  device: string;
+  rawDevice: string;
+  sizeBytes: number;
+  fileSystem: string;
+  looksLikeCameraCard: boolean;
+  readable: boolean;
+}
+
+const cardChannel = (onProgress: (p: CardProgress) => void) => new Channel<CardProgress>(onProgress);
+
+export const cardApi = {
+  listCards: () => invoke<CardDevice[]>("list_cards"),
+  imageCard: (job: string, device: string, outDir: string, onProgress: (p: CardProgress) => void) =>
+    invoke<string>("image_card", { job, device, outDir, progress: cardChannel(onProgress) }),
+  scanCard: (job: string, image: string, onProgress: (p: CardProgress) => void) =>
+    invoke<CardScanView>("scan_card", { job, image, progress: cardChannel(onProgress) }),
+  prepareRepair: (job: string, offsets: number[], outDir: string, onProgress: (p: CardProgress) => void) =>
+    invoke<PreparedCard>("card_prepare_repair", { job, offsets, outDir, progress: cardChannel(onProgress) }),
+  save: (job: string, kind: "clip" | "fragment", offset: number, outDir: string, onProgress: (p: CardProgress) => void) =>
+    invoke<string>("card_save", { job, kind, offset, outDir, progress: cardChannel(onProgress) }),
+};
+
 const channel = (onProgress?: (p: Progress) => void) =>
   new Channel<Progress>(onProgress ?? (() => {}));
 
@@ -143,4 +225,25 @@ export interface DevAutorun {
   cancelAfterMs?: number;
   /** Scroll the page down this many pixels once ready (for screenshots). */
   scrollY?: number;
+  /** Drive the "Recover from a memory card" flow instead (see card.ts). */
+  card?: DevCardRun;
+}
+
+export interface DevCardRun {
+  /** A card image to scan. */
+  image?: string;
+  /** Or: a disk ("disk6") to image into `imageDir` first, or to scan directly with `direct`. */
+  device?: string;
+  imageDir?: string;
+  direct?: boolean;
+  /** Drop this (0-byte) .DAT first and enter the flow from its error. */
+  fromEmptyDat?: string;
+  /** Folder for the copies and repaired videos. */
+  outDir?: string;
+  /** Press "Repair all" (default true). */
+  repair?: boolean;
+  /** Press Cancel this many milliseconds after the scan starts. */
+  cancelAfterMs?: number;
+  /** Wait this long on each screen, after announcing it, so a script can take a screenshot. */
+  pauseMs?: number;
 }

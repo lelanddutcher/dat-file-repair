@@ -532,3 +532,212 @@ details.tech pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* Recover from a memory card */
+
+.card-entry {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+}
+
+.card-entry p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.back-row {
+  margin: 0 0 -6px;
+}
+
+.looking {
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--accent-soft);
+}
+
+.options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  text-align: left;
+  padding: 12px 14px;
+  border-radius: 10px;
+}
+
+.option.selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.option-title {
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.option-text {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.option-panel {
+  margin: -2px 0 4px 14px;
+  padding: 10px 14px;
+  border-left: 3px solid var(--accent);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.option-panel p {
+  margin: 0;
+}
+
+.card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+}
+
+.card-choice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.card-choice.selected {
+  border-color: var(--accent);
+}
+
+.badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--warn-soft);
+  color: var(--warn);
+  vertical-align: 1px;
+}
+
+.option-title .badge {
+  margin-left: 0;
+}
+
+.badge.good {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.badges {
+  margin: -2px 0 6px;
+}
+
+.badges .badge:first-child {
+  margin-left: 0;
+}
+
+.item.target {
+  border-color: var(--ok);
+  border-width: 2px;
+}
+
+.pick {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.pick input,
+.card-choice input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.warn-list {
+  margin: 6px 0;
+  padding: 8px 12px 8px 28px;
+  border-radius: 8px;
+  background: var(--warn-soft);
+}
+
+.found {
+  margin-top: 10px;
+}
+
+.found-list {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+}
+
+details.group {
+  margin: 0 0 10px;
+}
+
+details.group > summary {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.plain-list {
+  list-style: none;
+  padding: 0;
+  margin: 6px 0 0;
+}
+
+.plain-list li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  border-top: 1px solid var(--border);
+}
+
+.steps {
+  margin: 6px 0 0;
+  padding-left: 20px;
+}
+
+.steps li {
+  margin-bottom: 4px;
+}
+
+.out-row {
+  margin-top: 0;
+}
+
+.card-note {
+  margin: 14px 0 0;
+}
+
+.card-note p {
+  margin: 0 0 4px;
+}

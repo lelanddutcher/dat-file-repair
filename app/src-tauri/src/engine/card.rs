@@ -991,6 +991,9 @@ fn copy_device(
             file.write_all(&buf[..n])
                 .map_err(|e| write_error(output, e))?;
             off += n as u64;
+            if let Some(rate) = dev_scan_rate() {
+                std::thread::sleep(Duration::from_secs_f64(n as f64 / rate));
+            }
             if off == total || last.elapsed() >= PROGRESS_EVERY {
                 last = Instant::now();
                 on_progress(CardProgress::Step { done: off, total });
