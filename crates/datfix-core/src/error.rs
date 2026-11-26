@@ -538,7 +538,8 @@ pub fn io_message(source: &std::io::Error) -> UserMessage {
             "The file is shorter than expected. It may still be copying.",
             "Wait until the copy is finished, then try again.",
         ),
-        _ if source.raw_os_error() == Some(5) => (
+        // EIO on macOS/Linux; ERROR_CRC, ERROR_READ_FAULT and friends on Windows.
+        _ if crate::read_at::is_media_error(source) => (
             "read_error",
             "The card or disk reported a read error",
             "Part of the file could not be read from the card or disk.",
