@@ -9,11 +9,15 @@
 //      for that camera. A clip the person chooses always wins.
 //   3. Output goes next to the .DAT unless they choose a folder.
 //   4. Repair -> progress -> result (Show in Finder / Play), or a friendly error.
+//
+// "Recover from a memory card" (card.ts) has its own screens. It copies recordings off a card
+// image and then hands them to this flow, with the card's finished clips as references.
 
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
-import { api, asAppError, type AppError, type AppInfo, type DatSummary, type PartialView, type Progress, type ReferenceMatch, type RepairOutcome, type Stage } from "./api";
+import { api, asAppError, type AppError, type AppInfo, type CardScanView, type DatSummary, type DevCardRun, type PartialView, type PreparedCard, type Progress, type ReferenceMatch, type RepairOutcome, type Stage } from "./api";
+import { card, initCard, openCard, renderCard, scanImage, makeImage, scanDirect, cancelJob as cancelCardJob, repairAll as cardRepairAll } from "./card";
 import * as fmt from "./format";
 import { h, type Child } from "./dom";
 
@@ -78,7 +82,14 @@ const state = {
   /** Unfinished files from a repair that was killed, found next to the outputs. */
   partials: [] as PartialView[],
   partialsNote: null as string | null,
+  /** "card" shows the "Recover from a memory card" screens. */
+  view: "main" as "main" | "card",
+  /** Shown above the list after recordings were copied off a card. */
+  cardNote: null as { text: string; problems: string[]; clipsDir: string | null } | null,
 };
+
+/** File types that are card images, not .DAT files. */
+const IMAGE_RE = /\.(img|dmg|dd|cdr|iso|raw|bin)$/i;
 
 let nextId = 1;
 const newId = (prefix: string) => `${prefix}-${nextId++}-${Date.now()}`;
@@ -99,6 +110,13 @@ function enqueue<T>(work: () => Promise<T>): Promise<T> {
 /** Adds dropped or chosen paths: .DAT files and folders go to the list, .MP4s become the reference. */
 async function addPaths(paths: string[]) {
   if (state.repairing || paths.length === 0) return;
+  // A card image goes to the card screens and is searched right away.
+  const image = paths.find((p) => IMAGE_RE.test(p));
+  if (image) {
+    state.view = "card";
+    openCard({ image });
+    return;
+  }
   const directClips = paths.filter((p) => /\.mp4$/i.test(p));
   const rest = paths.filter((p) => !/\.mp4$/i.test(p));
   if (directClips.length > 0) {
@@ -399,19 +417,26 @@ function render() {
   const root = document.getElementById("app")!;
   // Keep keyboard focus on the same control across re-renders.
   const focusedId = (document.activeElement as HTMLElement | null)?.id;
+  const header = h("header", { class: "top" }, [
+    h("h1", {}, state.info.name),
+    h("p", { class: "lede" }, "Get back the video from a Canon .DAT file. Your original file is never changed."),
+  ]);
+  const footer = h("footer", { class: "foot" }, [
+    `Free and open source · Not affiliated with Canon`,
+    state.info.version ? h("span", { class: "muted" }, ` · v${state.info.version}`) : null,
+  ]);
+  if (state.view === "card") {
+    root.replaceChildren(header, ...renderCard(), footer);
+    if (focusedId) document.getElementById(focusedId)?.focus();
+    return;
+  }
   const sections: (HTMLElement | null)[] = [
-    h("header", { class: "top" }, [
-      h("h1", {}, state.info.name),
-      h("p", { class: "lede" }, "Get back the video from a Canon .DAT file. Your original file is never changed."),
-    ]),
+    header,
     renderFiles(),
     state.items.some((i) => i.summary) ? renderReference() : null,
     state.items.some((i) => i.summary) ? renderOutput() : null,
     state.items.length ? renderAction() : null,
-    h("footer", { class: "foot" }, [
-      `Free and open source · Not affiliated with Canon`,
-      state.info.version ? h("span", { class: "muted" }, ` · v${state.info.version}`) : null,
-    ]),
+    footer,
   ];
   root.replaceChildren(...sections.filter((x): x is HTMLElement => x !== null));
   if (focusedId) document.getElementById(focusedId)?.focus();
@@ -438,6 +463,7 @@ function renderFiles(): HTMLElement {
   );
   return h("section", { class: "card", "aria-labelledby": "files-h" }, [
     h("h2", { id: "files-h" }, [h("span", { class: "step" }, "1"), "Your .DAT file" + (state.items.length > 1 ? "s" : "")]),
+    renderCardNote(),
     zone,
     empty
       ? h("p", { class: "hint" }, [
@@ -446,6 +472,30 @@ function renderFiles(): HTMLElement {
           " and DATfix will find every .DAT on it.",
         ])
       : h("ul", { class: "items", "aria-label": "Files to repair" }, state.items.map(renderItem)),
+    empty
+      ? h("div", { class: "card-entry" }, [
+          h("p", { class: "small" }, "Is the .DAT file 0 bytes, missing or deleted? The video may still be on the memory card."),
+          h("button", { id: "recover-card", type: "button", disabled: state.repairing, onclick: () => enterCard({}) }, "Recover from a memory card…"),
+        ])
+      : null,
+  ]);
+}
+
+function enterCard(opts: { lookingFor?: string; hintPath?: string }) {
+  state.view = "card";
+  openCard(opts);
+}
+
+/** Where the files in the list came from, after a card recovery. */
+function renderCardNote(): HTMLElement | null {
+  const n = state.cardNote;
+  if (!n) return null;
+  return h("div", { class: "notice card-note", role: "status" }, [
+    h("p", {}, n.text),
+    n.problems.length ? h("ul", { class: "small" }, n.problems.map((p) => h("li", {}, p))) : null,
+    n.clipsDir
+      ? h("button", { id: "show-clips", class: "link small", type: "button", onclick: () => void revealItemInDir(n.clipsDir!).catch(openFailed) }, "Show the copied clips")
+      : null,
   ]);
 }
 
@@ -508,7 +558,9 @@ function renderReference(): HTMLElement {
       ? "DATfix looks for a matching clip on the same card or in the same folder. If there is none, it uses its built-in settings for your camera."
       : c.kind === "file"
         ? `Using the clip you chose: ${fmt.baseName(c.path)}.`
-        : c.kind === "folder"
+        : c.kind === "folder" && c.path === state.cardNote?.clipsDir
+          ? "Using finished clips copied from the same card. If none matches, DATfix uses its built-in settings."
+          : c.kind === "folder"
           ? `Searching ${c.path} and its subfolders. If no clip matches, DATfix uses its built-in settings.`
           : "Using DATfix's built-in settings for your camera. No clip needed.";
   const canBuiltin = state.info.capabilities.referenceFree;
@@ -762,11 +814,18 @@ function renderRun(item: Item): Child {
 
 function errorBox(err: AppError, item?: Item): HTMLElement {
   const copyId = `copy-${item?.id ?? "x"}-${err.kind}`;
+  // An empty .DAT: the video may still be on the card, and DATfix can search it.
+  const emptyDat = err.kind === "empty_dat" && item;
   return h("div", { class: "error", role: "alert" }, [
     h("p", { class: "error-title" }, err.title),
     h("p", {}, err.message),
     err.reasons.length ? h("ul", {}, err.reasons.map((x) => h("li", {}, x))) : null,
-    h("p", { class: "next" }, [h("strong", {}, "What to do: "), err.nextStep]),
+    emptyDat
+      ? h("div", {}, [
+          h("p", { class: "next" }, [h("strong", {}, "What to do: "), "The video may still be on the memory card. Stop using the card and don't format it. DATfix can search the card for this recording."]),
+          h("button", { id: `scan-card-${item.id}`, class: "primary", type: "button", disabled: state.repairing, onclick: () => enterCard({ lookingFor: item.name, hintPath: item.dat }) }, "Scan the memory card for this recording…"),
+        ])
+      : h("p", { class: "next" }, [h("strong", {}, "What to do: "), err.nextStep]),
     err.details ? detailsBox(err.details) : null,
     h("button", { id: copyId, class: "link", type: "button", onclick: (ev: Event) => void copyDetails(err, item, ev.currentTarget as HTMLButtonElement) }, "Copy details"),
   ]);
@@ -841,7 +900,57 @@ function showToast(text: string) {
 // Start-up
 // ---------------------------------------------------------------------------------------------
 
+/** Repairs recordings copied off a card with the normal flow. */
+async function repairFromCard(prepared: PreparedCard, outDir: string, scan: CardScanView) {
+  const dats = prepared.recordings.filter((r) => r.dat).map((r) => r.dat!);
+  const problems = prepared.recordings
+    .filter((r) => r.error)
+    .map((r) => `A recording at ${fmt.bytes(r.offset)} on the card could not be copied: ${r.error!.message}`);
+  // The empty .DAT that led here has done its job; the copies replace it.
+  state.items = state.items.filter((i) => i.readError?.kind !== "empty_dat");
+  state.outDir = outDir;
+  state.refChoice = prepared.clipsDir ? { kind: "folder", path: prepared.clipsDir } : { kind: "builtin" };
+  state.cardNote = {
+    text: `${dats.length === 1 ? "1 recording was" : `${dats.length} recordings were`} copied from ${scan.imageName} into ${outDir}.${
+      prepared.clips ? ` ${prepared.clips === 1 ? "1 finished clip" : `${prepared.clips} finished clips`} from the same card ${prepared.clips === 1 ? "is" : "are"} used for the video settings.` : ""
+    }`,
+    problems,
+    clipsDir: prepared.clipsDir,
+  };
+  state.view = "main";
+  render();
+  window.scrollTo(0, 0);
+  await addPaths(dats);
+  await waitUntilReady();
+  await repairAll();
+}
+
+/** Resolves when every file is read and has its settings and output name. */
+async function waitUntilReady() {
+  while (state.items.some((i) => i.reading || i.ref.status === "searching" || (i.ref.status === "waiting" && !i.readError) || (i.summary && !i.output))) {
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
+
 async function start() {
+  initCard({
+    render,
+    scheduleRender,
+    announce,
+    toast: showToast,
+    errorBox: (err) => errorBox(err),
+    detailsBox,
+    progressBar,
+    spinner,
+    os: () => state.info.os,
+    close: () => {
+      state.view = "main";
+      render();
+      window.scrollTo(0, 0);
+    },
+    repair: repairFromCard,
+    devScreen,
+  });
   try {
     state.info = await api.appInfo();
     document.title = state.info.name;
@@ -886,6 +995,10 @@ async function devAutorun() {
     return;
   }
   if (!cfg) return;
+  if (cfg.card) {
+    await devCardRun(cfg.card);
+    return;
+  }
   if (cfg.outDir) state.outDir = cfg.outDir;
   if (cfg.reference === "builtin") state.refChoice = { kind: "builtin" };
   else if (cfg.reference) {
@@ -894,9 +1007,7 @@ async function devAutorun() {
   }
   await addPaths(cfg.dats);
   // Wait until every file is read and has a reference result.
-  while (state.items.some((i) => i.reading || i.ref.status === "searching" || i.ref.status === "waiting" && !i.readError || (i.summary && !i.output))) {
-    await new Promise((r) => setTimeout(r, 200));
-  }
+  await waitUntilReady();
   const report = () =>
     api.devReport(
       JSON.stringify(
@@ -934,6 +1045,103 @@ async function devAutorun() {
   }
   await done;
   await report();
+}
+
+/** Test hook: announces a screen on stdout and waits so a script can take a screenshot. */
+let devPauseMs = 0;
+async function devScreen(name: string) {
+  if (!devPauseMs) return;
+  render();
+  await new Promise((r) => setTimeout(r, 150));
+  await api.devReport(JSON.stringify({ screen: name }));
+  await new Promise((r) => setTimeout(r, devPauseMs));
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+async function until(test: () => boolean, ms = 600_000) {
+  const end = Date.now() + ms;
+  while (!test() && Date.now() < end) await sleep(100);
+}
+
+/** Test hook: drives the card flow (see DevCardRun in api.ts). */
+async function devCardRun(cfg: DevCardRun) {
+  devPauseMs = cfg.pauseMs ?? 0;
+  await devScreen("start");
+  if (cfg.fromEmptyDat) {
+    await addPaths([cfg.fromEmptyDat]);
+    await waitUntilReady();
+    await devScreen("empty-dat");
+    const item = state.items.find((i) => i.readError?.kind === "empty_dat");
+    enterCard({ lookingFor: item?.name, hintPath: item?.dat });
+  } else {
+    enterCard({});
+  }
+  await until(() => card.cards !== null);
+  await devScreen("choose");
+  if (cfg.outDir) card.outDir = cfg.outDir;
+  let scanning: Promise<void>;
+  if (cfg.device && cfg.imageDir && !cfg.direct) {
+    card.mode = "make";
+    card.device = cfg.device;
+    card.imageDir = cfg.imageDir;
+    await devScreen("choose-make");
+    scanning = makeImage();
+    await until(() => card.screen !== "imaging" || (card.job?.done ?? 0) > (card.job?.total ?? 1) * 0.3, 60_000);
+    if (card.screen === "imaging") await devScreen("imaging");
+  } else if (cfg.device && cfg.direct) {
+    card.mode = "direct";
+    card.device = cfg.device;
+    await devScreen("choose-direct");
+    scanning = scanDirect();
+  } else {
+    scanning = scanImage(cfg.image!);
+  }
+  await until(() => card.screen === "scanning" || card.screen === "results" || !!card.error);
+  if (cfg.cancelAfterMs) {
+    await sleep(cfg.cancelAfterMs);
+    await devScreen("scanning");
+    await cancelCardJob();
+    await scanning;
+    await devScreen("cancelled");
+    await api.devReport(JSON.stringify({ screen: card.screen, error: card.error?.kind, scan: !!card.scan }));
+    return;
+  }
+  await until(() => card.screen !== "scanning" || (card.job?.done ?? 0) > (card.job?.total ?? 1) * 0.4, 60_000);
+  if (card.screen === "scanning") await devScreen("scanning");
+  await scanning;
+  await devScreen("results");
+  card.open.add("clips");
+  card.open.add("fragments");
+  window.scrollTo(0, document.body.scrollHeight);
+  await devScreen("results-bottom");
+  const summary = {
+    error: card.error?.kind,
+    recordings: card.scan?.recordings.map((r) => ({ offset: r.offset, fileName: r.fileName, badge: r.badge, seconds: r.durationSeconds, frames: r.videoFrames, pieces: r.pieces, references: r.references })),
+    clips: card.scan?.clips.length,
+    fragments: card.scan?.fragments.length,
+  };
+  if (cfg.repair === false || !card.scan) {
+    await api.devReport(JSON.stringify({ screen: "results", ...summary }));
+    return;
+  }
+  window.scrollTo(0, 0);
+  const repairing = cardRepairAll();
+  await until(() => state.view === "main" || !!card.error);
+  await until(() => !state.repairing || state.items.some((i) => i.run.status === "running" && (i.run.done ?? 0) > 0), 60_000);
+  if (state.repairing) await devScreen("repairing");
+  await repairing;
+  await devScreen("done");
+  window.scrollTo(0, document.body.scrollHeight);
+  await devScreen("done-bottom");
+  await api.devReport(
+    JSON.stringify({
+      screen: "done",
+      ...summary,
+      cardError: card.error?.kind,
+      note: state.cardNote,
+      items: state.items.map((i) => ({ dat: i.dat, ref: i.ref.match?.source, refPath: i.ref.match?.path, run: i.run.status, error: i.run.error?.kind, outcome: i.run.outcome })),
+    }),
+  );
 }
 
 void start();
