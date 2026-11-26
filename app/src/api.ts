@@ -105,4 +105,6 @@ export interface DevAutorun {
   repair?: boolean;
   /** Press Cancel this many milliseconds after Repair. */
   cancelAfterMs?: number;
+  /** Scroll the page down this many pixels once ready (for screenshots). */
+  scrollY?: number;
 }

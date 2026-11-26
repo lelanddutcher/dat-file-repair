@@ -542,7 +542,12 @@ fn describe(dat: &Path, r: &InspectReport) -> DatSummary {
         size_bytes: r.file_size,
         camera: camera.into(),
         contents: parts.join(", "),
-        estimated_seconds: r.estimated_seconds,
+        // Frames divided by frame rate is exact; the audio-based estimate runs a little long
+        // because audio is recorded slightly ahead of the last complete video frame.
+        estimated_seconds: match r.estimated_fps {
+            Some(fps) if fps > 0.0 && video_frames > 0 => Some(video_frames as f64 / fps),
+            _ => r.estimated_seconds,
+        },
         video_frames,
         cut_off: r.truncation.is_some(),
     }

@@ -219,6 +219,13 @@ async function refreshAllOutputs() {
   for (const i of state.items) if (i.summary && i.run.status !== "done") await refreshOutput(i);
 }
 
+/** Clears the list for a new repair. Keeps the reference and output choices. */
+function startOver() {
+  state.items = [];
+  render();
+  document.getElementById("dropzone")?.focus();
+}
+
 function removeItem(item: Item) {
   state.items = state.items.filter((i) => i !== item);
   announce(`${item.name} removed.`);
@@ -579,6 +586,16 @@ function renderItemOutput(item: Item): HTMLElement {
 
 function renderAction(): HTMLElement {
   const ready = readyItems().length;
+  const allDone = state.items.length > 0 && state.items.every((i) => i.run.status === "done");
+  if (allDone && !state.repairing) {
+    return h("section", { class: "card action", "aria-labelledby": "act-h" }, [
+      h("h2", { id: "act-h", class: "visually-hidden" }, "Finished"),
+      h("div", { class: "row spread" }, [
+        h("p", { class: "done-msg" }, state.items.length > 1 ? "All files repaired." : "Your video is repaired."),
+        h("button", { id: "start-over", type: "button", onclick: startOver }, "Repair another file"),
+      ]),
+    ]);
+  }
   const label = state.repairing ? "Repairing…" : ready > 1 ? `Repair ${ready} files` : "Repair";
   const waiting = state.items.some((i) => i.reading || i.ref.status === "searching");
   return h("section", { class: "card action", "aria-labelledby": "act-h" }, [
@@ -773,6 +790,7 @@ async function devAutorun() {
         state.items.map((i) => ({ dat: i.dat, ref: i.ref.status, refPath: i.ref.match?.path, readError: i.readError?.kind, run: i.run.status, outcome: i.run.outcome, error: i.run.error?.kind })),
       ),
     );
+  if (cfg.scrollY) window.scrollTo(0, cfg.scrollY);
   if (cfg.repair === false) {
     await report();
     return;
