@@ -18,9 +18,11 @@
 //! - [`repair::repair`] writes a repaired MP4. It reports progress through a callback so a GUI
 //!   can show a progress bar.
 //! - [`repair::choose_reference`] picks a compatible reference from a folder.
+//! - [`carve::scan`] finds recordings in a raw card image (0-byte, deleted or missing `.DAT`).
 //!
 //! The input file is only ever opened for reading.
 
+pub mod carve;
 pub mod codec;
 pub mod error;
 pub mod fourcc;
