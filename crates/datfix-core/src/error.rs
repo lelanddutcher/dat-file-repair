@@ -47,10 +47,10 @@ pub enum Error {
 
     /// The `.DAT` is empty, or holds only zero bytes.
     #[error(
-        "{} holds no recording data ({0}). The data isn't in this file: the camera's file \
-         table points at nothing. Recover the memory card with PhotoRec (free, \
-         https://www.cgsecurity.org) first, without writing anything to the card, then run \
-         datfix on the .DAT or .MP4 pieces it finds.",
+        "{} holds no recording data ({detail}): the data isn't in this file. The card's file \
+         table points at empty space. Recover the memory card with PhotoRec first (free, \
+         https://www.cgsecurity.org), without writing anything to the card, then run datfix \
+         on the .DAT or .MP4 pieces it finds.",
         .path.display()
     )]
     EmptyDat { path: PathBuf, detail: String },

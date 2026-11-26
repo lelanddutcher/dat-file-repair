@@ -325,6 +325,52 @@ pub fn pad_to(plan: &mut TrackPlan, samples: u64) -> u64 {
 mod tests {
     use super::*;
 
+    use crate::repi::tests::{dat_header, group_bytes};
+
+    /// Family A stream: `intervals` video groups of 15 frames, each followed by 15 records
+    /// that carry the R3 body code and a 7-bit frame counter.
+    fn family_a(intervals: usize) -> (Vec<u8>, Vec<(usize, usize)>) {
+        let mut d = dat_header();
+        let mut spans = Vec::new();
+        for i in 0..intervals {
+            let start = d.len();
+            d.extend(group_bytes(b"vide", 0, &[100; 15]));
+            for f in 0..15 {
+                let mut rec = vec![0u8; 128];
+                rec[0] = 4;
+                rec[1..4].copy_from_slice(&[0, 0, 0x45]);
+                rec[0x54] = ((i * 15 + f + 7) % 128) as u8;
+                d.extend(rec);
+            }
+            spans.push((start, d.len()));
+        }
+        (d, spans)
+    }
+
+    fn gaps_after_zeroing(intervals: usize, lost: std::ops::Range<usize>) -> Vec<TimelineGap> {
+        let (mut d, spans) = family_a(intervals);
+        d[spans[lost.start].0..spans[lost.end - 1].1].fill(0);
+        let index = crate::repi::walk(&d, &mut |_| true).unwrap();
+        let lay = crate::layout::analyze(&d, &index, "");
+        assert!(lay.has_records);
+        assert_eq!(lay.body, Some("Canon EOS R3"));
+        build(&d, &index, &lay).gaps
+    }
+
+    #[test]
+    fn frame_counter_measures_gaps_in_family_a() {
+        let gaps = gaps_after_zeroing(6, 2..3);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!((gaps[0].lost_frames, gaps[0].method), (15, "frame counter"));
+        assert_eq!(gaps[0].resumes_at_frame, 45);
+        // 150 lost frames: the counter wraps at 128; the byte count picks the right wrap.
+        let gaps = gaps_after_zeroing(14, 2..12);
+        assert_eq!(
+            (gaps[0].lost_frames, gaps[0].method),
+            (150, "frame counter")
+        );
+    }
+
     #[test]
     fn steps_stretch_the_frame_before_a_gap() {
         assert_eq!(steps_from(&[0, 1, 2, 7, 8]), vec![1, 1, 5, 1, 1]);
