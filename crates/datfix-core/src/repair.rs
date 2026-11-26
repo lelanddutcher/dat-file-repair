@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -22,7 +22,10 @@ use crate::repi::{self, DatIndex, Truncation};
 use crate::timeline::{self, TimelineGap};
 use crate::timing::{self, VideoTiming};
 
-pub use crate::select::{Checked, RefKind, check_reference, choose_from_dir, choose_profile};
+pub use crate::select::{
+    Candidate, Checked, RefKind, ReferenceSearch, SearchOptions, Verdict, check_reference,
+    choose_from_dir, choose_profile, search_references,
+};
 
 /// Stage of the pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -42,8 +45,13 @@ pub enum Event {
     Phase { phase: Phase, message: String },
     /// Progress inside a stage. `done` and `total` share a unit (bytes or frames).
     Progress { phase: Phase, done: u64, total: u64 },
-    /// A candidate reference was skipped (folder search).
-    ReferenceRejected { path: PathBuf, reason: String },
+    /// A candidate reference was skipped (folder search). `reason` is technical,
+    /// `user_reason` is one plain sentence.
+    ReferenceRejected {
+        path: PathBuf,
+        reason: String,
+        user_reason: String,
+    },
     /// The reference that will be used.
     ReferenceChosen { path: PathBuf },
     /// A non-fatal observation.
@@ -59,6 +67,9 @@ pub enum ReferenceSource {
     /// profiles when nothing in it fits.
     Dir(PathBuf),
     /// No reference: pick a built-in profile from what the `.DAT` itself shows.
+    Builtin,
+    /// Search the `.DAT`'s own folder (not its subfolders) for a fitting clip, then fall back
+    /// to the built-in profiles.
     Auto,
 }
 
@@ -69,6 +80,10 @@ pub struct RepairOptions {
     pub overwrite: bool,
     /// Set to `true` from another thread to stop the repair.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// An index already read from this `.DAT` (for example by [`crate::inspect`]). Skips the
+    /// index walk, which takes about 40 s for a 38 GB file. Ignored when its file size does
+    /// not match the file on disk.
+    pub index: Option<Arc<DatIndex>>,
 }
 
 /// One output track in the report.
@@ -95,6 +110,14 @@ pub struct RepairReport {
     pub reference_kind: RefKind,
     /// Tracks or boxes written from Canon's conventions instead of copied.
     pub synthesized: Vec<String>,
+    /// What was rebuilt and why, in plain sentences.
+    pub rebuilt: Vec<String>,
+    /// Where the settings came from, as one plain sentence.
+    pub settings: String,
+    /// The built-in profile in plain words (`Canon EOS R5 Mark II, 4K 119.88p`), when used.
+    pub profile: Option<String>,
+    /// The camera as people know it, when the `.DAT` names it.
+    pub camera: Option<String>,
     /// What the `.DAT` itself shows: body, codec, frame rate, family.
     pub recording: String,
     /// Recording start written into the file (UTC, seconds since 1970) and where it came from.
@@ -382,20 +405,27 @@ pub fn repair(
         ReferenceSource::File(p) => Some(Reference::open(p)?),
         _ => None,
     };
-    let index = index_dat(&src, opts, on_event)?;
+    let walked;
+    let index: &DatIndex = match &opts.index {
+        Some(i) if i.file_size == src.size() => i,
+        _ => {
+            walked = index_dat(&src, opts, on_event)?;
+            &walked
+        }
+    };
     let name = dat.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let lay = layout::analyze(&src, &index, name);
+    let lay = layout::analyze(&src, index, name);
 
     on_event(&Event::Phase {
         phase: Phase::CheckingReference,
         message: format!("checking decoder settings for {}", lay.describe()),
     });
     let checked = match (given, reference) {
-        (Some(r), _) => check_reference(&src, &index, &lay, r, RefKind::User)?,
-        (None, ReferenceSource::Dir(d)) => match choose_from_dir(&src, &index, &lay, d, on_event) {
+        (Some(r), _) => check_reference(&src, index, &lay, r, RefKind::User)?,
+        (None, ReferenceSource::Dir(d)) => match choose_from_dir(&src, index, &lay, d, on_event) {
             Ok(c) => c,
             Err(dir_err @ Error::NoReference { .. }) => {
-                match choose_profile(&src, &index, &lay, on_event) {
+                match choose_profile(&src, index, &lay, on_event) {
                     Ok(mut c) => {
                         c.notes.insert(
                             0,
@@ -412,7 +442,32 @@ pub fn repair(
             }
             Err(e) => return Err(e),
         },
-        (None, ReferenceSource::Auto) => choose_profile(&src, &index, &lay, on_event)?,
+        (None, ReferenceSource::Builtin) => choose_profile(&src, index, &lay, on_event)?,
+        (None, ReferenceSource::Auto) => {
+            let dirs: Vec<PathBuf> = dat.parent().map(Path::to_path_buf).into_iter().collect();
+            let opts = SearchOptions {
+                depth: 0,
+                ..SearchOptions::default()
+            };
+            let found = search_references(&src, index, &lay, &dirs, &opts, on_event)?;
+            let (checked, chosen) = (found.checked(), found.chosen);
+            match chosen {
+                Some(c) => c,
+                None => {
+                    let mut c = choose_profile(&src, index, &lay, on_event)?;
+                    if checked > 0 {
+                        c.notes.insert(
+                            0,
+                            format!(
+                                "none of the {checked} clip(s) next to the .DAT fits; using the \
+                                 built-in profiles"
+                            ),
+                        );
+                    }
+                    c
+                }
+            }
+        }
         (None, ReferenceSource::File(_)) => unreachable!("opened above"),
     };
     let Checked {
@@ -422,6 +477,9 @@ pub fn repair(
         kind,
         label,
         synthesized,
+        rebuilt,
+        summary: settings,
+        profile,
         notes: check_notes,
     } = checked;
     for n in check_notes.iter().chain(&mapping.notes) {
@@ -451,7 +509,7 @@ pub fn repair(
     }
 
     // Keep audio and video in sync across damaged regions.
-    let tl = timeline::build(&src, &index, &lay);
+    let tl = timeline::build(&src, index, &lay);
     notes.extend(timeline::apply(&tl, &reference, &mut mapping.plans));
     for g in &tl.gaps {
         if g.lost_frames > 0 {
@@ -598,6 +656,10 @@ pub fn repair(
         reference: PathBuf::from(label),
         reference_kind: kind,
         synthesized,
+        rebuilt,
+        settings,
+        profile,
+        camera: lay.camera(),
         recording: lay.describe(),
         creation_time: created,
         creation_time_source: created_source,
@@ -632,13 +694,85 @@ fn check_output(input: &Path, output: &Path, opts: &RepairOptions) -> Result<()>
     Ok(())
 }
 
+/// Suffix of the hidden temporary file a repair writes before it renames it into place.
+pub const PARTIAL_SUFFIX: &str = ".datfix-partial";
+
 /// Hidden temp file next to the output; renamed into place on success.
-fn temp_path(output: &Path) -> PathBuf {
+pub fn temp_path(output: &Path) -> PathBuf {
     let name = output
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("output.mp4");
-    output.with_file_name(format!(".{name}.datfix-partial"))
+    output.with_file_name(format!(".{name}{PARTIAL_SUFFIX}"))
+}
+
+/// A temporary file left by a repair that was killed (power loss, force quit).
+#[derive(Clone, Debug, Serialize)]
+pub struct PartialFile {
+    pub path: PathBuf,
+    pub bytes: u64,
+    /// Seconds since the file was last written.
+    pub idle_seconds: u64,
+}
+
+/// True for names that a repair's temporary file can have (`.<name>.datfix-partial`).
+pub fn is_partial_name(name: &str) -> bool {
+    name.starts_with('.') && name.ends_with(PARTIAL_SUFFIX) && name.len() > PARTIAL_SUFFIX.len() + 1
+}
+
+/// Lists temporary files in `dir` (not its subfolders) that no repair has written to for at
+/// least `idle`. A running repair writes its file continuously, so a file idle for a minute
+/// belongs to a repair that was killed.
+pub fn find_stale_partials(dir: &Path, idle: Duration) -> Vec<PartialFile> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let now = SystemTime::now();
+    let mut out: Vec<PartialFile> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_str().is_some_and(is_partial_name))
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let idle_for = now
+                .duration_since(meta.modified().ok()?)
+                .unwrap_or_default();
+            (idle_for >= idle).then(|| PartialFile {
+                path: e.path(),
+                bytes: meta.len(),
+                idle_seconds: idle_for.as_secs(),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+/// Deletes temporary files found by [`find_stale_partials`]. Refuses any path whose name is
+/// not a repair's temporary file name. Returns the bytes freed.
+pub fn remove_partials(paths: &[PathBuf]) -> Result<u64> {
+    let mut freed = 0;
+    for p in paths {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !is_partial_name(name) {
+            return Err(Error::io(
+                format!("refusing to delete {}", p.display()),
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "not a datfix temporary file",
+                ),
+            ));
+        }
+        let len = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        match std::fs::remove_file(p) {
+            Ok(()) => freed += len,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::io(format!("cannot delete {}", p.display()), e)),
+        }
+    }
+    Ok(freed)
 }
 
 /// Video timing for callers that want it without writing (tests, diagnostics).

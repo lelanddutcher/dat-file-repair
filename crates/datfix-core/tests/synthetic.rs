@@ -145,7 +145,9 @@ fn refuses_reference_with_other_frame_rate() {
     match repair(&dat_path, &ref_path, &out) {
         Err(Error::Incompatible { reasons, .. }) => {
             assert!(
-                reasons.iter().any(|r| r.contains("frame rate differs")),
+                reasons
+                    .iter()
+                    .any(|r| r.detail.contains("frame rate differs")),
                 "{reasons:?}"
             );
         }
@@ -254,7 +256,7 @@ fn explains_inputs_that_are_not_repairable() {
         write(&p, bytes);
         repair::repair(
             &p,
-            &ReferenceSource::Auto,
+            &ReferenceSource::Builtin,
             &out,
             &RepairOptions::default(),
             &mut |_| {},
@@ -335,7 +337,7 @@ fn picks_a_harvested_profile_when_no_reference_is_given() {
     // No built-in profile runs at 25 fps: a clear refusal, not a guess.
     let e = repair::repair(
         &dat_path,
-        &ReferenceSource::Auto,
+        &ReferenceSource::Builtin,
         &dir.path().join("o.MP4"),
         &RepairOptions::default(),
         &mut |_| {},
@@ -359,4 +361,210 @@ fn picks_a_harvested_profile_when_no_reference_is_given() {
         panic!("a profile at another frame rate was accepted");
     };
     assert!(e.to_string().contains("other frame rate"), "{e}");
+}
+
+#[test]
+fn search_reports_a_verdict_for_every_clip() {
+    use datfix_core::read_at::FileSource;
+    use datfix_core::{layout, repi, select};
+
+    let dir = tempfile::tempdir().unwrap();
+    let dat_path = dir.path().join("clip.DAT");
+    write(&dat_path, &common::dat(2, 2));
+    let refs = dir.path().join("refs");
+    std::fs::create_dir(&refs).unwrap();
+    write(&refs.join("a_small.MP4"), &common::reference(4, &[]));
+    write(
+        &refs.join("c_fast.MP4"),
+        &common::reference_at(2, &common::dat(2, 2)[16..], 500),
+    );
+    // Our own output is never a candidate.
+    write(&refs.join("x_repaired.MP4"), &common::reference(2, &[]));
+
+    let src = FileSource::open(&dat_path).unwrap();
+    let index = repi::walk(&src, &mut |_| true).unwrap();
+    let lay = layout::analyze(&src, &index, "clip.DAT");
+    let found = select::search_references(
+        &src,
+        &index,
+        &lay,
+        &[refs],
+        &select::SearchOptions::default(),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(found.found, 2);
+    assert_eq!(found.checked(), 2);
+    // The 4-track clip fits as a hybrid; its rebuilt sound is explained in plain words.
+    let chosen = found.chosen.as_ref().expect("hybrid chosen");
+    assert_eq!(chosen.kind, repair::RefKind::Hybrid);
+    match &found.candidates[0].verdict {
+        select::Verdict::VideoOnly { rebuilt } => {
+            assert!(
+                rebuilt
+                    .iter()
+                    .any(|r| r.starts_with("Sound settings were rebuilt")),
+                "{rebuilt:?}"
+            );
+        }
+        v => panic!("expected VideoOnly, got {v:?}"),
+    }
+    // The other clip runs at another frame rate: plain reason, technical detail kept.
+    match &found.candidates[1].verdict {
+        select::Verdict::Skipped { reason } => {
+            assert!(reason.user.contains("frames per second"), "{reason:?}");
+            assert!(!reason.user.contains("repi"), "{reason:?}");
+            assert!(reason.detail.contains("frame rate differs"), "{reason:?}");
+        }
+        v => panic!("expected Skipped, got {v:?}"),
+    }
+}
+
+#[test]
+fn reuses_an_index_read_earlier() {
+    use datfix_core::inspect;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let dat_path = dir.path().join("clip.DAT");
+    write(&dat_path, &common::dat(2, 2));
+    let ref_path = dir.path().join("ref.MP4");
+    write(&ref_path, &common::reference(2, &common::dat(2, 2)[16..]));
+
+    let (summary, index) =
+        inspect::inspect_with(&dat_path, &RepairOptions::default(), &mut |_| {}).unwrap();
+    // The duration estimate is complete video frames divided by the frame rate.
+    let fps = summary.estimated_fps.unwrap();
+    let secs = summary.estimated_seconds.unwrap();
+    assert!((secs - summary.video_frames as f64 / fps).abs() < 1e-9);
+
+    let opts = RepairOptions {
+        index: Some(Arc::new(index)),
+        ..Default::default()
+    };
+    let mut indexing = 0;
+    let report = repair::repair(
+        &dat_path,
+        &ReferenceSource::File(ref_path),
+        &dir.path().join("out.MP4"),
+        &opts,
+        &mut |e: &Event| {
+            if matches!(
+                e,
+                Event::Phase {
+                    phase: repair::Phase::Indexing,
+                    ..
+                }
+            ) {
+                indexing += 1;
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(indexing, 0, "the index was walked again");
+    assert_eq!(report.video_frames, summary.video_frames);
+    assert!(report.settings.contains("ref.MP4"), "{}", report.settings);
+}
+
+#[test]
+fn auto_tries_clips_next_to_the_dat_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let dat_path = dir.path().join("clip.DAT");
+    write(&dat_path, &common::dat(2, 2));
+    write(
+        &dir.path().join("next.MP4"),
+        &common::reference(2, &common::dat(2, 2)[16..]),
+    );
+    let report = repair::repair(
+        &dat_path,
+        &ReferenceSource::Auto,
+        &dir.path().join("out.MP4"),
+        &RepairOptions::default(),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert!(report.reference.ends_with("next.MP4"));
+
+    // Without a clip next to it, Auto falls back to the profiles (none fits 25 fps).
+    let lone = tempfile::tempdir().unwrap();
+    let dat2 = lone.path().join("clip.DAT");
+    write(&dat2, &common::dat(2, 2));
+    let e = repair::repair(
+        &dat2,
+        &ReferenceSource::Auto,
+        &lone.path().join("out.MP4"),
+        &RepairOptions::default(),
+        &mut |_| {},
+    )
+    .unwrap_err();
+    assert!(matches!(e, Error::NoProfile { .. }), "{e}");
+    let m = e.user_message();
+    assert_eq!(m.kind, "no_profile");
+    assert!(m.next_step.contains("clip"), "{m:?}");
+}
+
+#[test]
+fn user_messages_have_no_format_jargon() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("empty.DAT");
+    write(&empty, &[]);
+    let e = repair::repair(
+        &empty,
+        &ReferenceSource::Builtin,
+        &dir.path().join("o.MP4"),
+        &RepairOptions::default(),
+        &mut |_| {},
+    )
+    .unwrap_err();
+    let m = e.user_message();
+    assert_eq!(m.kind, "empty_dat");
+    assert!(m.next_step.contains("PhotoRec"), "{m:?}");
+
+    let mut eos_r = vec![
+        0, 0, 0, 0, b'm', b'd', b'a', b't', 0, 0, 0, 8, b'w', b'i', b'd', b'e',
+    ];
+    eos_r.extend(std::iter::repeat_n(0x5a, 64 * 1024));
+    let p = dir.path().join("MVI_0001.DAT");
+    write(&p, &eos_r);
+    let e = repair::repair(
+        &p,
+        &ReferenceSource::Builtin,
+        &dir.path().join("o.MP4"),
+        &RepairOptions::default(),
+        &mut |_| {},
+    )
+    .unwrap_err();
+    let m = e.user_message();
+    assert_eq!(m.kind, "unsupported");
+    assert!(m.next_step.contains("github.com"), "{m:?}");
+    for text in [&m.title, &m.message, &m.next_step] {
+        assert!(
+            !text.contains("repi") || text.contains("recovery index"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn finds_and_removes_stale_partial_files() {
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let stale = dir.path().join(".clip_repaired.mp4.datfix-partial");
+    write(&stale, &[1u8; 1000]);
+    write(&dir.path().join("keep.mp4"), b"x");
+    write(&dir.path().join("datfix-partial"), b"x");
+    // A file written just now may belong to a running repair.
+    assert!(repair::find_stale_partials(dir.path(), Duration::from_secs(60)).is_empty());
+    let found = repair::find_stale_partials(dir.path(), Duration::ZERO);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].path, stale);
+    assert_eq!(found[0].bytes, 1000);
+    // Only temporary files can be deleted through this helper.
+    assert!(repair::remove_partials(&[dir.path().join("keep.mp4")]).is_err());
+    assert_eq!(
+        repair::remove_partials(std::slice::from_ref(&stale)).unwrap(),
+        1000
+    );
+    assert!(!stale.exists());
+    assert!(dir.path().join("keep.mp4").exists());
 }

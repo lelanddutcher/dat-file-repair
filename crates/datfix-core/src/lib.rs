@@ -37,5 +37,5 @@ pub mod select;
 pub mod timeline;
 pub mod timing;
 
-pub use error::{Error, Result};
+pub use error::{Error, Reason, Result, UserMessage};
 pub use fourcc::FourCC;

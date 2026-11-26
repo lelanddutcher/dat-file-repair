@@ -6,6 +6,7 @@
 //! The missing tracks are built by [`crate::mp4::synth`]. Tracks of the clip that already fit
 //! (same kind, count and sample size) are reused as they are.
 
+use crate::error::Reason;
 use crate::layout::{DatLayout, Family, FrameRate};
 use crate::mp4::atom::Atom;
 use crate::mp4::reference::{RefTrack, Reference, TrackKind};
@@ -19,6 +20,8 @@ pub struct Hybrid {
     pub synthesized: Vec<String>,
     /// What was reused from the clip besides the video.
     pub reused: Vec<String>,
+    /// What was rebuilt and why, one plain sentence each (no format names).
+    pub rebuilt: Vec<String>,
 }
 
 fn renumbered(base: &Reference, t: &RefTrack, id: u32) -> Result<Atom, String> {
@@ -27,11 +30,26 @@ fn renumbered(base: &Reference, t: &RefTrack, id: u32) -> Result<Atom, String> {
     Ok(trak)
 }
 
-/// Builds a hybrid reference for `index` from `base`'s video track.
-pub fn assemble(base: &Reference, index: &DatIndex, layout: &DatLayout) -> Result<Hybrid, String> {
+fn internal(e: String) -> Reason {
+    Reason::new(
+        "Its settings could not be combined with this .DAT's sound and data tracks.",
+        e,
+    )
+}
+
+/// Builds a hybrid reference for `index` from `base`'s video track. `subject` names the
+/// source in the plain sentences, for example `your reference clip`.
+pub fn assemble(
+    base: &Reference,
+    index: &DatIndex,
+    layout: &DatLayout,
+    subject: &str,
+) -> Result<Hybrid, Reason> {
     let shapes = index.shapes();
     let has = |k: &[u8; 4]| shapes.iter().find(|s| s.kind.0 == *k);
-    let vt = base.video_track().ok_or("the clip has no video track")?;
+    let vt = base
+        .video_track()
+        .ok_or_else(|| Reason::new("The clip has no video.", "the clip has no video track"))?;
     let rate = FrameRate {
         timescale: vt.timescale,
         frame_duration: vt.sample_delta,
@@ -39,7 +57,8 @@ pub fn assemble(base: &Reference, index: &DatIndex, layout: &DatLayout) -> Resul
     let per_chunk = layout.frames_per_group.max(1);
     let mut synthesized = Vec::new();
     let mut reused = Vec::new();
-    let mut traks = vec![renumbered(base, vt, 1)?];
+    let mut rebuilt = Vec::new();
+    let mut traks = vec![renumbered(base, vt, 1).map_err(internal)?];
     let mut next = 2u32;
     let of_kind =
         |k: TrackKind| -> Vec<&RefTrack> { base.tracks.iter().filter(|t| t.kind == k).collect() };
@@ -58,11 +77,24 @@ pub fn assemble(base: &Reference, index: &DatIndex, layout: &DatLayout) -> Resul
                 .all(|t| t.fixed_sample_size == kind.frame_bytes());
         if fits {
             for t in theirs {
-                traks.push(renumbered(base, t, next)?);
+                traks.push(renumbered(base, t, next).map_err(internal)?);
                 next += 1;
             }
             reused.push(format!("{want} PCM audio track(s)"));
         } else {
+            let why = if !of_kind(TrackKind::CompressedAudio).is_empty() {
+                "used compressed (AAC) audio".to_string()
+            } else if theirs.is_empty() {
+                "had no sound".to_string()
+            } else {
+                format!(
+                    "recorded sound differently ({} track(s) instead of {want})",
+                    theirs.len()
+                )
+            };
+            rebuilt.push(format!(
+                "Sound settings were rebuilt because {subject} {why}."
+            ));
             for _ in 0..want {
                 traks.push(synth::pcm_trak(next, kind));
                 next += 1;
@@ -72,23 +104,35 @@ pub fn assemble(base: &Reference, index: &DatIndex, layout: &DatLayout) -> Resul
     }
     if has(b"aac ").is_some() {
         let theirs = of_kind(TrackKind::CompressedAudio);
-        let t = theirs.first().ok_or(
-            "the .DAT has AAC audio but the clip has no AAC track, and AAC settings cannot be \
-             synthesized",
-        )?;
-        traks.push(renumbered(base, t, next)?);
+        let t = theirs.first().ok_or_else(|| {
+            Reason::new(
+                "This .DAT has compressed (AAC) sound, and the clip has no compressed sound to \
+                 copy its settings from.",
+                "the .DAT has AAC audio but the clip has no AAC track, and AAC settings cannot \
+                 be synthesized",
+            )
+        })?;
+        traks.push(renumbered(base, t, next).map_err(internal)?);
         next += 1;
         reused.push("AAC audio track".into());
     }
     if has(b"tmcd").is_some() {
         match of_kind(TrackKind::Timecode).first() {
             Some(t) if t.timescale == rate.timescale && t.sample_delta == rate.frame_duration => {
-                traks.push(renumbered(base, t, next)?);
+                traks.push(renumbered(base, t, next).map_err(internal)?);
                 reused.push("timecode track".into());
             }
-            _ => {
+            other => {
                 traks.push(synth::tmcd_trak(next, rate, per_chunk));
                 synthesized.push(format!("tmcd timecode ({rate})"));
+                rebuilt.push(format!(
+                    "Timecode settings were rebuilt because {subject} {}.",
+                    if other.is_some() {
+                        "used another timecode rate"
+                    } else {
+                        "had no timecode"
+                    }
+                ));
             }
         }
         next += 1;
@@ -100,12 +144,16 @@ pub fn assemble(base: &Reference, index: &DatIndex, layout: &DatLayout) -> Resul
             .find(|t| t.codec.0 == *b"cndm" && t.fixed_sample_size == meta.fixed_size);
         match cndm {
             Some(t) => {
-                traks.push(renumbered(base, t, next)?);
+                traks.push(renumbered(base, t, next).map_err(internal)?);
                 reused.push("Canon metadata track".into());
             }
             None => {
                 traks.push(synth::cndm_trak(next, 1, rate, meta.fixed_size, per_chunk));
                 synthesized.push("cndm Canon metadata".into());
+                rebuilt.push(format!(
+                    "The camera's per-frame data track was rebuilt because {subject} stored it \
+                     differently."
+                ));
             }
         }
         next += 1;
@@ -131,7 +179,8 @@ pub fn assemble(base: &Reference, index: &DatIndex, layout: &DatLayout) -> Resul
         children.push(synth::udta_model(&m));
     }
     let moov = Atom::container(b"moov", children);
-    let mut reference = Reference::from_parts(&base.path, base.file_size, ftyp, moov)?;
+    let mut reference =
+        Reference::from_parts(&base.path, base.file_size, ftyp, moov).map_err(internal)?;
     // The synthesized tracks follow the .DAT's own layout by construction; the video layout was
     // compared with the clip before assembling.
     reference.repi_shapes = Some(shapes);
@@ -139,5 +188,6 @@ pub fn assemble(base: &Reference, index: &DatIndex, layout: &DatLayout) -> Resul
         reference,
         synthesized,
         reused,
+        rebuilt,
     })
 }

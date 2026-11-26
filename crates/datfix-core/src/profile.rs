@@ -97,6 +97,16 @@ impl Profile {
         )
     }
 
+    /// Plain description such as `Canon EOS R5 Mark II, 4K 119.88p`.
+    pub fn plain(&self) -> String {
+        format!(
+            "{}, {} {}p",
+            crate::layout::friendly_body(&self.body),
+            crate::layout::resolution_text(self.width, self.height),
+            crate::layout::fps_text(self.frame_rate().fps())
+        )
+    }
+
     /// Turns the profile into a reference that the repair can use like a healthy clip.
     pub fn to_reference(&self) -> Result<Reference, String> {
         let ftyp = from_hex(&self.ftyp)?;
