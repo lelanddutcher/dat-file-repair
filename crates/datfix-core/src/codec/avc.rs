@@ -129,10 +129,18 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, String> {
         }
     }
     let log2_max_frame_num = r.ue()? + 4;
+    if log2_max_frame_num > 16 {
+        return Err("log2_max_frame_num out of range".into());
+    }
     let poc_type = r.ue()?;
     let mut log2_max_poc_lsb = 0;
     match poc_type {
-        0 => log2_max_poc_lsb = r.ue()? + 4,
+        0 => {
+            log2_max_poc_lsb = r.ue()? + 4;
+            if log2_max_poc_lsb > 16 {
+                return Err("log2_max_pic_order_cnt_lsb out of range".into());
+            }
+        }
         1 => {
             r.skip(1)?;
             r.se()?;
@@ -146,9 +154,14 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, String> {
     }
     r.ue()?; // max_num_ref_frames
     r.skip(1)?; // gaps_in_frame_num_value_allowed_flag
-    let width = (r.ue()? + 1) * 16;
+    let width_mbs = r.ue()? + 1;
     let height_units = r.ue()? + 1;
     let frame_mbs_only = r.flag()?;
+    // Level 6.2 allows 139264 macroblocks per frame; anything near u32 range is garbage.
+    if width_mbs > 1 << 16 || height_units > 1 << 16 {
+        return Err("picture size out of range".into());
+    }
+    let width = width_mbs * 16;
     Ok(Sps {
         id,
         separate_colour_plane,

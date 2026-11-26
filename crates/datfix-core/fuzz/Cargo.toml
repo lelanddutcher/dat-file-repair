@@ -1,0 +1,52 @@
+# Fuzz targets for datfix-core (cargo-fuzz, libFuzzer). Needs a nightly toolchain:
+#
+#   cargo +nightly fuzz run repi_walk -- -max_total_time=300
+#
+# Run from `crates/datfix-core`. Not a member of the main workspace, so stable builds
+# never see it. Seeds go in `corpus/<target>/` (ignored by git; see docs/testing).
+[package]
+name = "datfix-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+datfix-core = { path = ".." }
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "repi_walk"
+path = "fuzz_targets/repi_walk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mp4_reference"
+path = "fuzz_targets/mp4_reference.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_headers"
+path = "fuzz_targets/codec_headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "repair_plan"
+path = "fuzz_targets/repair_plan.rs"
+test = false
+doc = false
+bench = false

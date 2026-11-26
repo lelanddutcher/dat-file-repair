@@ -773,11 +773,13 @@ dependencies = [
 name = "datfix-core"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "memchr",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

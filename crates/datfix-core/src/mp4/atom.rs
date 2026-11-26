@@ -140,8 +140,19 @@ impl Atom {
     }
 }
 
+/// Deepest box nesting accepted. Real files nest about 6 levels (`moov/trak/mdia/minf/stbl`);
+/// a crafted file could nest containers until the stack overflows.
+const MAX_DEPTH: usize = 32;
+
 /// Parses a byte slice that holds a sequence of boxes.
 pub fn parse_atoms(data: &[u8]) -> Result<Vec<Atom>, String> {
+    parse_atoms_at(data, 0)
+}
+
+fn parse_atoms_at(data: &[u8], depth: usize) -> Result<Vec<Atom>, String> {
+    if depth > MAX_DEPTH {
+        return Err("boxes are nested too deeply".into());
+    }
     let mut atoms = Vec::new();
     let mut pos = 0usize;
     while pos < data.len() {
@@ -169,7 +180,7 @@ pub fn parse_atoms(data: &[u8]) -> Result<Vec<Atom>, String> {
             }
             n => (n as u64, 8),
         };
-        if size < header as u64 || pos as u64 + size > data.len() as u64 {
+        if size < header as u64 || size > (data.len() - pos) as u64 {
             return Err(format!(
                 "box {kind} at position {pos} claims {size} bytes but only {} are left",
                 data.len() - pos
@@ -177,7 +188,9 @@ pub fn parse_atoms(data: &[u8]) -> Result<Vec<Atom>, String> {
         }
         let payload = &data[pos + header..pos + size as usize];
         let body = if CONTAINERS.iter().any(|c| **c == kind.0) {
-            Body::Container(parse_atoms(payload).map_err(|e| format!("inside {kind}: {e}"))?)
+            Body::Container(
+                parse_atoms_at(payload, depth + 1).map_err(|e| format!("inside {kind}: {e}"))?,
+            )
         } else {
             Body::Leaf(payload.to_vec())
         };
@@ -205,7 +218,7 @@ pub fn scan_top_level<R: ReadAt + ?Sized>(src: &R) -> std::io::Result<Vec<TopBox
     let len = src.size();
     let mut out = Vec::new();
     let mut pos = 0u64;
-    while pos + 8 <= len {
+    while len.saturating_sub(pos) >= 8 {
         let mut h = [0u8; 16];
         let avail = (len - pos).min(16) as usize;
         src.read_exact_at(&mut h[..avail], pos)?;
@@ -264,6 +277,26 @@ mod tests {
         let mut bytes = Atom::leaf(b"abcd", vec![0; 4]).to_bytes();
         bytes[3] = 100;
         assert!(parse_atoms(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_deep_nesting_and_huge_sizes_without_panicking() {
+        // 100,000 nested trak boxes would overflow the stack if parsed recursively.
+        let mut b: Vec<u8> = Vec::new();
+        for _ in 0..100_000 {
+            let mut outer = ((b.len() + 8) as u32).to_be_bytes().to_vec();
+            outer.extend_from_slice(b"trak");
+            outer.extend(b);
+            b = outer;
+        }
+        assert!(parse_atoms(&b).unwrap_err().contains("nested too deeply"));
+        // A 64-bit size near u64::MAX must not overflow the bounds check.
+        let mut big = vec![0, 0, 0, 1];
+        big.extend_from_slice(b"free");
+        big.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert!(parse_atoms(&big).is_err());
+        let boxes = scan_top_level(&big).unwrap();
+        assert_eq!(boxes.len(), 1);
     }
 
     #[test]

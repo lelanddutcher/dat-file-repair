@@ -626,3 +626,36 @@ fn all_intra_dat_with_long_gop_reference_keeps_every_frame() {
     // No shift: the first frame plays at time zero and the last one is not cut off.
     assert_eq!(v.edit_media_time.unwrap_or(0), 0);
 }
+
+/// Writes fuzzing seeds (synthetic `.DAT` files and reference clips) into the folder named by
+/// `DATFIX_FUZZ_SEEDS`. Skipped when unset. See docs/testing/corpus-results.md.
+#[test]
+fn write_fuzz_seeds() {
+    let Some(dir) = std::env::var_os("DATFIX_FUZZ_SEEDS") else {
+        return;
+    };
+    let dir = Path::new(&dir);
+    for t in ["repi_walk", "repair_plan", "mp4_reference", "codec_headers"] {
+        std::fs::create_dir_all(dir.join(t)).unwrap();
+    }
+    for (name, intervals, pcm) in [("v", 2, 0), ("a1", 2, 1), ("a2", 3, 2), ("a4", 2, 4)] {
+        let dat = common::dat(intervals, pcm);
+        let reference = common::reference(pcm, &common::dat(2, pcm)[16..]);
+        write(&dir.join(format!("repi_walk/{name}.DAT")), &dat);
+        write(&dir.join(format!("repair_plan/{name}.DAT")), &dat);
+        let mut both = b"REF1".to_vec();
+        both.extend((reference.len() as u32).to_be_bytes());
+        both.extend(&reference);
+        both.extend(&dat);
+        write(&dir.join(format!("repair_plan/{name}_ref.bin")), &both);
+        write(&dir.join(format!("mp4_reference/{name}.MP4")), &reference);
+    }
+    let mut hvcc = vec![0u8];
+    hvcc.extend(common::hvcc());
+    write(&dir.join("codec_headers/hvcc.bin"), &hvcc);
+    for (i, (t, poc)) in common::GOP.iter().enumerate() {
+        let mut f = vec![4u8];
+        f.extend(common::frame(*t, *poc, 64));
+        write(&dir.join(format!("codec_headers/frame{i}.bin")), &f);
+    }
+}

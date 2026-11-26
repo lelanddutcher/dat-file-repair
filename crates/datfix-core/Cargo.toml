@@ -13,5 +13,12 @@ serde_json.workspace = true
 thiserror.workspace = true
 memchr = "2"
 
+# File system type and free space of the output drive (see `volume.rs`).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tempfile.workspace = true

@@ -352,15 +352,21 @@ const NOT_ORIGINAL: &str =
 
 /// Opens a candidate clip and rejects files that cannot be camera originals.
 pub fn open_candidate(path: &Path) -> std::result::Result<Reference, Reason> {
-    let r = Reference::open(path).map_err(|e| {
-        let detail = match e {
-            Error::BadReference { reason, .. } => reason,
-            other => other.to_string(),
-        };
-        Reason::new(
-            "It can't be read as a video file (it may be damaged or not fully copied).",
-            detail,
-        )
+    let r = Reference::open(path).map_err(|e| match e {
+        Error::NotAClip { what, .. } => Reason::new(
+            format!("It is {what}."),
+            format!("not a video clip: {what}"),
+        ),
+        other => {
+            let detail = match other {
+                Error::BadReference { reason, .. } => reason,
+                other => other.to_string(),
+            };
+            Reason::new(
+                "It can't be read as a video file (it may be damaged or not fully copied).",
+                detail,
+            )
+        }
     })?;
     let brands: Vec<String> = r
         .ftyp

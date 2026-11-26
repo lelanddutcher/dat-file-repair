@@ -15,6 +15,9 @@
 use super::atom::Atom;
 use super::bytes::{ByteReader, PutBe};
 
+/// Largest number of samples a parsed table may expand to (about 1 GB of memory).
+pub const MAX_EXPANDED_SAMPLES: u64 = 1 << 26;
+
 /// Seconds between 1904-01-01 (the MP4 epoch) and 1970-01-01 (the Unix epoch).
 pub const MP4_EPOCH_OFFSET: u64 = 2_082_844_800;
 
@@ -295,6 +298,9 @@ pub fn parse_ctts(payload: &[u8]) -> Result<Vec<i64>, String> {
     let mut out = Vec::new();
     for _ in 0..n {
         let count = r.u32()?;
+        if out.len() as u64 + count as u64 > MAX_EXPANDED_SAMPLES {
+            return Err("ctts describes implausibly many samples".into());
+        }
         let raw = r.u32()?;
         let off = if version == 1 {
             raw as i32 as i64
@@ -355,7 +361,14 @@ pub fn sample_locations(stbl: &Atom) -> Result<Vec<(u64, u32)>, String> {
     let chunks = parse_chunk_offsets(co)?;
     let size_of = |i: usize| if fixed > 0 { fixed } else { sizes[i] };
 
-    let mut out = Vec::with_capacity(count as usize);
+    if fixed == 0 && sizes.len() < count as usize {
+        return Err("stsz lists fewer sizes than samples".into());
+    }
+    if count as u64 > MAX_EXPANDED_SAMPLES {
+        return Err("stsz describes implausibly many samples".into());
+    }
+    // `count` comes from the file: grow the list as samples are found instead of trusting it.
+    let mut out = Vec::with_capacity((count as usize).min(1 << 20));
     for (ci, &chunk_off) in chunks.iter().enumerate() {
         let chunk_no = ci as u32 + 1;
         // The last stsc entry whose first_chunk <= this chunk applies.
@@ -372,7 +385,9 @@ pub fn sample_locations(stbl: &Atom) -> Result<Vec<(u64, u32)>, String> {
             }
             let s = size_of(out.len());
             out.push((off, s));
-            off += s as u64;
+            off = off
+                .checked_add(s as u64)
+                .ok_or("chunk offset past the 64-bit range")?;
         }
     }
     Ok(out)

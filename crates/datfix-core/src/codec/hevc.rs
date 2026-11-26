@@ -241,6 +241,10 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, String> {
     let separate_colour_plane = chroma_format_idc == 3 && r.flag()?;
     let width = r.ue()?;
     let height = r.ue()?;
+    // Level 6.2 tops out at 16888 samples per side; anything far above is not a real SPS.
+    if width > 1 << 16 || height > 1 << 16 {
+        return Err("picture size out of range".into());
+    }
     if r.flag()? {
         // conformance window offsets
         for _ in 0..4 {
@@ -304,6 +308,10 @@ fn parse_st_rps(r: &mut BitReader, idx: usize, sets: &[StRps]) -> Result<StRps, 
             .ok_or("RPS refers to a missing set")?;
         let sign = r.flag()?;
         let abs = r.ue()? as i32 + 1;
+        // delta_rps is within ±2^15 (§7.4.8); larger values would overflow the sums below.
+        if abs > 1 << 15 {
+            return Err("delta_rps out of range".into());
+        }
         let delta_rps = if sign { -abs } else { abs };
         let n = reference.num_delta_pocs();
         let mut used = vec![false; n + 1];
@@ -361,15 +369,23 @@ fn parse_st_rps(r: &mut BitReader, idx: usize, sets: &[StRps]) -> Result<StRps, 
             return Err("too many reference pictures".into());
         }
         let mut out = StRps::default();
+        // Each delta is at most 2^15 (§7.4.8), so 16 of them stay far inside i32.
+        let delta = |r: &mut BitReader| -> Result<i32, String> {
+            let d = r.ue()?;
+            if d >= 1 << 15 {
+                return Err("delta_poc out of range".into());
+            }
+            Ok(d as i32 + 1)
+        };
         let mut poc = 0i32;
         for _ in 0..neg {
-            poc -= r.ue()? as i32 + 1;
+            poc -= delta(r)?;
             out.delta_s0.push(poc);
             out.used_s0.push(r.flag()?);
         }
         poc = 0;
         for _ in 0..pos {
-            poc += r.ue()? as i32 + 1;
+            poc += delta(r)?;
             out.delta_s1.push(poc);
             out.used_s1.push(r.flag()?);
         }
@@ -395,7 +411,7 @@ fn parse_sps_ext(
         r.ue()?;
     }
     let log2_min_cb = r.ue()? + 3;
-    let log2_ctb_size = log2_min_cb + r.ue()?;
+    let log2_ctb_size = log2_min_cb.saturating_add(r.ue()?);
     if !(4..=6).contains(&log2_ctb_size) {
         return Err("CTB size out of range".into());
     }
@@ -491,8 +507,8 @@ fn parse_pps_ext(rbsp: &[u8]) -> Result<PpsExt, String> {
     p.tiles = r.flag()?;
     p.entropy_coding_sync = r.flag()?;
     if p.tiles {
-        let cols = r.ue()?;
-        let rows = r.ue()?;
+        let cols = r.ue()? as u64;
+        let rows = r.ue()? as u64;
         if !r.flag()? {
             for _ in 0..cols + rows {
                 r.ue()?;

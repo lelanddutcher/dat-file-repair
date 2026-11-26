@@ -293,7 +293,7 @@ fn guess_codec<R: ReadAt + ?Sized>(src: &R, g: &Group) -> Option<(FourCC, bool)>
         }
         let b = src.read_vec(off, 6).ok()?;
         let nal_len = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-        if nal_len == 0 || nal_len + 4 > size {
+        if nal_len == 0 || nal_len as u64 + 4 > size as u64 {
             continue;
         }
         let (h0, h1) = (b[4], b[5]);

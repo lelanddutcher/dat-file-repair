@@ -17,10 +17,11 @@ use crate::mapping::TrackPlan;
 use crate::mp4::reference::{Reference, TrackKind};
 use crate::mp4::tables::MP4_EPOCH_OFFSET;
 use crate::mp4::writer::{self, TrackOutput, rescale};
-use crate::read_at::{FileSource, ReadAt};
+use crate::read_at::{FileSource, Overlay, ReadAt, Region, Tolerant};
 use crate::repi::{self, DatIndex, Truncation};
 use crate::timeline::{self, TimelineGap};
 use crate::timing::{self, VideoTiming};
+use crate::volume;
 
 pub use crate::select::{
     Candidate, Checked, RefKind, ReferenceSearch, SearchOptions, Verdict, check_reference,
@@ -84,6 +85,9 @@ pub struct RepairOptions {
     /// index walk, which takes about 40 s for a 38 GB file. Ignored when its file size does
     /// not match the file on disk.
     pub index: Option<Arc<DatIndex>>,
+    /// Stop at the first read error. By default (`false`) unreadable parts of a failing card
+    /// are skipped and treated as damage; the report lists them and the seconds lost.
+    pub stop_on_read_error: bool,
 }
 
 /// One output track in the report.
@@ -136,6 +140,11 @@ pub struct RepairReport {
     pub damaged_frames: u64,
     pub tracks: Vec<TrackReport>,
     pub truncation: Option<Truncation>,
+    /// Regions of the `.DAT` that could not be read and were treated as damage.
+    pub unreadable: Vec<Region>,
+    pub unreadable_bytes: u64,
+    /// Seconds of video lost to damaged or unreadable regions (the picture holds over them).
+    pub lost_seconds: f64,
     pub notes: Vec<String>,
 }
 
@@ -317,10 +326,12 @@ pub fn classify_input<R: ReadAt + ?Sized>(path: &Path, src: &R) -> Result<()> {
     let head = src
         .read_vec(0, len.min(1 << 20) as usize)
         .map_err(|e| Error::io(format!("cannot read {}", path.display()), e))?;
-    if head.iter().all(|&b| b == 0) {
-        return Err(Error::EmptyDat {
+    // A file that starts with zeros may still hold a recording further in (a piece carved
+    // from a card image). The index walk scans for it; an all-zero file is reported after.
+    if let Some(detail) = playable_mp4(src) {
+        return Err(Error::AlreadyPlayable {
             path: path.to_path_buf(),
-            detail: "only zero bytes".into(),
+            detail,
         });
     }
     if head.len() >= 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"CDXA" {
@@ -341,6 +352,13 @@ pub fn classify_input<R: ReadAt + ?Sized>(path: &Path, src: &R) -> Result<()> {
         && head[0..8] == [0, 0, 0, 0, b'm', b'd', b'a', b't']
         && &head[12..16] == b"wide";
     let has_repi = head.windows(4).any(|w| w == repi::MAGIC);
+    if canon_header && !has_repi && len == head.len() as u64 && head[16..].iter().all(|&b| b == 0) {
+        // The camera wrote the header and stopped before the first group.
+        return Err(Error::NoFrames {
+            path: path.to_path_buf(),
+            detail: format!("the file is only {len} bytes and holds no recovery index"),
+        });
+    }
     if canon_header && !has_repi {
         return Err(Error::Unsupported(
             "this is an unfinished Canon recording, but from a body that does not write a \
@@ -351,6 +369,38 @@ pub fn classify_input<R: ReadAt + ?Sized>(path: &Path, src: &R) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Recognizes a finished MP4/MOV (renamed to `.DAT`): `ftyp`, a `moov` with at least one
+/// track, and an `mdat` with data. Returns a short technical description.
+pub fn playable_mp4<R: ReadAt + ?Sized>(src: &R) -> Option<String> {
+    let boxes = crate::mp4::atom::scan_top_level(src).ok()?;
+    let ftyp = boxes.iter().find(|b| b.kind.0 == *b"ftyp")?;
+    let moov = boxes.iter().find(|b| b.kind.0 == *b"moov")?;
+    let mdat = boxes.iter().find(|b| b.kind.0 == *b"mdat")?;
+    let len = src.size();
+    // A moov that is cut short or an empty mdat means the file is not complete.
+    if moov.offset + moov.size > len || mdat.size <= mdat.header_len || moov.size > 512 << 20 {
+        return None;
+    }
+    let bytes = src.read_vec(moov.offset, moov.size as usize).ok()?;
+    let atoms = crate::mp4::atom::parse_atoms(&bytes).ok()?;
+    let tracks = atoms
+        .first()?
+        .children()
+        .iter()
+        .filter(|a| a.kind.0 == *b"trak")
+        .count();
+    if tracks == 0 {
+        return None;
+    }
+    let mut brand = [0u8; 4];
+    src.read_exact_at(&mut brand, ftyp.offset + 8).ok()?;
+    Some(format!(
+        "file type '{}', {tracks} track(s), {} bytes of media",
+        String::from_utf8_lossy(&brand),
+        mdat.size - mdat.header_len
+    ))
 }
 
 /// Picks the creation time: the Canon file name (local time) adjusted to UTC with the
@@ -388,44 +438,124 @@ fn creation_time(layout: &DatLayout, mtime: Option<i64>, duration: f64) -> (Opti
     }
 }
 
-/// Repairs `dat` into `output`.
-pub fn repair(
+/// Everything decided before the output is written: settings, sample tables, the new `moov`.
+pub struct RepairPlan {
+    pub reference: Reference,
+    pub plans: Vec<TrackPlan>,
+    pub timing: VideoTiming,
+    pub kind: RefKind,
+    pub label: String,
+    pub synthesized: Vec<String>,
+    pub rebuilt: Vec<String>,
+    pub settings: String,
+    pub profile: Option<String>,
+    pub layout: DatLayout,
+    pub gaps: Vec<TimelineGap>,
+    pub trimmed: Vec<u64>,
+    pub damaged: u64,
+    pub notes: Vec<String>,
+    pub created: Option<i64>,
+    pub created_source: String,
+    pub truncation: Option<Truncation>,
+    /// `.DAT` bytes `[copy_start, copy_end)` become the `mdat` payload, then `silence` zeros.
+    pub copy_start: u64,
+    pub copy_end: u64,
+    pub silence: u64,
+    /// The serialized `moov` box.
+    pub moov: Vec<u8>,
+}
+
+impl RepairPlan {
+    /// Size of the output file in bytes.
+    pub fn output_size(&self) -> u64 {
+        self.reference.ftyp.len() as u64
+            + self.moov.len() as u64
+            + 16
+            + (self.copy_end - self.copy_start)
+            + self.silence
+    }
+
+    /// Where the payload starts in the output file.
+    pub fn payload_offset(&self) -> u64 {
+        self.reference.ftyp.len() as u64 + self.moov.len() as u64 + 16
+    }
+
+    /// Seconds of video lost to damaged or unreadable regions.
+    pub fn lost_seconds(&self) -> f64 {
+        let frames: i64 = self.gaps.iter().map(|g| g.lost_frames).sum();
+        let vt = self.plans.iter().find(|p| p.repi_type.0 == *b"vide");
+        vt.map_or(0.0, |p| {
+            frames as f64 * self.reference.tracks[p.ref_track].sample_seconds()
+        })
+    }
+}
+
+/// Removes, or cuts short, every group whose bytes touch an unreadable region, so the
+/// timeline treats the region as damage (frames lost, picture held, audio silent).
+pub fn exclude_unreadable(index: &DatIndex, bad: &[Region]) -> DatIndex {
+    let mut out = index.clone();
+    if bad.is_empty() {
+        return out;
+    }
+    let hit = |a: u64, b: u64| bad.iter().any(|r| r.overlaps(a, b));
+    out.groups.retain_mut(|g| {
+        if hit(g.header_offset, g.data_offset()) {
+            return false;
+        }
+        if hit(g.data_offset(), g.complete_end()) {
+            g.complete = g
+                .samples(g.complete)
+                .take_while(|&(o, s)| !hit(o, o + s as u64))
+                .count() as u32;
+        }
+        true
+    });
+    out
+}
+
+/// Plans a repair of `src` (the `.DAT` bytes) without writing anything.
+///
+/// `dat` is the `.DAT`'s path, used for messages, its file name (creation time) and, with
+/// [`ReferenceSource::Auto`], its folder. A [`ReferenceSource::File`] must be opened by the
+/// caller and passed as `given`. `mtime` is the `.DAT`'s modification time (Unix seconds).
+#[allow(clippy::too_many_arguments)]
+pub fn plan_repair<R: ReadAt + ?Sized>(
     dat: &Path,
+    src: &R,
+    index: &DatIndex,
     reference: &ReferenceSource,
-    output: &Path,
+    given: Option<&Reference>,
+    mtime: Option<i64>,
     opts: &RepairOptions,
     on_event: &mut dyn FnMut(&Event),
-) -> Result<RepairReport> {
-    check_output(dat, output, opts)?;
-    let src = FileSource::open(dat)
-        .map_err(|e| Error::io(format!("cannot open {}", dat.display()), e))?;
-    classify_input(dat, &src)?;
-    // Open a single reference first so a typo fails before a long index walk.
-    let given = match reference {
-        ReferenceSource::File(p) => Some(Reference::open(p)?),
-        _ => None,
-    };
-    let walked;
-    let index: &DatIndex = match &opts.index {
-        Some(i) if i.file_size == src.size() => i,
-        _ => {
-            walked = index_dat(&src, opts, on_event)?;
-            &walked
-        }
-    };
+) -> Result<RepairPlan> {
     let name = dat.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let lay = layout::analyze(&src, index, name);
+    let lay = layout::analyze(src, index, name);
+    if !index
+        .groups
+        .iter()
+        .any(|g| g.kind.0 == *b"vide" && g.complete > 0)
+    {
+        return Err(Error::NoFrames {
+            path: dat.to_path_buf(),
+            detail: if index.groups.iter().any(|g| g.kind.0 == *b"vide") {
+                "the file ends inside its first video frame".into()
+            } else {
+                "the index lists no video samples".into()
+            },
+        });
+    }
 
     on_event(&Event::Phase {
         phase: Phase::CheckingReference,
         message: format!("checking decoder settings for {}", lay.describe()),
     });
     let checked = match (given, reference) {
-        (Some(r), _) => check_reference(&src, index, &lay, r, RefKind::User)?,
-        (None, ReferenceSource::Dir(d)) => match choose_from_dir(&src, index, &lay, d, on_event) {
+        (Some(r), _) => check_reference(src, index, &lay, r.clone(), RefKind::User)?,
+        (None, ReferenceSource::Dir(d)) => match choose_from_dir(src, index, &lay, d, on_event) {
             Ok(c) => c,
             Err(dir_err @ Error::NoReference { .. }) => {
-                match choose_profile(&src, index, &lay, on_event) {
+                match choose_profile(src, index, &lay, on_event) {
                     Ok(mut c) => {
                         c.notes.insert(
                             0,
@@ -442,19 +572,19 @@ pub fn repair(
             }
             Err(e) => return Err(e),
         },
-        (None, ReferenceSource::Builtin) => choose_profile(&src, index, &lay, on_event)?,
+        (None, ReferenceSource::Builtin) => choose_profile(src, index, &lay, on_event)?,
         (None, ReferenceSource::Auto) => {
             let dirs: Vec<PathBuf> = dat.parent().map(Path::to_path_buf).into_iter().collect();
             let opts = SearchOptions {
                 depth: 0,
                 ..SearchOptions::default()
             };
-            let found = search_references(&src, index, &lay, &dirs, &opts, on_event)?;
+            let found = search_references(src, index, &lay, &dirs, &opts, on_event)?;
             let (checked, chosen) = (found.checked(), found.chosen);
             match chosen {
                 Some(c) => c,
                 None => {
-                    let mut c = choose_profile(&src, index, &lay, on_event)?;
+                    let mut c = choose_profile(src, index, &lay, on_event)?;
                     if checked > 0 {
                         c.notes.insert(
                             0,
@@ -468,7 +598,9 @@ pub fn repair(
                 }
             }
         }
-        (None, ReferenceSource::File(_)) => unreachable!("opened above"),
+        (None, ReferenceSource::File(p)) => {
+            check_reference(src, index, &lay, Reference::open(p)?, RefKind::User)?
+        }
     };
     let Checked {
         reference,
@@ -494,10 +626,10 @@ pub fn repair(
             t.offset, t.dropped_samples
         ));
     }
-    if !index.rejected_headers.is_empty() {
+    if index.rejected_count > 0 {
         notes.push(format!(
             "{} damaged index header(s) were skipped; the samples they described are lost",
-            index.rejected_headers.len()
+            index.rejected_count
         ));
     }
     if lay.frame_rate.is_some() && !lay.frame_rate_from_audio {
@@ -509,7 +641,7 @@ pub fn repair(
     }
 
     // Keep audio and video in sync across damaged regions.
-    let tl = timeline::build(&src, index, &lay);
+    let tl = timeline::build(src, index, &lay);
     notes.extend(timeline::apply(&tl, &reference, &mut mapping.plans));
     for g in &tl.gaps {
         if g.lost_frames > 0 {
@@ -524,18 +656,11 @@ pub fn repair(
     let trimmed = fit_to_video(&reference, &mut mapping.plans, &mut notes);
 
     let vplan = mapping.video().clone();
-    let (frames, damaged) = analyze_video(&src, &vplan, codec, opts, on_event, &mut notes)?;
+    let (frames, damaged) = analyze_video(src, &vplan, codec, opts, on_event, &mut notes)?;
     let timing = timing::video_timing(&frames);
 
     let vt = &reference.tracks[vplan.ref_track];
     let duration = vplan.duration_units() as f64 * vt.sample_seconds();
-    let mtime = src
-        .file()
-        .metadata()
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64);
     let (created, created_source) = creation_time(&lay, mtime, duration);
     let time = created.map_or(0, |t| (t + MP4_EPOCH_OFFSET as i64).max(0) as u64);
 
@@ -547,7 +672,8 @@ pub fn repair(
         .iter()
         .map(TrackPlan::end_offset)
         .max()
-        .unwrap_or(copy_start);
+        .unwrap_or(copy_start)
+        .max(copy_start);
     let silence = mapping
         .plans
         .iter()
@@ -588,21 +714,92 @@ pub fn repair(
             dropped.join(", ")
         ));
     }
-
-    on_event(&Event::Phase {
-        phase: Phase::Writing,
-        message: format!("writing {}", output.display()),
-    });
-    let tmp = temp_path(output);
-    let mut throttle = Throttle::new();
-    let written = writer::write_file(
-        &tmp,
-        &reference.ftyp,
-        &moov.to_bytes(),
-        &src,
+    let moov = moov.to_bytes();
+    drop(outputs);
+    Ok(RepairPlan {
+        reference,
+        plans: mapping.plans,
+        timing,
+        kind,
+        label,
+        synthesized,
+        rebuilt,
+        settings,
+        profile,
+        layout: lay,
+        gaps: tl.gaps,
+        trimmed,
+        damaged,
+        notes,
+        created,
+        created_source,
+        truncation: index.truncation.clone(),
         copy_start,
         copy_end,
         silence,
+        moov,
+    })
+}
+
+/// Plans with every unreadable region known so far excluded. Reading during planning can
+/// find more bad regions; plan again until none are new.
+#[allow(clippy::too_many_arguments)]
+fn plan_around_bad<R: ReadAt>(
+    dat: &Path,
+    src: &Tolerant<R>,
+    index: &DatIndex,
+    reference: &ReferenceSource,
+    given: Option<&Reference>,
+    mtime: Option<i64>,
+    opts: &RepairOptions,
+    on_event: &mut dyn FnMut(&Event),
+) -> Result<RepairPlan> {
+    let mut tries = 0;
+    loop {
+        let bad = src.bad_regions();
+        let index = exclude_unreadable(index, &bad);
+        let plan = plan_repair(dat, src, &index, reference, given, mtime, opts, on_event)
+            .map_err(|e| unreadable_error(src, e))?;
+        tries += 1;
+        if src.bad_regions().len() == bad.len() || tries >= 8 {
+            return Ok(plan);
+        }
+    }
+}
+
+/// Turns the error of a read that failed because too much was unreadable into
+/// [`Error::TooMuchUnreadable`].
+fn unreadable_error<R: ReadAt>(src: &Tolerant<R>, e: Error) -> Error {
+    if !src.exceeded() {
+        return e;
+    }
+    let (last_offset, source) = src.last_error().expect("exceeded after an error");
+    Error::TooMuchUnreadable {
+        unreadable: src.bad_bytes(),
+        total: src.size(),
+        last_offset,
+        source,
+    }
+}
+
+/// Writes a planned repair to the temporary file `tmp`. Deletes it on failure.
+fn write_plan<R: ReadAt + ?Sized>(
+    tmp: &Path,
+    plan: &RepairPlan,
+    src: &R,
+    opts: &RepairOptions,
+    on_event: &mut dyn FnMut(&Event),
+) -> Result<u64> {
+    src.sequential_hint(true);
+    let mut throttle = Throttle::new();
+    let written = writer::write_file(
+        tmp,
+        &plan.reference.ftyp,
+        &plan.moov,
+        src,
+        plan.copy_start,
+        plan.copy_end,
+        plan.silence,
         &mut |done, total| {
             if throttle.due(done, total) {
                 on_event(&Event::Progress {
@@ -614,13 +811,145 @@ pub fn repair(
             !cancelled(opts)
         },
     );
-    let written = match written {
-        Ok(n) => n,
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
+    if written.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    written
+}
+
+/// Repairs `dat` into `output`.
+pub fn repair(
+    dat: &Path,
+    reference: &ReferenceSource,
+    output: &Path,
+    opts: &RepairOptions,
+    on_event: &mut dyn FnMut(&Event),
+) -> Result<RepairReport> {
+    check_output(dat, output, opts)?;
+    let file = FileSource::open(dat)
+        .map_err(|e| Error::io(format!("cannot open {}", dat.display()), e))?;
+    let mtime = file
+        .file()
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64);
+    repair_from(dat, file, mtime, reference, output, opts, on_event)
+}
+
+/// [`repair`] reading the `.DAT` bytes from `source` instead of opening `dat`. `dat` still
+/// names the recording (messages, creation time, the folder searched for clips). Tests use
+/// it to simulate a failing card.
+pub fn repair_from<R: ReadAt>(
+    dat: &Path,
+    source: R,
+    mtime: Option<i64>,
+    reference: &ReferenceSource,
+    output: &Path,
+    opts: &RepairOptions,
+    on_event: &mut dyn FnMut(&Event),
+) -> Result<RepairReport> {
+    check_output(dat, output, opts)?;
+    let src = Tolerant::new(source, !opts.stop_on_read_error);
+    // Index walk and frame analysis read small scattered pieces.
+    src.sequential_hint(false);
+    classify_input(dat, &src).map_err(|e| unreadable_error(&src, e))?;
+    let out_dir = volume::parent_dir(output);
+    // Fail before a long index walk: a folder that can't be written, or a drive that can't
+    // hold a file as large as the .DAT (the output is about as large).
+    volume::check_writable(&out_dir)?;
+    volume::check_fits(&out_dir, src.size().saturating_sub(16 << 20))?;
+    // Open a single reference first so a typo fails before a long index walk.
+    let given = match reference {
+        ReferenceSource::File(p) => {
+            if same_file(p, dat) {
+                return Err(Error::NotAClip {
+                    path: p.clone(),
+                    what: "the broken .DAT itself".into(),
+                });
+            }
+            Some(Reference::open(p)?)
+        }
+        _ => None,
+    };
+    let walked;
+    let index: &DatIndex = match &opts.index {
+        Some(i) if i.file_size == src.size() => i,
+        _ => {
+            walked = index_dat(&src, opts, on_event)
+                .map_err(|e| unreadable_error(&src, not_a_dat(dat, &src, e)))?;
+            &walked
         }
     };
+
+    let mut plan = plan_around_bad(
+        dat,
+        &src,
+        index,
+        reference,
+        given.as_ref(),
+        mtime,
+        opts,
+        on_event,
+    )?;
+    volume::check_fits(&out_dir, plan.output_size())?;
+
+    on_event(&Event::Phase {
+        phase: Phase::Writing,
+        message: format!("writing {}", output.display()),
+    });
+    let tmp = temp_path(output);
+    let known_bad = src.bad_regions().len();
+    let mut written =
+        write_plan(&tmp, &plan, &src, opts, on_event).map_err(|e| unreadable_error(&src, e))?;
+
+    // New unreadable regions turned up while copying: the tables still point at samples that
+    // were written as zeros. Plan again around every bad region and write a second file,
+    // reading the payload back from the first one instead of from the failing card.
+    if src.bad_regions().len() != known_bad {
+        let first = temp_path_tagged(output, ".pass1");
+        let cleanup = |e: Error| {
+            let _ = std::fs::remove_file(&first);
+            e
+        };
+        std::fs::rename(&tmp, &first)
+            .map_err(|e| Error::io(format!("cannot rename {}", tmp.display()), e))?;
+        let copy = FileSource::open(&first)
+            .map_err(|e| cleanup(Error::io(format!("cannot read {}", first.display()), e)))?;
+        let overlay = Overlay {
+            base: &src,
+            copy,
+            start: plan.copy_start,
+            end: plan.copy_end,
+            copy_offset: plan.payload_offset(),
+        };
+        let index = exclude_unreadable(index, &src.bad_regions());
+        overlay.sequential_hint(false);
+        on_event(&Event::Note {
+            message: format!(
+                "{} unreadable region(s) found while copying; rebuilding the tables around them",
+                src.bad_regions().len() - known_bad
+            ),
+        });
+        let plan2 = plan_repair(
+            dat,
+            &overlay,
+            &index,
+            reference,
+            given.as_ref(),
+            mtime,
+            opts,
+            on_event,
+        )
+        .map_err(cleanup)?;
+        volume::check_fits(&out_dir, plan2.output_size()).map_err(cleanup)?;
+        written = write_plan(&tmp, &plan2, &overlay, opts, on_event).map_err(cleanup)?;
+        drop(overlay);
+        let _ = std::fs::remove_file(&first);
+        plan = plan2;
+    }
+
     if opts.overwrite && output.exists() {
         std::fs::remove_file(output)
             .map_err(|e| Error::io(format!("cannot replace {}", output.display()), e))?;
@@ -633,17 +962,33 @@ pub fn repair(
         )
     })?;
 
-    let mut tracks: Vec<TrackReport> = outputs
+    let unreadable = src.bad_regions();
+    let unreadable_bytes: u64 = unreadable.iter().map(|r| r.len).sum();
+    let lost_seconds = plan.lost_seconds();
+    if unreadable_bytes > 0 {
+        plan.notes.push(format!(
+            "{unreadable_bytes} bytes in {} region(s) could not be read from the card; they are \
+             treated as damage ({lost_seconds:.2} s of video lost in damaged or unreadable parts)",
+            unreadable.len()
+        ));
+    }
+    let plan = plan;
+    let mut tracks: Vec<TrackReport> = plan
+        .plans
         .iter()
-        .zip(&trimmed)
-        .map(|(t, &trim)| TrackReport {
-            track_id: t.ref_track.track_id,
-            handler: t.ref_track.handler,
-            codec: t.ref_track.codec,
-            source: t.plan.repi_type,
-            samples: t.plan.sample_count,
-            duration_seconds: t.media_duration() as f64 / t.ref_track.timescale as f64,
-            trimmed_samples: trim,
+        .zip(&plan.trimmed)
+        .map(|(p, &trim)| {
+            let rt = &plan.reference.tracks[p.ref_track];
+            TrackReport {
+                track_id: rt.track_id,
+                handler: rt.handler,
+                codec: rt.codec,
+                source: p.repi_type,
+                samples: p.sample_count,
+                duration_seconds: (p.duration_units() * rt.sample_delta as u64) as f64
+                    / rt.timescale as f64,
+                trimmed_samples: trim,
+            }
         })
         .collect();
     tracks.sort_by_key(|t| t.track_id);
@@ -651,30 +996,88 @@ pub fn repair(
         .iter()
         .find(|t| t.source.0 == *b"vide")
         .map_or(0.0, |t| t.duration_seconds);
+    let video_frames = plan
+        .plans
+        .iter()
+        .find(|p| p.repi_type.0 == *b"vide")
+        .map_or(0, |p| p.sample_count);
     Ok(RepairReport {
         input: dat.to_path_buf(),
-        reference: PathBuf::from(label),
-        reference_kind: kind,
-        synthesized,
-        rebuilt,
-        settings,
-        profile,
-        camera: lay.camera(),
-        recording: lay.describe(),
-        creation_time: created,
-        creation_time_source: created_source,
-        gaps: tl.gaps,
+        reference: PathBuf::from(plan.label),
+        reference_kind: plan.kind,
+        synthesized: plan.synthesized,
+        rebuilt: plan.rebuilt,
+        settings: plan.settings,
+        profile: plan.profile,
+        camera: plan.layout.camera(),
+        recording: plan.layout.describe(),
+        creation_time: plan.created,
+        creation_time_source: plan.created_source,
+        gaps: plan.gaps,
         output: output.to_path_buf(),
         bytes_written: written,
         duration_seconds,
-        video_frames: vplan.sample_count,
-        keyframes: timing.sync_samples.len() as u64,
-        reordered: timing.reordered,
-        damaged_frames: damaged,
+        video_frames,
+        keyframes: plan.timing.sync_samples.len() as u64,
+        reordered: plan.timing.reordered,
+        damaged_frames: plan.damaged,
         tracks,
-        truncation: index.truncation.clone(),
-        notes,
+        truncation: plan.truncation,
+        unreadable,
+        unreadable_bytes,
+        lost_seconds,
+        notes: plan.notes,
     })
+}
+
+/// True when two paths name the same existing file.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// Turns "no index found" into a clearer error when the file is empty or all zeros.
+pub(crate) fn not_a_dat<R: ReadAt + ?Sized>(dat: &Path, src: &R, e: Error) -> Error {
+    if !matches!(e, Error::NotADat(_)) {
+        return e;
+    }
+    if is_all_zero(src).unwrap_or(false) {
+        return Error::EmptyDat {
+            path: dat.to_path_buf(),
+            detail: "only zero bytes".into(),
+        };
+    }
+    let len = src.size();
+    let mut head = [0u8; 16];
+    let n = len.min(16) as usize;
+    if src.read_exact_at(&mut head[..n], 0).is_ok()
+        && head[..n.min(8)] == [0, 0, 0, 0, b'm', b'd', b'a', b't'][..n.min(8)]
+        && len < 64 * 1024
+    {
+        return Error::NoFrames {
+            path: dat.to_path_buf(),
+            detail: format!("the file is only {len} bytes, shorter than one group of samples"),
+        };
+    }
+    e
+}
+
+/// True when every byte of `src` is zero (reads in 8 MiB blocks; stops at the first non-zero).
+fn is_all_zero<R: ReadAt + ?Sized>(src: &R) -> std::io::Result<bool> {
+    let len = src.size();
+    let mut buf = vec![0u8; (8 << 20).min(len as usize)];
+    let mut pos = 0u64;
+    while pos < len {
+        let n = ((len - pos) as usize).min(buf.len());
+        src.read_exact_at(&mut buf[..n], pos)?;
+        if buf[..n].iter().any(|&b| b != 0) {
+            return Ok(false);
+        }
+        pos += n as u64;
+    }
+    Ok(true)
 }
 
 /// Refuses to write over the input, or over an existing file unless allowed.
@@ -699,11 +1102,37 @@ pub const PARTIAL_SUFFIX: &str = ".datfix-partial";
 
 /// Hidden temp file next to the output; renamed into place on success.
 pub fn temp_path(output: &Path) -> PathBuf {
+    temp_path_tagged(output, "")
+}
+
+/// Longest file name most file systems accept (bytes on macOS/Linux, UTF-16 units on
+/// Windows; the byte count is the stricter of the two).
+const MAX_NAME: usize = 255;
+
+/// `.<name><tag>.datfix-partial` next to `output`. A long name is shortened (on a character
+/// boundary) and given a short hash of the full name, so the temporary name stays within
+/// [`MAX_NAME`] and two long names that share a prefix do not collide.
+fn temp_path_tagged(output: &Path, tag: &str) -> PathBuf {
     let name = output
         .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("output.mp4");
-    output.with_file_name(format!(".{name}{PARTIAL_SUFFIX}"))
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output.mp4".into());
+    let budget = MAX_NAME - 1 - tag.len() - PARTIAL_SUFFIX.len();
+    let short = if name.len() <= budget {
+        name
+    } else {
+        // FNV-1a: stable across runs and platforms, no dependency.
+        let hash = name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
+        });
+        let keep = budget - 9;
+        let mut cut = keep;
+        while !name.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}~{:08x}", &name[..cut], hash as u32)
+    };
+    output.with_file_name(format!(".{short}{tag}{PARTIAL_SUFFIX}"))
 }
 
 /// A temporary file left by a repair that was killed (power loss, force quit).

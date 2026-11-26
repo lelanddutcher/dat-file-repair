@@ -19,6 +19,45 @@ use super::tables;
 
 /// Largest `moov` we are willing to load into memory (a 10-hour clip needs far less).
 const MAX_MOOV: u64 = 512 * 1024 * 1024;
+/// Bytes of a clip's `mdat` searched for the first `repi` group.
+const REPI_SAMPLE_WINDOW: u64 = 8 * 1024 * 1024;
+
+/// Recognizes files that are certainly not a healthy video clip from their first bytes.
+/// Returns what the file is, in plain words.
+pub fn sniff_not_a_clip(head: &[u8]) -> Option<&'static str> {
+    if head.starts_with(&[0, 0, 0, 0, b'm', b'd', b'a', b't']) {
+        return Some("an unfinished recording (.DAT), not a clip that plays");
+    }
+    if head.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("a photo (JPEG)");
+    }
+    if head.starts_with(b"\x89PNG") {
+        return Some("a picture (PNG)");
+    }
+    if head.starts_with(b"II*\0") || head.starts_with(b"MM\0*") {
+        return Some("a photo (TIFF or RAW)");
+    }
+    if head.len() >= 12 && &head[0..4] == b"RIFF" {
+        return Some("a RIFF file (WAV, AVI or similar), not an MP4");
+    }
+    if head.len() >= 4 && head[0..4] == [0x1a, 0x45, 0xdf, 0xa3] {
+        return Some("a Matroska or WebM video, not a camera MP4");
+    }
+    if head.iter().all(|&b| b == 0) && !head.is_empty() {
+        return Some("empty (it starts with only zero bytes)");
+    }
+    None
+}
+
+/// Recognizes `ftyp` brands of files that are not video clips (photos, RAW video).
+fn sniff_brand(ftyp: &[u8]) -> Option<&'static str> {
+    let brand = ftyp.get(8..12)?;
+    match brand {
+        b"crx " => Some("a Canon RAW file (CR3 photo or Cinema RAW Light .CRM video)"),
+        b"heic" | b"heix" | b"mif1" | b"msf1" | b"avif" => Some("a photo (HEIF/AVIF)"),
+        _ => None,
+    }
+}
 
 /// Sound sample entry types that carry uncompressed PCM.
 const PCM_CODECS: [&[u8; 4]; 9] = [
@@ -113,14 +152,31 @@ pub struct Reference {
 impl Reference {
     /// Opens and parses a reference MP4.
     pub fn open(path: &Path) -> Result<Reference> {
+        let src = FileSource::open(path)
+            .map_err(|e| Error::io(format!("cannot open {}", path.display()), e))?;
+        Self::from_source(path, &src)
+    }
+
+    /// Parses a reference from any byte source. `path` is only used for messages.
+    ///
+    /// Every size read from the file is checked against the file length before memory is
+    /// allocated, so a damaged or hostile file fails with an error instead of exhausting memory.
+    pub fn from_source<R: ReadAt + ?Sized>(path: &Path, src: &R) -> Result<Reference> {
         let bad = |reason: String| Error::BadReference {
             path: path.to_path_buf(),
             reason,
         };
-        let src = FileSource::open(path)
-            .map_err(|e| Error::io(format!("cannot open {}", path.display()), e))?;
-        let boxes = atom::scan_top_level(&src)
-            .map_err(|e| Error::io(format!("cannot read {}", path.display()), e))?;
+        let io = |e| Error::io(format!("cannot read {}", path.display()), e);
+        let mut head = [0u8; 64];
+        let head_len = (src.size().min(64)) as usize;
+        src.read_exact_at(&mut head[..head_len], 0).map_err(io)?;
+        if let Some(what) = sniff_not_a_clip(&head[..head_len]) {
+            return Err(Error::NotAClip {
+                path: path.to_path_buf(),
+                what: what.into(),
+            });
+        }
+        let boxes = atom::scan_top_level(src).map_err(io)?;
 
         let find = |kind: &[u8; 4]| boxes.iter().find(|b| b.kind.0 == *kind);
         let ftyp_box =
@@ -131,22 +187,39 @@ impl Reference {
         if moov_box.size > MAX_MOOV || ftyp_box.size > 4096 {
             return Err(bad("its header boxes are implausibly large".into()));
         }
-        let read = |b: &atom::TopBox| {
-            src.read_vec(b.offset, b.size as usize)
-                .map_err(|e| Error::io(format!("cannot read {}", path.display()), e))
-        };
+        for b in [ftyp_box, moov_box] {
+            if b.offset.saturating_add(b.size) > src.size() {
+                return Err(bad(format!(
+                    "the file ends inside its {} box (it is cut short or still copying)",
+                    b.kind
+                )));
+            }
+        }
+        let read = |b: &atom::TopBox| src.read_vec(b.offset, b.size as usize).map_err(io);
         let ftyp = read(ftyp_box)?;
+        if let Some(what) = sniff_brand(&ftyp) {
+            return Err(Error::NotAClip {
+                path: path.to_path_buf(),
+                what: what.into(),
+            });
+        }
         let moov_bytes = read(moov_box)?;
         let mut parsed =
             atom::parse_atoms(&moov_bytes).map_err(|e| bad(format!("broken moov: {e}")))?;
         let moov = parsed.pop().ok_or_else(|| bad("empty moov".into()))?;
         let mut reference = Self::from_parts(path, src.size(), ftyp, moov).map_err(bad)?;
         if let Some(mdat) = find(b"mdat") {
-            // Sample the first groups only; that is enough to see every stream.
-            reference.repi_shapes =
-                repi::walk_from(&src, mdat.offset + mdat.header_len, 32, &mut |_| true)
-                    .ok()
-                    .map(|index| index.shapes());
+            // Sample the first groups only; that is enough to see every stream. Give up after
+            // a few MB without a header: bodies without `repi` have none at all.
+            reference.repi_shapes = repi::walk_window(
+                src,
+                mdat.offset + mdat.header_len,
+                32,
+                REPI_SAMPLE_WINDOW,
+                &mut |_| true,
+            )
+            .ok()
+            .map(|index| index.shapes());
         }
         Ok(reference)
     }
