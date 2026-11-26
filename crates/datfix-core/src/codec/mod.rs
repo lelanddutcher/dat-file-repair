@@ -68,10 +68,15 @@ impl VideoCodec {
 }
 
 /// Facts about one video frame.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FrameInfo {
-    /// Random access point (keyframe).
+    /// Clean random access point: HEVC IDR/BLA, H.264 IDR.
     pub sync: bool,
+    /// HEVC CRA picture. It is a keyframe only when no RASL picture follows it (see timing).
+    pub cra: bool,
+    /// HEVC RASL picture: a leading picture that cannot be decoded when playback starts at the
+    /// CRA before it.
+    pub rasl: bool,
     /// `(sequence, poc)`: sorting by this gives display order.
     pub order: (u32, i64),
 }
@@ -141,7 +146,9 @@ impl FrameAnalyzer {
             VideoCodec::Hevc(cfg) => {
                 let s = hevc::parse_slice(nal, cfg)?;
                 Ok(FrameInfo {
-                    sync: hevc::is_irap(s.nal_type),
+                    sync: (16..=20).contains(&s.nal_type),
+                    cra: s.nal_type == 21,
+                    rasl: s.nal_type == 8 || s.nal_type == 9,
                     order: self.hevc_poc.next(&s),
                 })
             }
@@ -150,6 +157,7 @@ impl FrameAnalyzer {
                 Ok(FrameInfo {
                     sync: s.nal_type == 5,
                     order: self.avc_poc.next(&s)?,
+                    ..Default::default()
                 })
             }
         }

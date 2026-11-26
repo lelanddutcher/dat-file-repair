@@ -24,11 +24,15 @@ pub struct VideoTiming {
 }
 
 /// Computes keyframes and composition offsets for frames listed in decode order.
+///
+/// Keyframes are IDR/BLA pictures, plus CRA pictures that no RASL picture follows. A CRA with
+/// RASL leading pictures is not a clean seek point (those pictures reference frames before
+/// the CRA), and Canon's own files do not list it in `stss` either.
 pub fn video_timing(frames: &[FrameInfo]) -> VideoTiming {
     let sync_samples: Vec<u32> = frames
         .iter()
         .enumerate()
-        .filter(|(_, f)| f.sync)
+        .filter(|&(i, f)| f.sync || (f.cra && !frames.get(i + 1).is_some_and(|n| n.rasl)))
         .map(|(i, _)| i as u32 + 1)
         .collect();
 
@@ -68,7 +72,25 @@ mod tests {
         FrameInfo {
             sync,
             order: (0, poc),
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn cra_with_rasl_is_not_a_keyframe() {
+        let cra = |poc| FrameInfo {
+            cra: true,
+            order: (0, poc),
+            ..Default::default()
+        };
+        let rasl = |poc| FrameInfo {
+            rasl: true,
+            order: (0, poc),
+            ..Default::default()
+        };
+        // IDR, P, CRA + RASL, CRA without leading pictures.
+        let t = video_timing(&[f(true, 0), f(false, 1), cra(4), rasl(3), cra(5)]);
+        assert_eq!(t.sync_samples, vec![1, 5]);
     }
 
     #[test]
@@ -100,17 +122,12 @@ mod tests {
     #[test]
     fn sequences_sort_after_each_other() {
         let frames = [
-            FrameInfo {
-                sync: true,
-                order: (0, 0),
-            },
-            FrameInfo {
-                sync: false,
-                order: (0, 1),
-            },
+            f(true, 0),
+            f(false, 1),
             FrameInfo {
                 sync: true,
                 order: (1, 0),
+                ..Default::default()
             },
         ];
         let t = video_timing(&frames);

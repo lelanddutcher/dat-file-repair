@@ -184,7 +184,11 @@ impl DatIndex {
     pub fn shapes(&self) -> Vec<StreamShape> {
         let mut out: Vec<StreamShape> = Vec::new();
         let mut counts: Vec<std::collections::HashMap<u32, usize>> = Vec::new();
+        let mut run = 0u32;
+        let mut prev: Option<FourCC> = None;
         for g in &self.groups {
+            run = if prev == Some(g.kind) { run + 1 } else { 1 };
+            prev = Some(g.kind);
             let i = match out.iter().position(|s| s.kind == g.kind) {
                 Some(i) => i,
                 None => {
@@ -193,6 +197,7 @@ impl DatIndex {
                         typical_samples: 0,
                         fixed_size: g.fixed_size,
                         align: g.align,
+                        streams: 1,
                     });
                     counts.push(Default::default());
                     out.len() - 1
@@ -203,6 +208,7 @@ impl DatIndex {
                 *counts[i].entry(g.declared).or_default() += 1;
             }
             out[i].align = out[i].align.max(g.align);
+            out[i].streams = out[i].streams.max(run);
         }
         for (s, c) in out.iter_mut().zip(counts) {
             s.typical_samples = c
@@ -224,6 +230,8 @@ pub struct StreamShape {
     pub fixed_size: u32,
     /// Sample alignment (1 = packed).
     pub align: u32,
+    /// Groups of this type in a row, for example 4 for four mono PCM channels.
+    pub streams: u32,
 }
 
 /// Why a candidate header was not accepted.

@@ -358,6 +358,12 @@ fn compare_shapes(
                 r.typical_samples, r.kind, d.typical_samples
             ));
         }
+        if d.streams != r.streams {
+            reasons.push(format!(
+                "the reference records {} '{}' stream(s) per interval but the .DAT records {}",
+                r.streams, r.kind, d.streams
+            ));
+        }
     }
     let extra: Vec<String> = theirs
         .iter()

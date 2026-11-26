@@ -192,7 +192,7 @@ pub fn check_reference<R: ReadAt + ?Sized>(
             }
         }
     }
-    if !vt.has_stss && !vt.has_ctts && probed.iter().any(|f| !f.sync) {
+    if !vt.has_stss && !vt.has_ctts && probed.iter().any(|f| !f.sync && !f.cra) {
         let reason = "the .DAT is Long GOP (it has non-key frames) but the reference is All-Intra"
             .to_string();
         return Err(incompatible(&reference, vec![reason]));
@@ -286,8 +286,8 @@ fn analyze_video<R: ReadAt + ?Sized>(
                 }
                 // Keep the frame in decode order right after its predecessor.
                 FrameInfo {
-                    sync: false,
                     order: frames.last().map_or((0, 0), |f: &FrameInfo| f.order),
+                    ..Default::default()
                 }
             }
         };
