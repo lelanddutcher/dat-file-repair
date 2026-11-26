@@ -7,8 +7,9 @@ use serde::Serialize;
 
 use crate::error::{Error, Result};
 use crate::fourcc::FourCC;
+use crate::layout::{self, DatLayout};
 use crate::read_at::FileSource;
-use crate::repair::{Event, RepairOptions, index_dat};
+use crate::repair::{Event, RepairOptions, classify_input, index_dat};
 use crate::repi::{DatIndex, Truncation};
 
 /// Canon cameras record audio at 48 kHz. Used only for the duration estimate.
@@ -50,6 +51,8 @@ pub struct InspectReport {
     pub estimated_seconds: Option<f64>,
     /// Estimated video frame rate from the same data.
     pub estimated_fps: Option<f64>,
+    /// Body, codec, frame rate and family as read from the `.DAT`.
+    pub layout: Option<DatLayout>,
 }
 
 /// Builds the summary from an index.
@@ -138,6 +141,7 @@ pub fn summarize(path: &Path, index: &DatIndex) -> InspectReport {
         truncation: index.truncation.clone(),
         estimated_seconds,
         estimated_fps,
+        layout: None,
     }
 }
 
@@ -145,6 +149,14 @@ pub fn summarize(path: &Path, index: &DatIndex) -> InspectReport {
 pub fn inspect(path: &Path, on_event: &mut dyn FnMut(&Event)) -> Result<InspectReport> {
     let src = FileSource::open(path)
         .map_err(|e| Error::io(format!("cannot open {}", path.display()), e))?;
+    classify_input(path, &src)?;
     let index = index_dat(&src, &RepairOptions::default(), on_event)?;
-    Ok(summarize(path, &index))
+    let mut report = summarize(path, &index);
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let lay = layout::analyze(&src, &index, name);
+    if let Some(r) = lay.frame_rate {
+        report.estimated_fps = Some(r.fps());
+    }
+    report.layout = Some(lay);
+    Ok(report)
 }

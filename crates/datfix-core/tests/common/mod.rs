@@ -325,9 +325,14 @@ fn trak(
 /// A reference MP4: video (hvc1, 25 fps), `pcm_tracks` mono ipcm tracks, tmcd. Its `mdat`
 /// holds `mdat_payload` so the walker can read its repi layout.
 pub fn reference(pcm_tracks: usize, mdat_payload: &[u8]) -> Vec<u8> {
+    reference_at(pcm_tracks, mdat_payload, 1000)
+}
+
+/// Like [`reference`], with the video sample duration in 1/25000 s (1000 = 25 fps).
+pub fn reference_at(pcm_tracks: usize, mdat_payload: &[u8], video_delta: u32) -> Vec<u8> {
     let mut children = vec![
         mvhd(1000),
-        trak(1, b"vide", 25000, (b"hvc1", video_entry()), 1000, 0),
+        trak(1, b"vide", 25000, (b"hvc1", video_entry()), video_delta, 0),
     ];
     for i in 0..pcm_tracks {
         children.push(trak(

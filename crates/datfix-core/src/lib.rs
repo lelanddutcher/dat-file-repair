@@ -24,12 +24,17 @@
 pub mod codec;
 pub mod error;
 pub mod fourcc;
+pub mod hybrid;
 pub mod inspect;
+pub mod layout;
 pub mod mapping;
 pub mod mp4;
+pub mod profile;
 pub mod read_at;
 pub mod repair;
 pub mod repi;
+pub mod select;
+pub mod timeline;
 pub mod timing;
 
 pub use error::{Error, Result};

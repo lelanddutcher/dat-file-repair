@@ -48,6 +48,19 @@ impl serde::Serialize for FourCC {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for FourCC {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        let b = s.as_bytes();
+        if b.len() != 4 {
+            return Err(serde::de::Error::custom(format!(
+                "'{s}' is not a four-character code"
+            )));
+        }
+        Ok(FourCC::from_slice(b))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

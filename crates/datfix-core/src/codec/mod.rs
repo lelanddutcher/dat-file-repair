@@ -67,6 +67,104 @@ impl VideoCodec {
     }
 }
 
+/// Bytes of each slice NAL read for a full header check (wavefront entry points need room).
+const VERIFY_HEADER_BYTES: usize = 4096;
+
+/// How well a frame fits a set of parameter sets (see [`verify_frame`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FrameFit {
+    /// Slice segments whose complete header parsed and ended on the alignment bit.
+    pub full_checks: u32,
+    /// Slice segments in the frame.
+    pub slices: u32,
+}
+
+/// Checks one frame against the codec settings more strictly than [`FrameAnalyzer::analyze`]:
+/// every NAL length must fit, and every HEVC slice segment header must parse completely,
+/// end on its alignment bit, and agree with the picture size (slice addresses, wavefront
+/// entry points). Used to choose between candidate settings when no reference is given.
+pub fn verify_frame<R: ReadAt + ?Sized>(
+    src: &R,
+    codec: &VideoCodec,
+    offset: u64,
+    size: u32,
+) -> Result<FrameFit, String> {
+    let ls = codec.length_size() as u64;
+    let end = offset + size as u64;
+    let mut pos = offset;
+    let mut fit = FrameFit::default();
+    let mut first_rows: Option<(u32, u32, bool)> = None;
+    while pos < end {
+        if pos + ls > end {
+            return Err("frame ends inside a NAL length".into());
+        }
+        let mut head = [0u8; 4];
+        src.read_exact_at(&mut head[..ls as usize], pos)
+            .map_err(|e| e.to_string())?;
+        let nal_len = head[..ls as usize]
+            .iter()
+            .fold(0u64, |a, &b| (a << 8) | b as u64);
+        let nal_start = pos + ls;
+        if nal_len < 2 || nal_start + nal_len > end {
+            return Err(format!(
+                "NAL unit length {nal_len} at byte {} does not fit the frame",
+                pos - offset
+            ));
+        }
+        let take = (nal_len as usize).min(VERIFY_HEADER_BYTES);
+        let nal = src.read_vec(nal_start, take).map_err(|e| e.to_string())?;
+        match codec {
+            VideoCodec::Hevc(cfg) => {
+                if nal[0] & 0x80 != 0 || nal[1] & 7 == 0 {
+                    return Err("invalid HEVC NAL header".into());
+                }
+                if hevc::is_vcl(hevc::nal_type(nal[0])) {
+                    fit.slices += 1;
+                    if let Some(c) = hevc::check_slice(&nal, cfg)? {
+                        if fit.slices == 1 && !c.first_in_picture {
+                            return Err("frame does not start with its first slice".into());
+                        }
+                        let data = nal_len.saturating_sub(2 + c.header_bytes as u64);
+                        if c.entry_bytes >= data.max(1) {
+                            return Err(format!(
+                                "entry points span {} bytes but the slice holds {data}",
+                                c.entry_bytes
+                            ));
+                        }
+                        if fit.slices == 1 {
+                            first_rows = Some((c.entry_points, c.ctbs.1, c.wavefront && !c.tiles));
+                        }
+                        fit.full_checks += 1;
+                    }
+                }
+            }
+            VideoCodec::Avc(cfg) => {
+                if nal[0] & 0x80 != 0 {
+                    return Err("invalid H.264 NAL header".into());
+                }
+                if avc::is_vcl(avc::nal_type(nal[0])) {
+                    fit.slices += 1;
+                    avc::parse_slice(&nal, cfg)?;
+                }
+            }
+        }
+        pos = nal_start + nal_len;
+    }
+    if fit.slices == 0 {
+        return Err("frame contains no slice".into());
+    }
+    // One wavefront slice covers every CTB row: entry points = rows - 1.
+    if let Some((entry_points, rows, wpp)) = first_rows {
+        if wpp && fit.slices == 1 && entry_points + 1 != rows {
+            return Err(format!(
+                "the frame has {} CTB rows but the settings describe {rows}",
+                entry_points + 1
+            ));
+        }
+    }
+    Ok(fit)
+}
+
 /// Facts about one video frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FrameInfo {

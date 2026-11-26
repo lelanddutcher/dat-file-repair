@@ -38,7 +38,7 @@ pub struct TrackOutput<'a> {
 impl TrackOutput<'_> {
     /// Duration in the track's media timescale.
     pub fn media_duration(&self) -> u64 {
-        self.plan.sample_count * self.ref_track.sample_delta as u64
+        self.plan.duration_units() * self.ref_track.sample_delta as u64
     }
 }
 
@@ -168,10 +168,21 @@ fn build_stbl(stsd: Atom, t: &TrackOutput, offset_delta: i64) -> Result<Vec<Atom
     let plan = t.plan;
     let count =
         u32::try_from(plan.sample_count).map_err(|_| "too many samples for one MP4 track")?;
-    let mut out = vec![
-        stsd,
-        tables::build_stts_constant(plan.sample_count, t.ref_track.sample_delta),
-    ];
+    let delta = t.ref_track.sample_delta;
+    let stts = if plan.steps.is_empty() {
+        tables::build_stts_constant(plan.sample_count, delta)
+    } else {
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        for &s in &plan.steps {
+            let d = s.checked_mul(delta).ok_or("sample duration overflow")?;
+            match runs.last_mut() {
+                Some((n, last)) if *last == d && *n < u32::MAX => *n += 1,
+                _ => runs.push((1, d)),
+            }
+        }
+        tables::build_stts(&runs)
+    };
+    let mut out = vec![stsd, stts];
     if let Some(v) = t.video {
         if !v.all_sync {
             out.push(tables::build_stss(&v.sync_samples));
@@ -201,9 +212,11 @@ fn build_stbl(stsd: Atom, t: &TrackOutput, offset_delta: i64) -> Result<Vec<Atom
     Ok(out)
 }
 
-/// Writes `ftyp + moov + mdat` to `path`, copying `src[copy_start..copy_end]` as the payload.
+/// Writes `ftyp + moov + mdat` to `path`, copying `src[copy_start..copy_end]` as the payload
+/// and then `silence` zero bytes (inserted PCM silence points there).
 ///
 /// `progress(done, total)` is called after each block and returns `false` to cancel.
+#[allow(clippy::too_many_arguments)]
 pub fn write_file<R: ReadAt + ?Sized>(
     path: &Path,
     ftyp: &[u8],
@@ -211,6 +224,7 @@ pub fn write_file<R: ReadAt + ?Sized>(
     src: &R,
     copy_start: u64,
     copy_end: u64,
+    silence: u64,
     progress: &mut dyn FnMut(u64, u64) -> bool,
 ) -> Result<u64> {
     let ctx = |what: &str| format!("cannot {what} {}", path.display());
@@ -220,7 +234,7 @@ pub fn write_file<R: ReadAt + ?Sized>(
         .create_new(true)
         .open(path)
         .map_err(|e| Error::io(ctx("create"), e))?;
-    let payload = copy_end - copy_start;
+    let payload = copy_end - copy_start + silence;
     let mut header = Vec::with_capacity(ftyp.len() + moov.len() + 16);
     header.extend_from_slice(ftyp);
     header.extend_from_slice(moov);
@@ -242,6 +256,14 @@ pub fn write_file<R: ReadAt + ?Sized>(
         if !progress(pos - copy_start, payload) {
             return Err(Error::Cancelled);
         }
+    }
+    let mut left = silence;
+    buf.iter_mut().for_each(|b| *b = 0);
+    while left > 0 {
+        let n = left.min(buf.len() as u64) as usize;
+        f.write_all(&buf[..n])
+            .map_err(|e| Error::io(ctx("write"), e))?;
+        left -= n as u64;
     }
     f.sync_all().map_err(|e| Error::io(ctx("flush"), e))?;
     Ok(header.len() as u64 + payload)

@@ -12,16 +12,17 @@ use serde::Serialize;
 
 use crate::codec::{FrameAnalyzer, FrameInfo, VideoCodec};
 use crate::error::{Error, Result};
-use crate::mapping::{self, Mapping, TrackPlan};
-use crate::mp4::reference::Reference;
+use crate::layout::{self, DatLayout};
+use crate::mapping::TrackPlan;
+use crate::mp4::reference::{Reference, TrackKind};
 use crate::mp4::tables::MP4_EPOCH_OFFSET;
 use crate::mp4::writer::{self, TrackOutput, rescale};
 use crate::read_at::{FileSource, ReadAt};
 use crate::repi::{self, DatIndex, Truncation};
+use crate::timeline::{self, TimelineGap};
 use crate::timing::{self, VideoTiming};
 
-/// Frames analyzed when probing whether a reference fits.
-const PROBE_FRAMES: usize = 30;
+pub use crate::select::{Checked, RefKind, check_reference, choose_from_dir, choose_profile};
 
 /// Stage of the pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -49,13 +50,16 @@ pub enum Event {
     Note { message: String },
 }
 
-/// Where the reference comes from.
+/// Where the decoder settings come from.
 #[derive(Clone, Debug)]
 pub enum ReferenceSource {
-    /// One specific healthy MP4.
+    /// One specific healthy MP4. It always wins: no fallback.
     File(PathBuf),
-    /// A folder to search for the smallest compatible MP4.
+    /// A folder searched recursively for a compatible MP4. Falls back to the built-in
+    /// profiles when nothing in it fits.
     Dir(PathBuf),
+    /// No reference: pick a built-in profile from what the `.DAT` itself shows.
+    Auto,
 }
 
 /// Options for [`repair`].
@@ -84,7 +88,20 @@ pub struct TrackReport {
 #[derive(Clone, Debug, Serialize)]
 pub struct RepairReport {
     pub input: PathBuf,
+    /// The clip path, or `built-in profile <id>`.
     pub reference: PathBuf,
+    /// `user` (every track from the clip), `hybrid` (clip video + synthesized tracks) or
+    /// `profile` (built-in decoder settings).
+    pub reference_kind: RefKind,
+    /// Tracks or boxes written from Canon's conventions instead of copied.
+    pub synthesized: Vec<String>,
+    /// What the `.DAT` itself shows: body, codec, frame rate, family.
+    pub recording: String,
+    /// Recording start written into the file (UTC, seconds since 1970) and where it came from.
+    pub creation_time: Option<i64>,
+    pub creation_time_source: String,
+    /// Damaged regions and how many frames each removed.
+    pub gaps: Vec<TimelineGap>,
     pub output: PathBuf,
     pub bytes_written: u64,
     pub duration_seconds: f64,
@@ -149,112 +166,6 @@ pub fn index_dat<R: ReadAt + ?Sized>(
     })
 }
 
-/// A reference that passed the compatibility check.
-pub struct Checked {
-    pub reference: Reference,
-    pub mapping: Mapping,
-    pub codec: VideoCodec,
-}
-
-/// Checks whether `reference` fits the `.DAT`: track mapping, codec, and a trial parse of the
-/// first frames with the reference's parameter sets.
-pub fn check_reference<R: ReadAt + ?Sized>(
-    src: &R,
-    index: &DatIndex,
-    reference: Reference,
-) -> Result<Checked> {
-    let incompatible = |reference: &Reference, reasons: Vec<String>| Error::Incompatible {
-        path: reference.path.clone(),
-        reasons,
-    };
-    let mapping = match mapping::map_tracks(index, &reference) {
-        Ok(m) => m,
-        Err(reasons) => return Err(incompatible(&reference, reasons)),
-    };
-    let vt = &reference.tracks[mapping.video().ref_track];
-    let vf = vt.video.as_ref().expect("video track has a video format");
-    let codec = match VideoCodec::from_config(vt.codec, vf.config_kind, &vf.config) {
-        Ok(c) => c,
-        Err(e) => return Err(incompatible(&reference, vec![e])),
-    };
-
-    let mut analyzer = FrameAnalyzer::new(codec.clone());
-    let mut probed = Vec::new();
-    for (off, size) in mapping.video().sample_locations().take(PROBE_FRAMES) {
-        match analyzer.analyze(src, off, size) {
-            Ok(f) => probed.push(f),
-            Err(e) => {
-                let reason = format!(
-                    "the video frames cannot be read with the reference's {} settings: {e}",
-                    codec.name()
-                );
-                return Err(incompatible(&reference, vec![reason]));
-            }
-        }
-    }
-    if !vt.has_stss && !vt.has_ctts && probed.iter().any(|f| !f.sync && !f.cra) {
-        let reason = "the .DAT is Long GOP (it has non-key frames) but the reference is All-Intra"
-            .to_string();
-        return Err(incompatible(&reference, vec![reason]));
-    }
-    Ok(Checked {
-        reference,
-        mapping,
-        codec,
-    })
-}
-
-/// Finds MP4 files in `dir` (not recursive) and returns the smallest compatible one.
-pub fn choose_reference<R: ReadAt + ?Sized>(
-    src: &R,
-    index: &DatIndex,
-    dir: &Path,
-    on_event: &mut dyn FnMut(&Event),
-) -> Result<Checked> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| Error::io(format!("cannot list {}", dir.display()), e))?;
-    let mut candidates: Vec<(u64, PathBuf)> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            let p = e.path();
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            // Skip macOS "._" resource-fork files and our own temporary outputs.
-            !name.starts_with('.')
-                && p.extension()
-                    .and_then(|x| x.to_str())
-                    .is_some_and(|x| x.eq_ignore_ascii_case("mp4"))
-        })
-        .filter_map(|e| Some((e.metadata().ok()?.len(), e.path())))
-        .collect();
-    candidates.sort();
-
-    let mut tried = Vec::new();
-    for (_, path) in candidates {
-        let result = Reference::open(&path).and_then(|r| check_reference(src, index, r));
-        match result {
-            Ok(c) => {
-                on_event(&Event::ReferenceChosen { path: path.clone() });
-                return Ok(c);
-            }
-            Err(e) => {
-                let reason = match &e {
-                    Error::Incompatible { reasons, .. } => reasons.join("; "),
-                    other => other.to_string(),
-                };
-                on_event(&Event::ReferenceRejected {
-                    path: path.clone(),
-                    reason: reason.clone(),
-                });
-                tried.push((path, reason));
-            }
-        }
-    }
-    Err(Error::NoReference {
-        dir: dir.to_path_buf(),
-        tried,
-    })
-}
-
 /// Analyzes every video frame: keyframe flag and display order.
 fn analyze_video<R: ReadAt + ?Sized>(
     src: &R,
@@ -310,8 +221,9 @@ fn analyze_video<R: ReadAt + ?Sized>(
     Ok((frames, damaged))
 }
 
-/// Trims every non-video track so it ends with the video. Returns trimmed sample counts.
-fn trim_to_video(
+/// Trims every non-video track so it ends with the video, and pads PCM tracks that end early
+/// with silence. Returns trimmed sample counts.
+fn fit_to_video(
     reference: &Reference,
     plans: &mut [TrackPlan],
     notes: &mut Vec<String>,
@@ -321,7 +233,7 @@ fn trim_to_video(
         .position(|p| p.repi_type.0 == *b"vide")
         .expect("video plan");
     let vt = &reference.tracks[plans[vi].ref_track];
-    let video_ticks = plans[vi].sample_count * vt.sample_delta as u64;
+    let video_ticks = plans[vi].duration_units() * vt.sample_delta as u64;
     let mut trimmed = vec![0u64; plans.len()];
     for (i, p) in plans.iter_mut().enumerate() {
         if i == vi {
@@ -331,12 +243,35 @@ fn trim_to_video(
         // Samples that fit in the video's duration, rounded to nearest.
         let fit = rescale(video_ticks, vt.timescale, rt.timescale) as f64 / rt.sample_delta as f64;
         let keep = fit.round() as u64;
-        if keep < p.sample_count {
-            trimmed[i] = p.sample_count - keep;
-            p.truncate(keep);
-        } else if keep > p.sample_count {
-            let short = (keep - p.sample_count) as f64 * rt.sample_seconds();
-            if short > vt.sample_seconds() {
+        let have = p.duration_units();
+        if keep < have {
+            // Per-frame tracks with stretched samples: cut by duration, not by count.
+            let mut units = 0u64;
+            let mut n = 0u64;
+            if p.steps.is_empty() {
+                n = keep;
+            } else {
+                for &s in &p.steps {
+                    if units + s as u64 > keep {
+                        break;
+                    }
+                    units += s as u64;
+                    n += 1;
+                }
+            }
+            trimmed[i] = p.sample_count - n;
+            p.truncate(n);
+        } else if keep > have {
+            let short = (keep - have) as f64 * rt.sample_seconds();
+            if rt.kind == TrackKind::PcmAudio && p.steps.is_empty() {
+                let added = timeline::pad_to(p, keep);
+                if short > vt.sample_seconds() / 2.0 && added > 0 {
+                    notes.push(format!(
+                        "track {} ({}) ended {short:.3} s before the video; padded with silence",
+                        rt.track_id, rt.codec
+                    ));
+                }
+            } else if short > vt.sample_seconds() {
                 notes.push(format!(
                     "track {} ({}) ends {short:.3} s before the video",
                     rt.track_id, p.repi_type
@@ -345,6 +280,89 @@ fn trim_to_video(
         }
     }
     trimmed
+}
+
+/// Rejects inputs that are not Canon `.DAT` recordings, with a message that says what to do.
+pub fn classify_input<R: ReadAt + ?Sized>(path: &Path, src: &R) -> Result<()> {
+    let len = src.size();
+    if len == 0 {
+        return Err(Error::EmptyDat {
+            path: path.to_path_buf(),
+            detail: "0 bytes".into(),
+        });
+    }
+    let head = src
+        .read_vec(0, len.min(1 << 20) as usize)
+        .map_err(|e| Error::io(format!("cannot read {}", path.display()), e))?;
+    if head.iter().all(|&b| b == 0) {
+        return Err(Error::EmptyDat {
+            path: path.to_path_buf(),
+            detail: "only zero bytes".into(),
+        });
+    }
+    if head.len() >= 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"CDXA" {
+        return Err(Error::NotCanon(
+            "it is a Video CD track (RIFF/CDXA MPEG-1). Video CD .dat files are not broken; \
+             open them in VLC or convert them with ffmpeg."
+                .into(),
+        ));
+    }
+    if head.len() >= 4 && head[0..3] == [0, 0, 1] && matches!(head[3], 0xba | 0xb3) {
+        return Err(Error::NotCanon(
+            "it is an MPEG program stream (as on Video CDs and some DVD recorders), not a Canon \
+             recording. It is not broken; open it in VLC or rename it to .mpg."
+                .into(),
+        ));
+    }
+    let canon_header = head.len() >= 16
+        && head[0..8] == [0, 0, 0, 0, b'm', b'd', b'a', b't']
+        && &head[12..16] == b"wide";
+    let has_repi = head.windows(4).any(|w| w == repi::MAGIC);
+    if canon_header && !has_repi {
+        return Err(Error::Unsupported(
+            "this is an unfinished Canon recording, but from a body that does not write a \
+             recovery index (repi), such as the EOS R or M50 Mark II. Rebuilding these needs \
+             frame-boundary guessing, which datfix does not support yet. Keep the file \
+             unchanged; a later version may repair it."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Picks the creation time: the Canon file name (local time) adjusted to UTC with the
+/// offset implied by the file's modification time, else modification time minus duration.
+fn creation_time(layout: &DatLayout, mtime: Option<i64>, duration: f64) -> (Option<i64>, String) {
+    let end_estimate = mtime.map(|m| m - duration.round() as i64);
+    if let Some(local) = layout.start.name_local {
+        if let Some(utc) = end_estimate {
+            let offset = local - utc;
+            let rounded = (offset as f64 / 900.0).round() as i64 * 900;
+            if rounded.abs() <= 14 * 3600 && (offset - rounded).abs() <= 600 {
+                let sign = if rounded < 0 { '-' } else { '+' };
+                return (
+                    Some(local - rounded),
+                    format!(
+                        "file name (camera local time, UTC{sign}{:02}:{:02} inferred from the file \
+                         time)",
+                        rounded.abs() / 3600,
+                        rounded.abs() % 3600 / 60
+                    ),
+                );
+            }
+        }
+        return (
+            Some(local),
+            "file name (camera local time; time zone unknown, written as UTC)".into(),
+        );
+    }
+    match end_estimate {
+        Some(t) => (
+            Some(t),
+            "file modification time minus the recording length".into(),
+        ),
+        None => (None, "unknown".into()),
+    }
 }
 
 /// Repairs `dat` into `output`.
@@ -358,32 +376,60 @@ pub fn repair(
     check_output(dat, output, opts)?;
     let src = FileSource::open(dat)
         .map_err(|e| Error::io(format!("cannot open {}", dat.display()), e))?;
+    classify_input(dat, &src)?;
     // Open a single reference first so a typo fails before a long index walk.
     let given = match reference {
         ReferenceSource::File(p) => Some(Reference::open(p)?),
-        ReferenceSource::Dir(_) => None,
+        _ => None,
     };
     let index = index_dat(&src, opts, on_event)?;
+    let name = dat.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let lay = layout::analyze(&src, &index, name);
 
     on_event(&Event::Phase {
         phase: Phase::CheckingReference,
-        message: "checking the reference clip".into(),
+        message: format!("checking decoder settings for {}", lay.describe()),
     });
     let checked = match (given, reference) {
-        (Some(r), _) => check_reference(&src, &index, r)?,
-        (None, ReferenceSource::Dir(d)) => choose_reference(&src, &index, d, on_event)?,
+        (Some(r), _) => check_reference(&src, &index, &lay, r, RefKind::User)?,
+        (None, ReferenceSource::Dir(d)) => match choose_from_dir(&src, &index, &lay, d, on_event) {
+            Ok(c) => c,
+            Err(dir_err @ Error::NoReference { .. }) => {
+                match choose_profile(&src, &index, &lay, on_event) {
+                    Ok(mut c) => {
+                        c.notes.insert(
+                            0,
+                            format!(
+                                "no clip in {} fits this .DAT; falling back to the built-in \
+                                 profiles",
+                                d.display()
+                            ),
+                        );
+                        c
+                    }
+                    Err(_) => return Err(dir_err),
+                }
+            }
+            Err(e) => return Err(e),
+        },
+        (None, ReferenceSource::Auto) => choose_profile(&src, &index, &lay, on_event)?,
         (None, ReferenceSource::File(_)) => unreachable!("opened above"),
     };
     let Checked {
         reference,
         mut mapping,
         codec,
+        kind,
+        label,
+        synthesized,
+        notes: check_notes,
     } = checked;
-    for n in &mapping.notes {
+    for n in check_notes.iter().chain(&mapping.notes) {
         on_event(&Event::Note { message: n.clone() });
     }
 
-    let mut notes = std::mem::take(&mut mapping.notes);
+    let mut notes = check_notes;
+    notes.append(&mut mapping.notes);
     if let Some(t) = &index.truncation {
         notes.push(format!(
             "the recording was cut off at byte {}; {} incomplete sample(s) were dropped",
@@ -396,22 +442,67 @@ pub fn repair(
             index.rejected_headers.len()
         ));
     }
+    if lay.frame_rate.is_some() && !lay.frame_rate_from_audio {
+        notes.push(
+            "the frame rate was inferred from the index group size (no PCM audio to measure \
+             against)"
+                .into(),
+        );
+    }
 
-    let trimmed = trim_to_video(&reference, &mut mapping.plans, &mut notes);
+    // Keep audio and video in sync across damaged regions.
+    let tl = timeline::build(&src, &index, &lay);
+    notes.extend(timeline::apply(&tl, &reference, &mut mapping.plans));
+    for g in &tl.gaps {
+        if g.lost_frames > 0 {
+            notes.push(format!(
+                "{} damaged bytes before frame {}: {} frame(s) lost (measured by {}); the picture \
+                 holds and audio is silent for that time",
+                g.damaged_bytes, g.resumes_at_frame, g.lost_frames, g.method
+            ));
+        }
+    }
+
+    let trimmed = fit_to_video(&reference, &mut mapping.plans, &mut notes);
 
     let vplan = mapping.video().clone();
     let (frames, damaged) = analyze_video(&src, &vplan, codec, opts, on_event, &mut notes)?;
     let timing = timing::video_timing(&frames);
 
-    // Creation time: the .DAT's modification time, close to when recording stopped.
-    let unix = src
+    let vt = &reference.tracks[vplan.ref_track];
+    let duration = vplan.duration_units() as f64 * vt.sample_seconds();
+    let mtime = src
         .file()
         .metadata()
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs());
-    let time = unix + MP4_EPOCH_OFFSET;
+        .map(|d| d.as_secs() as i64);
+    let (created, created_source) = creation_time(&lay, mtime, duration);
+    let time = created.map_or(0, |t| (t + MP4_EPOCH_OFFSET as i64).max(0) as u64);
+
+    // The payload is copied from the first group to the end of the last sample used; inserted
+    // silence points at a zero block appended after it.
+    let copy_start = index.payload_start();
+    let copy_end = mapping
+        .plans
+        .iter()
+        .map(TrackPlan::end_offset)
+        .max()
+        .unwrap_or(copy_start);
+    let silence = mapping
+        .plans
+        .iter()
+        .map(TrackPlan::silence_bytes)
+        .max()
+        .unwrap_or(0);
+    for p in &mut mapping.plans {
+        for c in &mut p.chunks {
+            if c.silence {
+                c.offset = copy_end;
+            }
+        }
+    }
 
     let outputs: Vec<TrackOutput> = mapping
         .plans
@@ -424,13 +515,6 @@ pub fn repair(
         .collect();
 
     // Build the moov twice: once to learn its size, then with the real chunk offsets.
-    let copy_start = index.payload_start();
-    let copy_end = mapping
-        .plans
-        .iter()
-        .map(TrackPlan::end_offset)
-        .max()
-        .unwrap_or(copy_start);
     let bad_ref = |reason: String| Error::BadReference {
         path: reference.path.clone(),
         reason,
@@ -460,6 +544,7 @@ pub fn repair(
         &src,
         copy_start,
         copy_end,
+        silence,
         &mut |done, total| {
             if throttle.due(done, total) {
                 on_event(&Event::Progress {
@@ -510,7 +595,13 @@ pub fn repair(
         .map_or(0.0, |t| t.duration_seconds);
     Ok(RepairReport {
         input: dat.to_path_buf(),
-        reference: reference.path.clone(),
+        reference: PathBuf::from(label),
+        reference_kind: kind,
+        synthesized,
+        recording: lay.describe(),
+        creation_time: created,
+        creation_time_source: created_source,
+        gaps: tl.gaps,
         output: output.to_path_buf(),
         bytes_written: written,
         duration_seconds,

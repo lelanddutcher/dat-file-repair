@@ -34,6 +34,11 @@ impl<'a> BitReader<'a> {
         "header ended early".to_string()
     }
 
+    /// Bits read so far.
+    pub fn bit_pos(&self) -> usize {
+        self.bit
+    }
+
     /// One bit.
     pub fn flag(&mut self) -> Result<bool, String> {
         let byte = *self.data.get(self.bit / 8).ok_or_else(Self::end)?;
