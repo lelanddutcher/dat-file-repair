@@ -568,3 +568,61 @@ fn finds_and_removes_stale_partial_files() {
     assert!(!stale.exists());
     assert!(dir.path().join("keep.mp4").exists());
 }
+
+#[test]
+fn all_intra_dat_with_long_gop_reference_keeps_every_frame() {
+    use datfix_core::mp4::atom::{self, Atom};
+
+    // An All-Intra .DAT: every frame is an IDR picture, no reordering.
+    let mut dat = vec![
+        0, 0, 0, 0, b'm', b'd', b'a', b't', 0, 0, 0, 8, b'w', b'i', b'd', b'e',
+    ];
+    for i in 0..2u32 {
+        let tc: Vec<Vec<u8>> = (0..6).map(|f| (i * 6 + f).to_be_bytes().to_vec()).collect();
+        dat.extend(common::group(b"tmcd", 4, &tc));
+        for c in 0..2u8 {
+            let pcm: Vec<Vec<u8>> = (0..11520)
+                .map(|k| vec![c, (k >> 8) as u8, k as u8])
+                .collect();
+            dat.extend(common::group(b"lpcm", 3, &pcm));
+        }
+        let frames: Vec<Vec<u8>> = (0..6).map(|k| common::frame(19, 0, 100 + 7 * k)).collect();
+        dat.extend(common::group(b"vide", 0, &frames));
+    }
+    // A Long-GOP reference whose video edit list starts one frame in (like Canon's files).
+    let bytes = common::reference(2, &[]);
+    let mut atoms = atom::parse_atoms(&bytes).unwrap();
+    let moov = atoms.iter_mut().find(|a| a.kind.0 == *b"moov").unwrap();
+    let trak = moov
+        .children_mut()
+        .iter_mut()
+        .find(|a| a.kind.0 == *b"trak")
+        .unwrap();
+    trak.children_mut().insert(
+        1,
+        Atom::container(b"edts", vec![tables::build_elst(0, 1000)]),
+    );
+    let reference: Vec<u8> = atoms.iter().flat_map(|a| a.to_bytes()).collect();
+
+    let dir = tempfile::tempdir().unwrap();
+    let dat_path = dir.path().join("intra.DAT");
+    write(&dat_path, &dat);
+    let ref_path = dir.path().join("ref.MP4");
+    write(&ref_path, &reference);
+    assert_eq!(
+        Reference::open(&ref_path)
+            .unwrap()
+            .video_track()
+            .unwrap()
+            .edit_media_time,
+        Some(1000)
+    );
+    let out = dir.path().join("out.MP4");
+    let report = repair(&dat_path, &ref_path, &out).unwrap();
+    assert!(!report.reordered);
+    let parsed = Reference::open(&out).unwrap();
+    let v = parsed.video_track().unwrap();
+    assert_eq!(v.sample_count, 12);
+    // No shift: the first frame plays at time zero and the last one is not cut off.
+    assert_eq!(v.edit_media_time.unwrap_or(0), 0);
+}
