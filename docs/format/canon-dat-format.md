@@ -1,7 +1,8 @@
 # Canon `.DAT` interrupted-recording format
 
-Status: verified on 36 `.DAT` files and about 1,000 healthy Canon MP4s on the zpool share (2026-11-26).
-Research scripts (not in git): `/Volumes/15T/dat-file-repair/research-scripts/`.
+Status: verified on 36 `.DAT` files and about 1,000 healthy Canon MP4s in a local test corpus
+(2026-11-26). Corpus files are named by neutral ids (`R3-01`, `R5-01`, `R5II-01`). The research
+scripts are not in git.
 
 ## 1. Background
 
@@ -25,7 +26,7 @@ The `.DAT` is byte-for-byte the `mdat` box of the MP4 that the camera would have
 - Every healthy Canon MP4 whose body uses `repi` has a `repi` header as the first bytes of its `mdat`
   payload, in the same group pattern as the `.DAT` files from the same body. Example:
   `100EOSR3/LAD33745.MP4` (R3), mdat payload at 2097168 starts `repi … tmcd`, then `lpcm`, then `vide`,
-  exactly like `LAD33743.DAT` from the same shoot.
+  exactly like `R3-11.DAT` from the same shoot.
 - Every chunk offset in a healthy `moov` points at a sample inside a `repi` group. Bytes between
   chunks are always a `repi` header, padding, or per-frame metadata records (section 5).
 
@@ -85,7 +86,7 @@ metadata record (section 6), which matches `modl` on every healthy file we check
 
 F is the frame count of one interval. One interval is 0.5005 s (24024 audio samples at 48 kHz):
 F = 15 at 29.97p, 30 at 59.94p, 60 at 119.88p, 12 at 23.976p. The last group before a normal stop
-can be shorter (`LAD12023.DAT` has a 16-frame group before its truncated tail).
+can be shorter (`R5-07.DAT` has a 16-frame group before its truncated tail).
 
 Families B′, B″, C′ and D are **not** in the `.DAT` corpus. Their layout comes from healthy MP4s only.
 
@@ -184,7 +185,7 @@ only when the assertion fails.
   frame that crosses EOF. Recoverable frames range from 0 to 57 per file.
 - The audio, `tmcd` and `tdmt` groups of the truncated interval are complete (they precede `vide`).
   Trim audio to the recovered video duration: audio samples = frames × 48000 × 1001 / (fps × 1000).
-- Groups can be shorter than F at the end of a recording (`LAD12023.DAT`: `tmcd×16`, `lpcm 51248`,
+- Groups can be shorter than F at the end of a recording (`R5-07.DAT`: `tmcd×16`, `lpcm 51248`,
   `vide×16`).
 - **No 4 GB splitting.** Bodies write one file (largest `.DAT` 35.2 GiB; healthy MP4s use `co64`).
 - **Header reservation** varies: mdat payload starts at 2097168 (2 MiB) in R3/R5 II, 2621456
@@ -224,44 +225,44 @@ only when the assertion fails.
 
 Recovered frames = complete groups plus complete frames of the truncated group.
 
-| Family | Body | File | Size (GiB) | Groups | F | Frames | Seconds |
+| Family | Body | Id | Size (GiB) | Groups | F | Frames | Seconds |
 |---|---|---|---|---|---|---|---|
-| A | R3 | LAD33835.DAT | 29.69 | 1093 | 15 | 16383 | 546.6 |
-| A | R3 | LAD37315.DAT | 6.00 | 221 | 15 | 3303 | 110.2 |
-| A | R3 | LAD37395.DAT | 0.34 | 13 | 15 | 188 | 6.3 |
-| A | R3 | LAD37406.DAT | 0.25 | 10 | 15 | 136 | 4.5 |
-| A | R3 | LAD37708.DAT | 0.56 | 21 | 15 | 308 | 10.3 |
-| A | R3 | LAD39177.DAT | 1.66 | 61 | 15 | 910 | 30.4 |
-| A | R3 | LAD39649.DAT | 2.31 | 85 | 15 | 1269 | 42.3 |
-| A | R3 | LAD39659.DAT | 1.62 | 61 | 15 | 901 | 30.1 |
-| A | R3 | LAD39662.DAT | 12.12 | 445 | 15 | 6674 | 222.7 |
-| A | R3 | LAD39665.DAT | 0.12 | 5 | 15 | 67 | 2.2 |
-| B | R3 | LAD33743.DAT | 0.72 | 39 | 30 | 368 | 6.1 |
-| B | R5 | LAD10430.DAT | 1.12 | 60 | 30 | 578 | 9.6 |
-| B | R5 | LAD11225.DAT | 0.06 | 6 | 30 | 30 | 0.5 |
-| B | R5 | LAD11582.DAT | 0.59 | 33 | 30 | 303 | 5.1 |
-| B | R5 | LAD11830.DAT | 1.12 | 60 | 30 | 577 | 9.6 |
-| B | R5 | LAD11981.DAT | 1.12 | 60 | 30 | 578 | 9.6 |
-| B | R5 | LAD11983.DAT | 0.31 | 18 | 30 | 159 | 2.7 |
-| B | R5 | LAD12023.DAT | 0.66 | 36 | 30 | 337 | 5.6 |
-| B | R5 | LAD12203.DAT | 0.47 | 27 | 30 | 240 | 4.0 |
-| B | R5 | LAD18029.DAT | 0.12 | 9 | 30 | 63 | 1.1 |
-| B | R5 | LAD18036.DAT | 0.19 | 12 | 30 | 94 | 1.6 |
-| C | R5 II | A_0001C809H241214_1422235Q_LAD04.DAT | 0.50 | 133 | 60 | 1127 | 9.4 |
-| C | R5 II | A_0002D054H241221_134042C0_LAD04.DAT | 0.06 | 21 | 60 | 135 | 1.1 |
-| C | R5 II | A_0015C453H250312_151308LJ_LAD04.DAT | 9.03 | 2394 | 60 | 20464 | 170.7 |
-| C | R5 II | A_0024C180H250508_174627EJ_LAD04.DAT | 1.47 | 392 | 60 | 3321 | 27.7 |
-| C | R5 II | A_0025C582H250531_110712X4_LAD04.DAT | 0.81 | 217 | 60 | 1833 | 15.3 |
-| C | R5 II | A_0026C677H250623_101219EK_LAD04.DAT | 1.41 | 371 | 60 | 3177 | 26.5 |
-| C | R5 II | A_0028C829H250627_1255235E_LAD04.DAT | 5.66 | 1498 | 60 | 12820 | 106.9 |
-| C | R5 II | A_0037C750H251016_104856J4_LAD04.DAT | 35.19 | 9303 | 60 | 79727 | 665.1 |
-| C | R5 II | A_0037C773H251016_1231241N_LAD04.DAT | 0.47 | 126 | 60 | 1057 | 8.8 |
-| C | R5 II | A_0037C785H251016_123919P5_LAD04.DAT | 0.69 | 182 | 60 | 1555 | 13.0 |
-| C | R5 II | A_0053C607H260110_115130LJ_LAD04.DAT | 0.91 | 245 | 60 | 2045 | 17.1 |
-| C | R5 II | B_0004C469H241109_111822E8_LAD04.DAT | 1.53 | 406 | 60 | 3461 | 28.9 |
-| C | R5 II | B_0004C512H241109_123515LE_LAD04.DAT | 5.44 | 1442 | 60 | 12303 | 102.6 |
-| C | R5 II | B_0004C512H241109_123729EJ_LAD04.DAT | 2.66 | 707 | 60 | 6004 | 50.1 |
-| C | R5 II | B_0004C544H241109_133743FE_LAD04.DAT | 0.19 | 56 | 60 | 420 | 3.5 |
+| A | R3 | R3-01.DAT | 29.69 | 1093 | 15 | 16383 | 546.6 |
+| A | R3 | R3-02.DAT | 6.00 | 221 | 15 | 3303 | 110.2 |
+| A | R3 | R3-03.DAT | 0.34 | 13 | 15 | 188 | 6.3 |
+| A | R3 | R3-04.DAT | 0.25 | 10 | 15 | 136 | 4.5 |
+| A | R3 | R3-05.DAT | 0.56 | 21 | 15 | 308 | 10.3 |
+| A | R3 | R3-06.DAT | 1.66 | 61 | 15 | 910 | 30.4 |
+| A | R3 | R3-07.DAT | 2.31 | 85 | 15 | 1269 | 42.3 |
+| A | R3 | R3-08.DAT | 1.62 | 61 | 15 | 901 | 30.1 |
+| A | R3 | R3-09.DAT | 12.12 | 445 | 15 | 6674 | 222.7 |
+| A | R3 | R3-10.DAT | 0.12 | 5 | 15 | 67 | 2.2 |
+| B | R3 | R3-11.DAT | 0.72 | 39 | 30 | 368 | 6.1 |
+| B | R5 | R5-01.DAT | 1.12 | 60 | 30 | 578 | 9.6 |
+| B | R5 | R5-02.DAT | 0.06 | 6 | 30 | 30 | 0.5 |
+| B | R5 | R5-03.DAT | 0.59 | 33 | 30 | 303 | 5.1 |
+| B | R5 | R5-04.DAT | 1.12 | 60 | 30 | 577 | 9.6 |
+| B | R5 | R5-05.DAT | 1.12 | 60 | 30 | 578 | 9.6 |
+| B | R5 | R5-06.DAT | 0.31 | 18 | 30 | 159 | 2.7 |
+| B | R5 | R5-07.DAT | 0.66 | 36 | 30 | 337 | 5.6 |
+| B | R5 | R5-08.DAT | 0.47 | 27 | 30 | 240 | 4.0 |
+| B | R5 | R5-09.DAT | 0.12 | 9 | 30 | 63 | 1.1 |
+| B | R5 | R5-10.DAT | 0.19 | 12 | 30 | 94 | 1.6 |
+| C | R5 II | R5II-01.DAT | 0.50 | 133 | 60 | 1127 | 9.4 |
+| C | R5 II | R5II-02.DAT | 0.06 | 21 | 60 | 135 | 1.1 |
+| C | R5 II | R5II-03.DAT | 9.03 | 2394 | 60 | 20464 | 170.7 |
+| C | R5 II | R5II-04.DAT | 1.47 | 392 | 60 | 3321 | 27.7 |
+| C | R5 II | R5II-05.DAT | 0.81 | 217 | 60 | 1833 | 15.3 |
+| C | R5 II | R5II-06.DAT | 1.41 | 371 | 60 | 3177 | 26.5 |
+| C | R5 II | R5II-07.DAT | 5.66 | 1498 | 60 | 12820 | 106.9 |
+| C | R5 II | R5II-08.DAT | 35.19 | 9303 | 60 | 79727 | 665.1 |
+| C | R5 II | R5II-09.DAT | 0.47 | 126 | 60 | 1057 | 8.8 |
+| C | R5 II | R5II-10.DAT | 0.69 | 182 | 60 | 1555 | 13.0 |
+| C | R5 II | R5II-11.DAT | 0.91 | 245 | 60 | 2045 | 17.1 |
+| C | R5 II | R5II-12.DAT | 1.53 | 406 | 60 | 3461 | 28.9 |
+| C | R5 II | R5II-13.DAT | 5.44 | 1442 | 60 | 12303 | 102.6 |
+| C | R5 II | R5II-14.DAT | 2.66 | 707 | 60 | 6004 | 50.1 |
+| C | R5 II | R5II-15.DAT | 0.19 | 56 | 60 | 420 | 3.5 |
 
 All 36 walk cleanly from offset 16 to the truncated last group with zero resyncs.
 
@@ -274,8 +275,8 @@ They carry no Canon `hvcC` and cannot be used.
 | DATs | Usable reference |
 |---|---|
 | Family A (all 10) | `100EOSR3/*.MP4` in the same folder (R3, 4096×2160 29.97p, video only) |
-| `LAD33743.DAT` (R3 + LPCM) | `Kevin Gates Tampa 12-14-23/100EOSR3/LAD33745.MP4` |
-| Family B R5 (10: NXGN 2022, Dietz wedding) | **none in folder** (AV1/hev1 re-encodes). Need an original R5 HEVC 59.94p + LPCM clip. The re-encodes say 4096×2160; the DAT's first 8 frames of each group checked are all IDR (NAL type 19), so probably ALL-I. No such original was found on zpool (the 49 R5 HEVC 59.94p originals all use AAC and Long GOP) |
+| `R3-11.DAT` (R3 + LPCM) | an R3 59.94p + LPCM original from the same shoot (`100EOSR3/LAD33745.MP4`) |
+| Family B R5 (all 10) | **none in folder** (AV1/hev1 re-encodes). Need an original R5 HEVC 59.94p + LPCM clip. The re-encodes say 4096×2160; the DAT's first 8 frames of each group checked are all IDR (NAL type 19), so probably ALL-I. No such original was found in the corpus (the 49 R5 HEVC 59.94p originals all use AAC and Long GOP) |
 | Family C (13) | neighbouring `*_LAD04.MP4` (R5 II), but check F: some neighbours are 59.94p while the DAT is 119.88p |
-| `A_0001…`, `A_0002…` (Miami/Tampa 2024) | neighbours are AV1 re-encodes; use any original R5 II 4K 119.88p clip, e.g. from `07 OTA Workout` |
-| `A_0015…` (Tampa Tech), `A_0028…` (USC) | no MP4 in folder; same as above |
+| `R5II-01`, `R5II-02` | neighbours are AV1 re-encodes; use any original R5 II 4K 119.88p clip |
+| `R5II-03`, `R5II-07` | no MP4 in folder; same as above |
