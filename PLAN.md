@@ -13,6 +13,22 @@ Status (2026-11-26, end of day): **M0–M4 done. M5 waits on the wedding .DAT.**
   imaging, Premiere test, card time-zone check on a real Canon card.
 - Name DATfix; repo `lelanddutcher/dat-file-repair` (private). License MIT.
 
+## Phase 2 (started 2026-11-27): general video repair
+
+Leland: "build it". Grow DATfix into a free, open, idiot-proof repair tool for any broken camera,
+phone, drone or screen-recording video. Design: `docs/research/video-repair-market.md` §7.
+Diagnose → try strategies least-invasive first (remux, vendor index, built-in profile, reference
+graft, frame scan, stream dump, card carve, salvage) → score → keep the best, with an honest loss
+report. Never re-encode as "repair". ffmpeg (LGPL, separate binary) only validates.
+
+| # | Milestone | Done when |
+|---|---|---|
+| P2.1 | Strategy framework + diagnosis + scorer; Canon path becomes one strategy | Canon corpus still 36/36; `datfix diagnose` explains any file |
+| P2.2 | Generic MP4/MOV with no `moov` (H.264/HEVC + AAC/PCM) | Synthetic + real broken phone/drone/OBS files repair |
+| P2.3 | Sony `.RSV`, DJI, GoPro, Panasonic `.MDT` | Real samples repair |
+| P2.4 | "Not broken, can't decode here" diagnosis; app UI for the pipeline | Strangers can use it |
+| P2.5 | ProRes/BRAW, MXF footer rebuild | — |
+
 ## Goal
 
 A free, open-source desktop app (macOS + Windows) that turns a Canon camera `.DAT` file back into a
