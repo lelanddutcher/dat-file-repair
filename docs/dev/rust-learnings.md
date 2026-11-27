@@ -131,7 +131,7 @@ cargo build --release                        # optimized binary in target/releas
   rejects references from another frame rate or audio setting.
 - Canon lists only IDR frames in `stss`. CRA frames followed by RASL pictures are not listed,
   because those leading pictures cannot be decoded when playback starts at the CRA.
-- Files mirrored from the NAS can arrive with mode `070` (no owner read). Reads fail with
+- Files copied by a mirroring job can arrive with mode `070` (no owner read). Reads fail with
   "Permission denied" until the mirror's final `chmod 444` runs.
 
 ## Desktop app (Tauri)
@@ -208,16 +208,15 @@ cargo tauri build --target universal-apple-darwin   # .app + .dmg for Apple Sili
 
 ### Signing and notarization (macOS: done, 2026-11-26)
 
-Run `scripts/release-macos.sh [out-dir]` on the Mac Studio from a GUI-session shell. It:
+Run `scripts/release-macos.sh [out-dir]` on a Mac from a GUI-session shell. It:
 
-1. Builds the universal app with `APPLE_SIGNING_IDENTITY="Developer ID Application: LELAND ANDREW
-   DUTCHER (PKUE74YS72)"`. Tauri signs the app with the hardened runtime and signs the `.dmg`.
-   The certificate is in the Studio's login keychain; codesign needs no prompt.
-2. Notarizes through the homelab notary relay
-   (`~/Developer/actions-web-dev/infra/mac-runner/test-build/notary-relay.sh`), which runs
-   `notarytool` on runner1 with the `ClipLogger` profile (same Apple team). Leland's rule since
-   2026-11-12: no notary credential on the Studio. runner1 must be on and logged in.
-3. Staples on the Studio and checks `spctl` says `Notarized Developer ID` for the `.dmg` and the app.
+1. Builds the universal app with `APPLE_SIGNING_IDENTITY` (required; a "Developer ID
+   Application: …" identity in the login keychain). Tauri signs the app with the hardened
+   runtime and signs the `.dmg`.
+2. Notarizes with `xcrun notarytool` and the keychain profile in `DATFIX_NOTARY_PROFILE`
+   (required). `DATFIX_NOTARYTOOL` can name a wrapper script that takes the same arguments, for
+   example one that runs `notarytool` on another machine that holds the credential.
+3. Staples and checks `spctl` says `Notarized Developer ID` for the `.dmg` and the app.
 
 The GitHub release workflow still builds an unsigned `.dmg`. For a release, run the script and
 replace that asset: `gh release upload v<version> dist/DATfix_<version>_macos_universal.dmg --clobber`.
