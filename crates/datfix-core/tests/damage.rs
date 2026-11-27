@@ -7,8 +7,8 @@
 //! The synthetic test always runs. The real-media test is gated:
 //!
 //! ```sh
-//! DATFIX_DAMAGE_DAT=/Volumes/15T/dat-file-repair/samples/r5m2_64MB.DAT \
-//! DATFIX_DAMAGE_OUT=/Volumes/15T/dat-file-repair/out/synthetic \
+//! DATFIX_DAMAGE_DAT="$DATFIX_SAMPLES/r5m2_64MB.DAT" \
+//! DATFIX_DAMAGE_OUT=/path/to/out \
 //!   cargo test --release --test damage -- --nocapture
 //! ```
 //!

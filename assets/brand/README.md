@@ -9,5 +9,4 @@ mended with a bandage: the footage was cut off and DATfix makes it whole again. 
 - `readme_banner_1280x320_{light,dark}.png`: README header.
 - `social_preview_1280x640.png`: upload in GitHub Settings > General > Social preview (no API).
 - `og_1200x630.png`: for a future GitHub Pages site.
-- Sources, every concept, judge answers and the rebuild steps: `/Volumes/15T/dat-file-repair/brand/SOURCES.md`.
-  Fonts: Inter, IBM Plex Mono (OFL). No AI imagery.
+- Design sources and rebuild steps are kept outside the repo. Fonts: Inter, IBM Plex Mono (OFL). No AI imagery.
