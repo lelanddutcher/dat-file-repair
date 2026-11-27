@@ -1,4 +1,7 @@
-<img src="assets/icon.svg" width="64" height="64" alt="">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/brand/readme_banner_1280x320_dark.png">
+  <img src="assets/brand/readme_banner_1280x320_light.png" width="640" alt="DATfix: get your video back from a cut-off Canon .DAT recording. Free and open source, for Mac and Windows.">
+</picture>
 
 # DATfix
 
