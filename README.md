@@ -29,12 +29,9 @@ computer, uploads nothing, and never changes the original file.
 
 `SHA256SUMS.txt` lists a checksum for each file.
 
-The builds are not signed yet.
-
-- **macOS:** the app is not notarized. The first time, right-click DATfix in Applications and
-  choose **Open**, then **Open** again.
-- **Windows:** SmartScreen may warn about an unknown publisher. Choose **More info**, then
-  **Run anyway**. The Windows installer has not yet been tested on a real Windows machine.
+- **macOS:** the app is signed with a Developer ID and notarized by Apple, so it opens normally.
+- **Windows:** the installer is not code-signed yet. SmartScreen may warn about an unknown
+  publisher. Choose **More info**, then **Run anyway**. It is tested on Windows 11.
 
 ## Is it free?
 

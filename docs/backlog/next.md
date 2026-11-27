@@ -53,3 +53,17 @@ section.
    `chore/release-workflow`.
 2. ~~README privacy note and the guide's "card recovery is CLI-only" line.~~ Done in
    `feat/final-integration`, with real screenshots in `docs/user/img/`.
+
+# Signing and testing (2026-11-26)
+
+- Done: macOS sign + notarize + staple via `scripts/release-macos.sh` (notary relay to runner1).
+- Done: Windows 11 test on homelab VM `arc` (`ssh -F ~/.ssh/homelab/config arc`): CLI repairs incl.
+  Unicode paths, silent NSIS install/uninstall (`/S`), installed app repaired the R5 II sample on the
+  console desktop (run via an interactive scheduled task `/it`; session 0 over SSH has no desktop).
+- Fixed: `datfix repair clip.DAT` with a bare file name failed ("cannot list") on all platforms.
+1. **Move mac sign+notarize into a `macos-ci` job** that declares signing + notarization needs
+   (homelab convention). `release.yml` keeps building unsigned Windows/Linux artifacts.
+2. **Windows code signing** (OV/EV cert or Azure Trusted Signing) costs money: Leland's decision.
+3. **Reference search picks DATfix's own repaired outputs** as "clips" (seen on Windows: it chose an
+   earlier `*_repaired.mp4`). Harmless (same settings), but prefer camera originals and skip files
+   DATfix wrote.

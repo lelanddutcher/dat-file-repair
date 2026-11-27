@@ -744,7 +744,8 @@ pub fn plan_repair<R: ReadAt + ?Sized>(
         },
         (None, ReferenceSource::Builtin) => choose_profile(src, index, &lay, on_event)?,
         (None, ReferenceSource::Auto) => {
-            let dirs: Vec<PathBuf> = dat.parent().map(Path::to_path_buf).into_iter().collect();
+            // A bare file name ("clip.DAT") has an empty parent; search the current folder.
+            let dirs: Vec<PathBuf> = vec![crate::volume::parent_dir(dat)];
             let opts = SearchOptions {
                 depth: 0,
                 ..SearchOptions::default()

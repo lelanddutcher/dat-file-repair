@@ -206,23 +206,25 @@ cargo tauri build --target universal-apple-darwin   # .app + .dmg for Apple Sili
   `DATFIX_DEV_THEME=light|dark` forces the theme. Window screenshots: find the window id with
   `CGWindowListCopyWindowInfo` (a 10-line Swift program) and run `screencapture -x -o -l <id>`.
 
-### Signing and notarization (not done yet)
+### Signing and notarization (macOS: done, 2026-11-26)
 
-Unsigned builds work, but macOS Gatekeeper warns ("cannot be opened because the developer cannot
-be verified") and Windows SmartScreen shows "Windows protected your PC". Before a public release:
+Run `scripts/release-macos.sh [out-dir]` on the Mac Studio from a GUI-session shell. It:
 
-macOS:
+1. Builds the universal app with `APPLE_SIGNING_IDENTITY="Developer ID Application: LELAND ANDREW
+   DUTCHER (PKUE74YS72)"`. Tauri signs the app with the hardened runtime and signs the `.dmg`.
+   The certificate is in the Studio's login keychain; codesign needs no prompt.
+2. Notarizes through the homelab notary relay
+   (`~/Developer/actions-web-dev/infra/mac-runner/test-build/notary-relay.sh`), which runs
+   `notarytool` on runner1 with the `ClipLogger` profile (same Apple team). Leland's rule since
+   2026-11-12: no notary credential on the Studio. runner1 must be on and logged in.
+3. Staples on the Studio and checks `spctl` says `Notarized Developer ID` for the `.dmg` and the app.
 
-1. Join the Apple Developer Program (99 USD/year).
-2. Create a "Developer ID Application" certificate in Xcode or on developer.apple.com. Export it
-   as `.p12` with a password.
-3. Create an app-specific password for the Apple ID at appleid.apple.com.
-4. Set these environment variables (or GitHub secrets, see `.github/workflows/app.yml`):
-   `APPLE_CERTIFICATE` (base64 of the `.p12`), `APPLE_CERTIFICATE_PASSWORD`,
-   `APPLE_SIGNING_IDENTITY` (`Developer ID Application: Name (TEAMID)`), `APPLE_ID`,
-   `APPLE_PASSWORD` (the app-specific password), `APPLE_TEAM_ID`.
-5. `cargo tauri build` then signs with the hardened runtime (already on in `tauri.conf.json`) and
-   notarizes. Check with `spctl -a -vv DATfix.app` and `xcrun stapler validate DATfix.dmg`.
+The GitHub release workflow still builds an unsigned `.dmg`. For a release, run the script and
+replace that asset: `gh release upload v<version> dist/DATfix_<version>_macos_universal.dmg --clobber`.
+
+Gotchas: the app binary inside the bundle is `Contents/MacOS/datfix-app`, not `DATfix`. A first
+notarization takes about a minute. Test a notarized build with the quarantine flag set
+(`xattr -w com.apple.quarantine "0081;<hex time>;Safari;" DATfix.app`) to see what a downloader sees.
 
 Windows:
 
