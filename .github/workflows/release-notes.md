@@ -15,12 +15,9 @@ cut off, and turns it into a playable MP4. Free and open source (MIT).
 `shasum -a 256 -c SHA256SUMS.txt --ignore-missing` (macOS) or
 `Get-FileHash <file> -Algorithm SHA256` (Windows).
 
-The builds are not signed yet.
-
-- **macOS:** the app is not notarized. The first time, right-click DATfix in Applications and
-  choose **Open**, then **Open** again.
-- **Windows:** SmartScreen may warn about an unknown publisher. Choose **More info**, then
-  **Run anyway**.
+The Mac app is signed with an Apple Developer ID and notarized by Apple, so it opens normally.
+The Windows installers are not code-signed yet: SmartScreen may warn about an unknown publisher.
+Choose **More info**, then **Run anyway**.
 
 {{CAMERAS}}
 
