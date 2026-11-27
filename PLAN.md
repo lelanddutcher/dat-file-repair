@@ -1,19 +1,21 @@
 # DATfix — plan
 
-Status (2026-11-26, end of day): **M0–M4 done. M5 (first public release) is next.**
+Status (2026-11-27): **M0–M5 done. v0.1.0 is public.**
 
+- Released: repo public, [v0.1.0](https://github.com/lelanddutcher/dat-file-repair/releases/tag/v0.1.0)
+  with a notarized macOS universal `.dmg`, Windows NSIS and MSI installers, and CLI archives.
+  Site: <https://lelanddutcher.github.io/dat-file-repair/> (sitemap; Bing and Google Search
+  Console verification).
 - Engine + CLI: all 36 corpus `.DAT`s (R3, R5, R5 II) repair in both modes (folder clip, built-in
   settings) with full clean decodes (72/72). Fuzzed; failing-card, FAT32, disk-full and Windows
   read-error paths handled. Reference metadata is not copied (privacy). Dates, rotation, AAC hybrids.
 - Card recovery: `datfix scan` and the app's "Recover from a memory card" find deleted and 0-byte
   `.DAT`s in a card image, rejoin split recordings, restore original names and times.
-- App: Tauri, macOS universal `.dmg` + Windows installers built in CI. Verified in QuickTime and Resolve.
-- Release: `release.yml` builds all README assets and drafts a GitHub Release on a `v*` tag.
-- Open (see `docs/backlog/next.md`): real-Windows run, signing/notarization, admin-password card
-  imaging, Premiere test, card time-zone check on a real Canon card.
-- Name DATfix; repo `lelanddutcher/dat-file-repair`. License MIT.
+- Open (see `docs/backlog/next.md`): Windows code signing, Mac signing in CI, admin-password card
+  imaging, Premiere test, card time-zone check on a real Canon card, camcorder (Vixia) `.DAT` reports.
 
-A general video-repair tool is planned as a separate project.
+A general video-repair tool (MP4/MOV without an index, GoPro, DJI, iPhone and more) is being
+built as a separate project.
 
 ## Goal
 
