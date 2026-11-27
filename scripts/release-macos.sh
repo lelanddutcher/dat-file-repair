@@ -1,22 +1,29 @@
 #!/bin/bash
-# Build, sign, notarize and staple the DATfix macOS app on the Mac Studio.
+# Build, sign, notarize and staple the DATfix macOS app on a Mac.
 #
-# Why here and not in GitHub Actions: Leland's convention (2026-11-12) keeps the Apple notary
-# credential on runner1 only. Signing uses the Developer ID certificate in the Studio's login
-# keychain; notarization goes through the homelab notary relay to runner1 (profile "ClipLogger",
-# same team PKUE74YS72); stapling needs no credential and runs here.
+# Why not in GitHub Actions: signing and notarization need a Developer ID certificate and a
+# notary credential, which stay on the maintainer's machine. Stapling needs no credential.
 #
 # Usage: scripts/release-macos.sh [out-dir]          (default out-dir: dist/)
-# Needs: runner1 on and logged in (for the relay). Run from a GUI-session shell on the Studio.
+#
+# Environment:
+#   APPLE_SIGNING_IDENTITY  required. The codesign identity, for example
+#                           "Developer ID Application: <Name> (<TEAMID>)". The certificate must
+#                           be in the login keychain.
+#   DATFIX_NOTARY_PROFILE   required. A `notarytool store-credentials` keychain profile name.
+#   DATFIX_NOTARYTOOL       optional. A command that takes `notarytool` arguments (default:
+#                           `xcrun notarytool`). Set it to a wrapper script to notarize elsewhere.
+#
+# Run from a GUI-session shell (codesign may need keychain access).
 # Optional: upload to a draft release with
 #   gh release upload v<version> <out-dir>/DATfix_<version>_macos_universal.dmg --clobber
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${1:-$ROOT/dist}"
-IDENTITY="${APPLE_SIGNING_IDENTITY:-Developer ID Application: LELAND ANDREW DUTCHER (PKUE74YS72)}"
-PROFILE="${DATFIX_NOTARY_PROFILE:-ClipLogger}"
-NOTARY="${DATFIX_NOTARYTOOL:-$HOME/Developer/actions-web-dev/infra/mac-runner/test-build/notary-relay.sh}"
+IDENTITY="${APPLE_SIGNING_IDENTITY:?set APPLE_SIGNING_IDENTITY to your Developer ID Application identity}"
+PROFILE="${DATFIX_NOTARY_PROFILE:?set DATFIX_NOTARY_PROFILE to a notarytool keychain profile}"
+NOTARY="${DATFIX_NOTARYTOOL:-}"
 VERSION="$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$ROOT/app/package.json" | head -1)"
 [ -n "$VERSION" ] || { echo "could not read the version from app/package.json" >&2; exit 1; }
 TARGET=universal-apple-darwin
@@ -41,8 +48,13 @@ codesign --verify "$DMG"
 mkdir -p "$OUT"
 cp "$DMG" "$FINAL"
 
-step "Notarize via $(basename "$NOTARY") (profile $PROFILE)"
-bash "$NOTARY" submit "$FINAL" --keychain-profile "$PROFILE" --wait --timeout 30m
+if [ -n "$NOTARY" ]; then
+  step "Notarize via $(basename "$NOTARY") (profile $PROFILE)"
+  bash "$NOTARY" submit "$FINAL" --keychain-profile "$PROFILE" --wait --timeout 30m
+else
+  step "Notarize via xcrun notarytool (profile $PROFILE)"
+  xcrun notarytool submit "$FINAL" --keychain-profile "$PROFILE" --wait --timeout 30m
+fi
 
 step "Staple and verify"
 xcrun stapler staple "$FINAL"

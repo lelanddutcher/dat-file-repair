@@ -10,7 +10,7 @@ setup (`hvcC`/`avcC`), the track layout and the Canon metadata box.
 
 This page answers two questions:
 
-1. Which camera-original reference clips exist on the NAS, and which corpus `.DAT` files can now be
+1. Which camera-original reference clips exist in the test corpus, and which corpus `.DAT` files can now be
    repaired with them?
 2. Do repaired files open in the editing apps people use (QuickTime/AVFoundation, DaVinci Resolve,
    Premiere Pro), and do they behave like camera originals?
@@ -18,9 +18,10 @@ This page answers two questions:
 A **camera original** has a Canon `ftyp` brand (`CAEP` or `XFVC`), a Canon `uuid` box and `repi`
 groups at the start of `mdat`. Re-encodes (AV1, `hev1`, `isom` brand) are not references.
 
-Media and working files are outside git, under `/Volumes/15T/dat-file-repair/`:
+Media and working files are outside git, in a local workspace. Corpus `.DAT` files are named by
+neutral ids (`R3-01`, `R5-01`, `R5II-01`).
 
-- `refs/inventory.tsv`: every Canon original found on the NAS (13,827 rows).
+- `refs/inventory.tsv`: every Canon original found in the media library scan (13,827 rows).
 - `refs/<body>/<mode>/`: 1–2 small copies per mode, mode `0444`.
 - `refs/scripts/`: the read-only scan, check and proof scripts used here.
 - `out/compat/`: thumbnails, metadata dumps and decode logs for job 2.
@@ -33,8 +34,8 @@ attributable to the repair. All originals passed every check.
 | File | Mode | ffmpeg full decode | QuickTime / AVFoundation | DaVinci Resolve 21.2 | Premiere Pro |
 |---|---|---|---|---|---|
 | `r5m2_64MB_repaired.MP4` | R5 II, 4K DCI 119.88p, 4× 24-bit PCM | Pass, 0 errors | Pass | Pass | Not run |
-| `B_0004C512_123515LE_repaired.MP4` (5.8 GB) | same | Pass, 0 errors | Pass | Pass | Not run |
-| `LAD37315_repaired.MP4` (6.4 GB) | R3, 4K DCI 29.97p ALL-I, no audio | Pass, 0 errors | Pass | Pass | Not run |
+| `R5II-13_repaired.MP4` (5.8 GB) | same | Pass, 0 errors | Pass | Pass | Not run |
+| `R3-02_repaired.MP4` (6.4 GB) | R3, 4K DCI 29.97p ALL-I, no audio | Pass, 0 errors | Pass | Pass | Not run |
 | Family B R5 repair | R5, 4K DCI 59.94p ALL-I, LPCM | — | — | — | — |
 | Original `A_0026C730…_LAD04.MP4` | R5 II 119.88p | Pass | Pass | Pass | Not run |
 | Original `LAD37341.MP4` | R3 29.97p | Pass | Pass | Pass | Not run |
@@ -62,12 +63,12 @@ Clip properties:
 | Clip | Resolution | FPS | Frames | Codec | Audio | Start TC |
 |---|---|---|---|---|---|---|
 | `r5m2_64MB_repaired` | 4096x2160 | 119.88 | 135 | H.265 Main 4:2:2 10 L6.1 | 4 ch LPCM 24-bit | 13:40:42;015 |
-| `B_0004C512_123515LE_repaired` | 4096x2160 | 119.88 | 12303 | H.265 Main 4:2:2 10 L6.1 | 4 ch LPCM 24-bit | 12:35:15;013 |
+| `R5II-13_repaired` | 4096x2160 | 119.88 | 12303 | H.265 Main 4:2:2 10 L6.1 | 4 ch LPCM 24-bit | 12:35:15;013 |
 | Original `A_0026C730` | 4096x2160 | 119.88 | 124 | H.265 Main 4:2:2 10 L6.1 | 4 ch LPCM 24-bit | 10:51:58;013 |
-| `LAD37315_repaired` | 4096x2160 | 29.97 | 3303 | H.265 Main 4:2:2 10 L5.2 | none | 00:00:00:00 |
+| `R3-02_repaired` | 4096x2160 | 29.97 | 3303 | H.265 Main 4:2:2 10 L5.2 | none | 00:00:00:00 |
 | Original `LAD37341` | 4096x2160 | 29.97 | 335 | H.265 Main 4:2:2 10 L5.2 | none | 00:00:00:00 |
 
-- The start timecode comes from the `.DAT` itself. It matches the file name (`123515` → 12:35:15).
+- The start timecode comes from the `.DAT` itself. It matches the time in the Canon file name (`…_123515…` → 12:35:15).
 - A timeline built from the repaired R5 II clip and one built from the original are identical:
   1 video track, 4 audio tracks, one item on each.
 - Thumbnails across the whole clip (6 per clip, first to last frame) were clean.
@@ -80,8 +81,8 @@ the app open and the bridge panel started by hand ("Start Bridge").
 
 ### Metadata diff (exiftool `-a -G1 -s`, mediainfo `-f`)
 
-Compared: `B_0004C512_123515LE_repaired.MP4` against original `A_0026C730…_LAD04.MP4`, and
-`LAD37315_repaired.MP4` against original `LAD37341.MP4`. Dumps are in `out/compat/meta/`.
+Compared: `R5II-13_repaired.MP4` against original `A_0026C730…_LAD04.MP4`, and
+`R3-02_repaired.MP4` against original `LAD37341.MP4`. Dumps are in `out/compat/meta/`.
 
 Same in both: brands, model (`Canon EOS R5m2`, `Canon EOS R3`), codec, profile, level, chroma, bit
 depth, color fields, audio format, track count and order, timecode track.
@@ -102,8 +103,8 @@ repaired files and the camera originals. It is the Canon edit list, not a repair
 
 ## Reference inventory
 
-The scan read the first 32 bytes of every `.MP4/.CRM/.MOV/.MXF` file on both shares, server side. For
-Canon files it parsed `moov`. Copies in ClipLogger test folders are included in the counts.
+The scan read the first 32 bytes of every `.MP4/.CRM/.MOV/.MXF` file in the media library, server side.
+For Canon files it parsed `moov`. Duplicate copies are included in the counts.
 
 | Body | Files | Modes found (video / fps / GOP / audio) |
 |---|---|---|
@@ -128,13 +129,13 @@ Sixteen corpus `.DAT` files had no usable reference in their own folder.
 
 | `.DAT` | Family | Reference that works | Result |
 |---|---|---|---|
-| `A_0001C809H241214_1422235Q` | C | R5 II `A_0026C730H250623_105158EJ` | **Repaired.** 1127 frames, 0 decode errors, audio = video, frames clean |
-| `A_0002D054H241221_134042C0` | C | same | **Repaired.** 135 frames |
-| `A_0015C453H250312_151308LJ` | C | same | **Repaired.** 20464 frames, 9.70 GB, audio 170.703875 s = video 170.703867 s |
-| `A_0028C829H250627_1255235E` | C | same | **Repaired.** 12820 frames, 6.07 GB |
-| `LAD33835` | A | R3 `LAD37341` (4K 29.97p, no audio) | **Repaired.** 16383 frames, 31.9 GB, last 6 s decode clean. Shot in portrait; no rotation flag, same as originals. |
-| `LAD33743` | B (R3) | R3 `LAD33690` or `LAD33745` | **Blocked by issue 1.** Independent decode: 368/368 frames, 0 errors |
-| `LAD10430`, `LAD11225`, `LAD11582`, `LAD11830`, `LAD11981`, `LAD11983`, `LAD12023`, `LAD12203`, `LAD18029`, `LAD18036` | B (R5) | R5 `LAD19893` or `LAD19894` (4K 59.94p ALL-I `twos`, `refs/R5/hvc1-4096x2160-59.940-ALL-I-42210b-twos2ch/`) | **Blocked by issue 1.** Independent decode: 578, 30, 303, 577, 578, 159, 337, 240, 63, 94 frames. All match the spec. 0 errors. Last frames clean |
+| `R5II-01` | C | R5 II `A_0026C730H250623_105158EJ` | **Repaired.** 1127 frames, 0 decode errors, audio = video, frames clean |
+| `R5II-02` | C | same | **Repaired.** 135 frames |
+| `R5II-03` | C | same | **Repaired.** 20464 frames, 9.70 GB, audio 170.703875 s = video 170.703867 s |
+| `R5II-07` | C | same | **Repaired.** 12820 frames, 6.07 GB |
+| `R3-01` | A | R3 `LAD37341` (4K 29.97p, no audio) | **Repaired.** 16383 frames, 31.9 GB, last 6 s decode clean. Shot in portrait; no rotation flag, same as originals. |
+| `R3-11` | B (R3) | R3 `LAD33690` or `LAD33745` | **Blocked by issue 1.** Independent decode: 368/368 frames, 0 errors |
+| `R5-01`, `R5-02`, `R5-03`, `R5-04`, `R5-05`, `R5-06`, `R5-07`, `R5-08`, `R5-09`, `R5-10` | B (R5) | R5 `LAD19893` or `LAD19894` (4K 59.94p ALL-I `twos`, `refs/R5/hvc1-4096x2160-59.940-ALL-I-42210b-twos2ch/`) | **Blocked by issue 1.** Independent decode: 578, 30, 303, 577, 578, 159, 337, 240, 63, 94 frames. All match the spec. 0 errors. Last frames clean |
 
 The "independent decode" took the parameter sets from the reference and walked the `.DAT` with
 the spec's family B layout (each frame padded to a multiple of 8, then 128 bytes × n of records).
@@ -160,7 +161,7 @@ rules agree. In family B the first frame starts at 4 mod 8: the 140-byte `vide` 
 chain check, and `detect_alignment` falls back to "packed" (1). From frame 2 on, every offset is
 wrong.
 
-**Example.** `LAD11225.DAT`: the first `vide` sample is at byte 96,412 (≡ 4 mod 8). With size-padding
+**Example.** `R5-02.DAT`: the first `vide` sample is at byte 96,412 (≡ 4 mod 8). With size-padding
 all 30 frames start with a valid NAL header. With no padding only 1 of 30 does
 (`refs/scripts/r5layout.py`). `datfix inspect` reports the gap as 3,912 bytes: 3,840 bytes of records
 plus 72 bytes of padding it did not account for.
@@ -171,7 +172,7 @@ another reference, but no reference will work.
 **Fix.** Pad relative to the sample: `next = here + round_up(size, align)`. Apply this in
 `Group::samples`, `Group::end_of` and `detect_alignment`.
 
-**Check.** `datfix repair LAD33743.DAT --reference LAD33745.MP4` writes 368 frames with a clean
+**Check.** `datfix repair R3-11.DAT --reference LAD33745.MP4` writes 368 frames with a clean
 ffmpeg decode. Add a synthetic test whose first `vide` sample starts at 4 mod 8.
 
 ### 2. Creation date is the `.DAT` modification time (medium)
@@ -181,10 +182,10 @@ writes the recording **start** time in the camera's own time convention.
 
 **Examples.**
 
-1. `B_0004C512…123515LE`: the repaired file says 2024-11-09 17:36:58 UTC. The camera would write
+1. `R5II-13`: the repaired file says 2024-11-09 17:36:58 UTC. The camera would write
    about 16:35:15. Its neighbour `B_0004C511…123428` says 16:34:28. The value is 1 h 1 m 43 s late:
    the clip's length, plus the gap between the host time zone and the camera's.
-2. `LAD37315` (R3): the repaired file says 21:13:04. Its neighbour `LAD37316` started at 19:13:28.
+2. `R3-02` (R3): the repaired file says 21:13:04. Its neighbour `LAD37316` started at 19:13:28.
 3. `r5m2_64MB_repaired` was made from a copied `.DAT` with `cp`. It says 2026-11-26, the day of the
    copy. Resolve shows that date as "Date Created".
 
@@ -196,7 +197,7 @@ reference `mvhd` time minus (reference mtime − reference duration). For R5 II,
 holds the start time (`H241109_123515`), and the `tmcd` start agrees with it. Prefer that when it
 parses.
 
-**Check.** Repairing `B_0004C512…123515LE` gives `CreateDate` 16:35:15 ± 2 s.
+**Check.** Repairing `R5II-13` gives `CreateDate` 16:35:15 ± 2 s.
 
 ### 3. Canon `uuid` and `udta` are copied verbatim from the reference (medium)
 
@@ -206,11 +207,11 @@ reference too.
 
 **Examples.**
 
-1. `B_0004C512_123515LE_repaired.MP4` has EXIF date 2024:11:09 12:34:28 and firmware 1.0.1. Those
+1. `R5II-13_repaired.MP4` has EXIF date 2024:11:09 12:34:28 and firmware 1.0.1. Those
    belong to the reference `B_0004C511`.
-2. `r5m2_64MB_repaired.MP4` is a December 2024 recording. It has EXIF date 2026:11:21 20:58:18 and
-   firmware 1.3.1, from the wedding reference `A_0071C743…`.
-3. `LAD37315_repaired.MP4` has GPS 42.14262, −124.35695 from `LAD37314`. The original `LAD37341`
+2. `r5m2_64MB_repaired.MP4` is a December 2024 recording. It has an EXIF date from November 2026
+   and firmware 1.3.1, both from its reference clip.
+3. `R3-02_repaired.MP4` has GPS coordinates from the reference `LAD37314`. The original `LAD37341`
    has none.
 
 **User result.** Finder, Canon software and DAMs show another clip's thumbnail and date. A user
@@ -220,7 +221,7 @@ who repairs with a reference from another shoot gets wrong location and date met
 repaired clip, or drop it. Rewrite or remove the EXIF date fields. Drop GPS unless the reference
 comes from the same folder. Say in the CLI output which metadata came from the reference.
 
-**Check.** `exiftool -a -G1 B_0004C512_123515LE_repaired.MP4` shows no 12:34:28 timestamp.
+**Check.** `exiftool -a -G1 R5II-13_repaired.MP4` shows no 12:34:28 timestamp.
 
 ### 4. Reference-check errors point at the wrong thing (low)
 
@@ -232,7 +233,7 @@ ask the user to pick another clip.
 ### 5. Notes, not bugs
 
 - `--reference-dir` is not recursive. Many working references are in a sibling folder
-  (`100EOSR3/`) or another shoot. A "search the NAS/card for a matching original" helper would close
+  (`100EOSR3/`) or another shoot. A "search a drive or card for a matching original" helper would close
   most of the 16 cases without a human.
 - The `.CRM` files need a model string from somewhere other than `udta/modl`. Their size suggests
   R3 (6000×3164) and R5 (8192×4320).

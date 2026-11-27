@@ -5,7 +5,7 @@
 //! decoded by `ffprobe -count_frames` (slow for big files).
 //!
 //! ```sh
-//! DATFIX_CORPUS=/Volumes/15T/dat-file-repair/corpus DATFIX_OUT=/Volumes/15T/dat-file-repair/out \
+//! DATFIX_CORPUS=/path/to/corpus DATFIX_OUT=/path/to/out \
 //!   cargo test --release --test corpus -- --nocapture
 //! ```
 //!

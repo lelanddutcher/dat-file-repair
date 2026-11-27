@@ -5,7 +5,7 @@
 //! wrote. `DATFIX_REF_FRAMES` limits how many frames are read (default 3000).
 //!
 //! ```sh
-//! DATFIX_REF=/Volumes/15T/dat-file-repair/refs/clip.MP4 cargo test --release --test reference_timing -- --nocapture
+//! DATFIX_REF=/path/to/clip.MP4 cargo test --release --test reference_timing -- --nocapture
 //! ```
 
 use std::path::PathBuf;

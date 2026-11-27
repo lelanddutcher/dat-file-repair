@@ -1,6 +1,6 @@
-# Naming and GitHub discoverability (webmaster research, 2026-11-26)
+# Naming and GitHub discoverability (research, 2026-11-26)
 
-Status: recommendation. Leland decides the final name before the repo goes public.
+Status: decided. The name is DATfix.
 
 ## Recommendation
 

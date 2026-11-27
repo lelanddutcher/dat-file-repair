@@ -1,7 +1,7 @@
 //! Tests of the app's engine layer against real media. They are skipped unless these
 //! environment variables are set (media never goes into git):
 //!
-//! - `DATFIX_APP_DAT`: a small `.DAT`, for example `samples/r5m2_64MB.DAT`.
+//! - `DATFIX_APP_DAT`: a small `.DAT`, for example `$DATFIX_SAMPLES/r5m2_64MB.DAT`.
 //! - `DATFIX_APP_REFS`: a folder that holds a healthy clip from the same camera.
 //! - `DATFIX_APP_OUT`: a folder to write the repaired file into.
 //! - `DATFIX_APP_BIG_DAT` (optional): a multi-GB `.DAT` with a healthy clip in its own folder,

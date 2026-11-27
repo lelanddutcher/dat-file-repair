@@ -1,6 +1,6 @@
-# DAT file repair — plan
+# DATfix — plan
 
-Status (2026-11-26, end of day): **M0–M4 done. M5 waits on the wedding .DAT.**
+Status (2026-11-26, end of day): **M0–M4 done. M5 (first public release) is next.**
 
 - Engine + CLI: all 36 corpus `.DAT`s (R3, R5, R5 II) repair in both modes (folder clip, built-in
   settings) with full clean decodes (72/72). Fuzzed; failing-card, FAT32, disk-full and Windows
@@ -11,23 +11,9 @@ Status (2026-11-26, end of day): **M0–M4 done. M5 waits on the wedding .DAT.**
 - Release: `release.yml` builds all README assets and drafts a GitHub Release on a `v*` tag.
 - Open (see `docs/backlog/next.md`): real-Windows run, signing/notarization, admin-password card
   imaging, Premiere test, card time-zone check on a real Canon card.
-- Name DATfix; repo `lelanddutcher/dat-file-repair` (private). License MIT.
+- Name DATfix; repo `lelanddutcher/dat-file-repair`. License MIT.
 
-## Phase 2 (started 2026-11-27): general video repair
-
-Leland: "build it". Grow DATfix into a free, open, idiot-proof repair tool for any broken camera,
-phone, drone or screen-recording video. Design: `docs/research/video-repair-market.md` §7.
-Diagnose → try strategies least-invasive first (remux, vendor index, built-in profile, reference
-graft, frame scan, stream dump, card carve, salvage) → score → keep the best, with an honest loss
-report. Never re-encode as "repair". ffmpeg (LGPL, separate binary) only validates.
-
-| # | Milestone | Done when |
-|---|---|---|
-| P2.1 | Strategy framework + diagnosis + scorer; Canon path becomes one strategy | Canon corpus still 36/36; `datfix diagnose` explains any file |
-| P2.2 | Generic MP4/MOV with no `moov` (H.264/HEVC + AAC/PCM) | Synthetic + real broken phone/drone/OBS files repair |
-| P2.3 | Sony `.RSV`, DJI, GoPro, Panasonic `.MDT` | Real samples repair |
-| P2.4 | "Not broken, can't decode here" diagnosis; app UI for the pipeline | Strangers can use it |
-| P2.5 | ProRes/BRAW, MXF footer rebuild | — |
+A general video-repair tool is planned as a separate project.
 
 ## Goal
 
@@ -35,17 +21,14 @@ A free, open-source desktop app (macOS + Windows) that turns a Canon camera `.DA
 playable `.MP4`. The user drops in the broken `.DAT` and one healthy clip from the same camera. The
 app writes a new `.MP4`. It never modifies the original.
 
-Personal target: a long clip from Hollie and Colton's wedding (2026-11-21), shot on a Canon EOS R5 Mark II
-or R3. **Its `.DAT` is not on the NAS yet** — see open questions.
-
-## What a Canon `.DAT` is (verified on our own files, 2026-11-26)
+## What a Canon `.DAT` is (verified on a test corpus, 2026-11-26)
 
 A Canon camera writes the media payload to a temporary `.DAT` while it records. It writes the file
 header (`ftyp` + `moov`, the index that tells a player where each frame is) only when recording
 stops. If the camera loses power or the card errors, the header never gets written, and the `.DAT`
 is left on the card. Players cannot open it.
 
-What we found in 37 Canon `.DAT` files on the zpool share:
+What we found in 37 Canon `.DAT` files in a local test corpus:
 
 - Every file starts with an `mdat` box whose size is still `0` (never finalized).
 - The payload is cut into groups. Each group starts with a Canon **`repi`** header that lists the
@@ -100,8 +83,7 @@ repair is deterministic — no guessing.
 - **App:** Tauri (Rust backend, small web UI) — one window, two drop zones, one button, a progress
   bar, a result preview. Builds for macOS (universal) and Windows. Chosen over Electron for size
   (~10 MB vs ~150 MB) and because the core is Rust anyway.
-- **License:** GPL-3.0 or MIT/Apache — decision for Leland. (untrunc is GPL-2.0; we write our own
-  code and cite it, so either is open.)
+- **License:** MIT. (untrunc is GPL-2.0; DATfix is its own code and cites it.)
 
 ## Milestones
 
@@ -112,17 +94,11 @@ repair is deterministic — no guessing.
 | M2 | R3 + older bodies | R3 `CAEP` files (H.264 and HEVC, AAC and PCM) repaired; R5/R6-era `100CANON` files tested. |
 | M3 | Robustness | Truncated tails, damaged `repi` mid-file, >4 GB, Long-GOP `ctts`. Regression suite against the corpus. |
 | M4 | Desktop app | Tauri app, signed builds for macOS + Windows. |
-| M5 | Wedding clip | Leland's clip repaired and verified. Public release. |
+| M5 | Public release | Repo public, signed builds attached to a GitHub Release. |
 
 ## Workspace
 
-- Experiments: `/Volumes/15T/dat-file-repair/` (14 TB free). `samples/` holds read-only copies.
-- Originals on the NAS are never written to. We copy, then work on the copy.
+- Media lives outside the repo, in a local workspace (`$DATFIX_CORPUS`, `$DATFIX_SAMPLES`).
+  Test copies are read only.
+- Originals are never written to. We copy, then work on the copy.
 - Scripts live in this repo under `tools/`; media never enters git.
-
-## Open questions for Leland
-
-1. Where is the wedding `.DAT`? Not on zpool, media, other-media or hermes-share. Still on the card?
-   If the card has no `.DAT` entry (FAT32 behaviour), we image the card and carve it.
-2. License: GPL-3.0 or MIT/Apache-2.0?
-3. Public GitHub repo name and when to publish.
