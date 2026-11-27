@@ -1,7 +1,13 @@
-# DATfix user guide
+# DATfix user guide: how to repair a Canon `.DAT` file
 
-DATfix repairs the `.DAT` file that a Canon camera leaves when a recording is cut off. It writes a
-new `.MP4` next to it. Your `.DAT` is only read. DATfix never changes or deletes it.
+**Your Canon camera left a `.DAT` file instead of an `.MP4` because the recording was cut off: the
+battery died, the card was removed, or the camera stopped with an error such as Err 70.** DATfix
+repairs that `.DAT` into a new `.MP4` you can play and edit, on your own computer, with no
+re-encoding.
+
+Your `.DAT` is only read. DATfix never changes or deletes it. DATfix is verified on the Canon EOS
+R5 Mark II, EOS R5 and EOS R3. The [supported cameras](../../README.md#supported-cameras) table
+lists each mode and what it was tested with.
 
 This guide covers:
 
@@ -11,6 +17,7 @@ This guide covers:
 4. [Recover a 0-byte or missing `.DAT`](#recover-a-0-byte-or-missing-dat)
 5. [The recording date](#the-recording-date)
 6. [Troubleshooting](#troubleshooting)
+7. [Common questions](#common-questions)
 
 ## Before you start
 
@@ -415,3 +422,36 @@ See [The recording date](#the-recording-date) for where the date comes from. **D
 result says which source DATfix used. DATfix never copies the reference clip's dates, thumbnail,
 serial numbers or location unless you turn on **Keep the reference clip's camera metadata** (or
 pass `--keep-reference-metadata`).
+
+## Common questions
+
+### How do I open a `.DAT` file from my Canon camera?
+
+You cannot open it directly. Repair it with DATfix, then open the new `.MP4`. Renaming the `.DAT`
+to `.MP4` does not work, because the file's index is missing.
+
+### My battery died while recording. Can I get the video back?
+
+Usually yes. The `.DAT` holds everything up to the cut. DATfix leaves out only the unfinished last
+moment, which is under one second.
+
+### I removed the card while recording. What now?
+
+Put the card in your computer and look for the `.DAT`. If it has a size, repair it. If it is
+0 bytes or missing, follow [Recover a 0-byte or missing `.DAT`](#recover-a-0-byte-or-missing-dat).
+Do not record on the card until your video is back.
+
+### Does DATfix upload my video?
+
+No. It runs on your computer and works without an internet connection.
+
+### Is DATfix free?
+
+Yes. It is free and open source under the MIT license, with no trial, watermark or size limit.
+
+### Which editors open the repaired file?
+
+Repaired files open in QuickTime and DaVinci Resolve 21.2 with all tracks and the camera's
+timecode. Premiere Pro and Final Cut Pro are not tested yet.
+
+Not affiliated with or endorsed by Canon Inc. Canon and EOS are trademarks of Canon Inc.

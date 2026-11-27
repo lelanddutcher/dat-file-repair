@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src https://api.github.com; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>Canon .DAT File Repair, Free for Mac and Windows | DATfix</title>
+<meta name="description" content="Canon camera left a .DAT file after the battery died or the card was removed? DATfix rebuilds a playable MP4, no re-encoding. Free for Mac and Windows.">
+<link rel="canonical" href="https://lelanddutcher.github.io/dat-file-repair/">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f6f2e9" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#16181c" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="site/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="site/style.css">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="DATfix">
+<meta property="og:title" content="DATfix: repair a Canon .DAT video file">
+<meta property="og:description" content="Get your video back from a cut-off Canon recording. Free and open source, for Mac and Windows. No re-encoding, nothing uploaded.">
+<meta property="og:url" content="https://lelanddutcher.github.io/dat-file-repair/">
+<meta property="og:image" content="https://lelanddutcher.github.io/dat-file-repair/site/og_1200x630.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="DATfix: get your video back from a cut-off Canon .DAT recording">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="DATfix: repair a Canon .DAT video file">
+<meta name="twitter:description" content="Get your video back from a cut-off Canon recording. Free and open source, for Mac and Windows. No re-encoding, nothing uploaded.">
+<meta name="twitter:image" content="https://lelanddutcher.github.io/dat-file-repair/site/og_1200x630.png">
+<meta name="twitter:image:alt" content="DATfix: get your video back from a cut-off Canon .DAT recording">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "DATfix",
+  "description": "Repairs the .DAT file a Canon camera leaves when a recording is cut off. Rebuilds the MP4 index with no re-encoding. Runs locally and uploads nothing.",
+  "applicationCategory": "MultimediaApplication",
+  "operatingSystem": "macOS, Windows",
+  "url": "https://lelanddutcher.github.io/dat-file-repair/",
+  "downloadUrl": "https://github.com/lelanddutcher/dat-file-repair/releases/latest",
+  "image": "https://lelanddutcher.github.io/dat-file-repair/site/og_1200x630.png",
+  "license": "https://opensource.org/licenses/MIT",
+  "isAccessibleForFree": true,
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+  "author": { "@type": "Person", "name": "Leland Dutcher" },
+  "codeRepository": "https://github.com/lelanddutcher/dat-file-repair"
+}
+</script>
+<script type="application/ld+json" id="faq-ld">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    { "@type": "Question", "name": "What is a .DAT file from a Canon camera?",
+      "acceptedAnswer": { "@type": "Answer", "text": "It is a recording the camera did not finish. The camera writes video into a .DAT file and renames it to .MP4 when you press stop. If recording is cut off, the .DAT stays on the card with the video inside but without the index that players need." } },
+    { "@type": "Question", "name": "How do I open a .DAT file from my Canon camera?",
+      "acceptedAnswer": { "@type": "Answer", "text": "You cannot open it directly. Repair it with DATfix, then open the new MP4. Renaming the .DAT to .MP4 does not work, because the index is still missing." } },
+    { "@type": "Question", "name": "My battery died while recording. Can I get the video back?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Usually yes. The .DAT holds everything up to the cut. DATfix leaves out only the unfinished last moment, which is under one second." } },
+    { "@type": "Question", "name": "I removed the card while recording. Can I get the video back?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Often yes. Put the card in your computer and look for the .DAT. If it has a size, repair it with DATfix. If it is 0 bytes or missing, use Recover from a memory card in DATfix to scan the card. Stop using the card until your video is back." } },
+    { "@type": "Question", "name": "My .DAT file is 0 bytes. Is the video gone?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Not always. A 0-byte .DAT holds no video itself, but the recording is often still on the card. DATfix can scan the card, or an image of it, and repair what it finds." } },
+    { "@type": "Question", "name": "Which Canon cameras does DATfix support?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Verified on the EOS R5 Mark II, EOS R5 and EOS R3. Expected to work, but not yet tested on a real .DAT: EOS R6, R6 Mark II, C70 and C80 in some modes. Not supported: EOS R and EOS M50 Mark II, which write no recovery index." } },
+    { "@type": "Question", "name": "Does DATfix upload my video or change the original file?",
+      "acceptedAnswer": { "@type": "Answer", "text": "No. DATfix runs on your computer and works without an internet connection. It only reads the .DAT and always writes a new file. The video and audio are copied as they are, with no re-encoding." } },
+    { "@type": "Question", "name": "Is DATfix free?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Yes. DATfix is free and open source under the MIT license, with no trial, watermark or file-size limit." } },
+    { "@type": "Question", "name": "Will the repaired file open in my video editor?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Repaired files open in QuickTime and DaVinci Resolve 21.2 with all tracks and the camera's timecode. Premiere Pro and Final Cut Pro are not tested yet." } }
+  ]
+}
+</script>
+<script src="site/download.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="./"><img src="site/icon.svg" width="32" height="32" alt=""> DATfix</a>
+  <nav><a href="#cameras">Cameras</a> <a href="#faq">FAQ</a> <a href="https://github.com/lelanddutcher/dat-file-repair">GitHub</a></nav>
+</header>
+
+<main>
+<section class="hero">
+  <h1>Repair a Canon <code>.DAT</code> video file</h1>
+  <p class="lead">A Canon camera leaves a <code>.DAT</code> file instead of an <code>.MP4</code> when a recording is cut off: the battery died, the card was removed, or the camera stopped with an error such as Err 70. DATfix is a free, open-source app for Mac and Windows that turns that <code>.DAT</code> into an MP4 you can play and edit, with no re-encoding and nothing uploaded.</p>
+  <div class="cta">
+    <a id="dl" class="button" href="https://github.com/lelanddutcher/dat-file-repair/releases/latest">Download DATfix</a>
+    <p id="dl-note" class="note">Free. For macOS (signed and notarized) and Windows 10 or 11. <a href="https://github.com/lelanddutcher/dat-file-repair/releases/latest">All downloads</a>, including the command-line tool.</p>
+  </div>
+  <p class="facts">Verified on the EOS R5 Mark II, EOS R5 and EOS R3. Also finds a recording on the card when the <code>.DAT</code> is 0 bytes or missing.</p>
+</section>
+
+<section>
+  <h2>What happened to your video</h2>
+  <p>A Canon camera records into a temporary <code>.DAT</code> file. When you stop recording, it writes the file's index and renames it to <code>.MP4</code>. If recording is cut off, the index is never written. The video is still in the <code>.DAT</code>, but no player or editor can open it.</p>
+  <p>Canon writes small recovery headers inside the <code>.DAT</code> while it records. DATfix reads them, rebuilds the index and writes a new MP4. It copies the video and audio unchanged and never changes your original file.</p>
+</section>
+
+<section>
+  <h2>How to repair it</h2>
+  <ol class="steps">
+    <li><strong>Copy the card folder to your computer.</strong> Keep the card as it is until your video is back.</li>
+    <li><strong>Drop the <code>.DAT</code> into DATfix.</strong> It reads the file and picks the video settings.</li>
+    <li><strong>Press Repair.</strong> The new MP4 is saved next to the <code>.DAT</code>.</li>
+  </ol>
+  <figure class="shot">
+    <img src="user/img/05-done.png" width="760" height="860" loading="lazy" alt="DATfix after a repair: Your video is repaired, with Show in Finder and Play buttons">
+    <figcaption>The finished repair. <a href="https://github.com/lelanddutcher/dat-file-repair/blob/main/docs/user/guide.md">Read the full user guide</a>.</figcaption>
+  </figure>
+</section>
+
+<section id="cameras">
+  <h2>Supported cameras</h2>
+  <p><strong>Verified</strong> means real <code>.DAT</code> files from that camera and mode were repaired and passed every check: frame count, a full error-free decode, equal audio and video length, and a look at frames from the middle and the end. Last full run: 26 November 2026, 36 files, 273 GB.</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Camera</th><th>Recording mode</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td>EOS R5 Mark II</td><td>XF-HEVC S, 4K 119.88p, 4 channels PCM</td><td>Verified, 15 files</td></tr>
+      <tr><td>EOS R5</td><td>HEVC 4K 59.94p All-I, stereo PCM</td><td>Verified, 10 files</td></tr>
+      <tr><td>EOS R3</td><td>HEVC 4K 29.97p All-I, no audio</td><td>Verified, 10 files</td></tr>
+      <tr><td>EOS R3</td><td>HEVC 4K 59.94p All-I, stereo PCM</td><td>Verified, 1 file</td></tr>
+      <tr><td>EOS R5, R6, R6 Mark II</td><td>Modes with AAC audio</td><td>Expected</td></tr>
+      <tr><td>Cinema EOS C70, C80</td><td>HEVC with AAC or PCM audio</td><td>Expected</td></tr>
+      <tr><td>EOS R, EOS M50 Mark II</td><td>Any</td><td>Not supported</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p><a href="https://github.com/lelanddutcher/dat-file-repair#supported-cameras">Full table with every mode</a>. Have a <code>.DAT</code> from another camera? <a href="https://github.com/lelanddutcher/dat-file-repair/issues/new/choose">Send a sample</a>.</p>
+</section>
+
+<section>
+  <h2>Other ways to repair a <code>.DAT</code></h2>
+  <p>Paid tools and repair services also handle Canon <code>.DAT</code> files, and the free tool untrunc covers some Canon modes. The README has a <a href="https://github.com/lelanddutcher/dat-file-repair#how-datfix-compares">dated comparison with prices checked on each vendor's page</a>.</p>
+</section>
+
+<section id="faq">
+  <h2>Questions</h2>
+  <div class="faq">
+    <h3>What is a .DAT file from a Canon camera?</h3>
+    <p>It is a recording the camera did not finish. The camera writes video into a .DAT file and renames it to .MP4 when you press stop. If recording is cut off, the .DAT stays on the card with the video inside but without the index that players need.</p>
+    <h3>How do I open a .DAT file from my Canon camera?</h3>
+    <p>You cannot open it directly. Repair it with DATfix, then open the new MP4. Renaming the .DAT to .MP4 does not work, because the index is still missing.</p>
+    <h3>My battery died while recording. Can I get the video back?</h3>
+    <p>Usually yes. The .DAT holds everything up to the cut. DATfix leaves out only the unfinished last moment, which is under one second.</p>
+    <h3>I removed the card while recording. Can I get the video back?</h3>
+    <p>Often yes. Put the card in your computer and look for the .DAT. If it has a size, repair it with DATfix. If it is 0 bytes or missing, use Recover from a memory card in DATfix to scan the card. Stop using the card until your video is back.</p>
+    <h3>My .DAT file is 0 bytes. Is the video gone?</h3>
+    <p>Not always. A 0-byte .DAT holds no video itself, but the recording is often still on the card. DATfix can scan the card, or an image of it, and repair what it finds.</p>
+    <h3>Which Canon cameras does DATfix support?</h3>
+    <p>Verified on the EOS R5 Mark II, EOS R5 and EOS R3. Expected to work, but not yet tested on a real .DAT: EOS R6, R6 Mark II, C70 and C80 in some modes. Not supported: EOS R and EOS M50 Mark II, which write no recovery index.</p>
+    <h3>Does DATfix upload my video or change the original file?</h3>
+    <p>No. DATfix runs on your computer and works without an internet connection. It only reads the .DAT and always writes a new file. The video and audio are copied as they are, with no re-encoding.</p>
+    <h3>Is DATfix free?</h3>
+    <p>Yes. DATfix is free and open source under the MIT license, with no trial, watermark or file-size limit.</p>
+    <h3>Will the repaired file open in my video editor?</h3>
+    <p>Repaired files open in QuickTime and DaVinci Resolve 21.2 with all tracks and the camera's timecode. Premiere Pro and Final Cut Pro are not tested yet.</p>
+  </div>
+</section>
+</main>
+
+<footer>
+  <p><a href="https://github.com/lelanddutcher/dat-file-repair">Source code on GitHub</a> · <a href="https://github.com/lelanddutcher/dat-file-repair/blob/main/LICENSE">MIT license</a> · No cookies, no analytics.</p>
+  <p>Not affiliated with or endorsed by Canon Inc. Canon and EOS are trademarks of Canon Inc.</p>
+</footer>
+</body>
+</html>
