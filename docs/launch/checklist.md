@@ -81,20 +81,23 @@ closed).
 | https://github.com/anthwlock/untrunc/issues/170 | R5 | open, last activity 30 Jun 2024 | Yes |
 | https://github.com/anthwlock/untrunc/issues/215 | R5 C | open, last activity 19 Mar 2025 | Only if R5 C gets verified. It is not in our table today. |
 
-Draft (#84):
+Draft (#84), a reply to the R5 Mark II comment of 14 Nov 2025:
 
-> For the R5 Mark II `.DAT` files mentioned here: I wrote a free, MIT-licensed tool for this case,
-> DATfix (https://github.com/lelanddutcher/dat-file-repair). It reads the `repi` recovery index for
-> the XF-HEVC S layout with 4-channel PCM and the `cndm` metadata track, which is why the generic
-> scan misreads these files. It is verified on 15 R5 Mark II `.DAT` files at 4K 119.88p. Thanks to
-> untrunc for showing the way; this is meant as a complement for the PCM layouts.
+> For the R5 Mark II `.DAT` files mentioned here: untrunc's new `repi` support (Nov 2026) covers
+> Canon HEVC files with AAC audio. The R5 Mark II writes XF-HEVC S with four channels of 24-bit
+> PCM and a `cndm` metadata track, and that layout still falls back to the generic scan. I wrote a
+> free, MIT-licensed tool for this case: DATfix (https://github.com/lelanddutcher/dat-file-repair).
+> It walks the `repi` index for every track, so there is no guessing. It is verified on 15 R5
+> Mark II `.DAT` files (4K 119.88p, up to 37.8 GB). It runs offline on Mac (notarized) and Windows.
+> Thanks to untrunc for showing the way; this is meant as a complement for the PCM layouts.
 
 Draft (#170):
 
-> If this is still open for you: DATfix (https://github.com/lelanddutcher/dat-file-repair) is a
-> free, MIT-licensed tool that repairs R5 `.DAT` files with PCM audio from Canon's `repi` index.
-> It is verified on 10 R5 `.DAT` files (HEVC 4K 59.94p All-I, stereo PCM). R5 modes with AAC audio
-> are expected to work but not yet tested on a real `.DAT`.
+> If this is still open for you: R5 `.DAT` files with PCM audio can be repaired with DATfix
+> (https://github.com/lelanddutcher/dat-file-repair), a free, MIT-licensed tool that rebuilds
+> the file from Canon's `repi` index. It is verified on 10 R5 `.DAT` files (HEVC 4K 59.94p
+> All-I, stereo PCM). R5 modes with AAC audio are expected to work but are not yet tested on a
+> real `.DAT`; for those, untrunc's new `repi` support is also worth a try.
 
 ### 5.2 Reddit
 
@@ -194,6 +197,9 @@ URL: the GitHub repo. First comment:
 > Canon bodies are very welcome.
 
 ### 5.7 Awesome lists (pull requests, after the release)
+
+**Deferred to FootageFix (decided 27 Nov 2026).** These lists favour general tools; a single-camera
+repair tool is unlikely to be accepted. Propose FootageFix instead once it is public.
 
 Checked 27 November 2026: all active, not archived. Read each `CONTRIBUTING.md` first.
 
